@@ -67,7 +67,10 @@ def main():
     mode=sys.argv[1]
     if mode=='info':
         with Image.open(sys.argv[2]) as im: im.verify()
-        with Image.open(sys.argv[2]) as im: print(json.dumps({'width':im.width,'height':im.height,'mode':im.mode,'format':im.format}));return
+        with Image.open(sys.argv[2]) as im:
+            im.load()
+            print(json.dumps({'width':im.width,'height':im.height,'mode':im.mode,'format':im.format}))
+            return
     data=json.loads(Path(sys.argv[2]).read_text())
     if mode=='geometry': print(json.dumps(geometry(data),ensure_ascii=False))
     elif mode=='compose':print(compose(data))

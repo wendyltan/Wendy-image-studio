@@ -13,6 +13,7 @@ process.env.WENDI_TEST_CALLS=path.join(temp,'calls.txt');
 const W=await import('../server/workflow.mjs');
 const E=await import('../server/engine.mjs');
 const B=await import('../server/bridge.mjs');
+const J=await import('../server/job-store.mjs');
 const panel={scene:'原木客厅',characters:'温蒂',costume:'轻薄夏装',action:'翻书',gaze:'书页',expression:'专注',lighting:'左侧日光',layers:'桌子、人物、窗外',objects:'一本书',caption:'停一会儿，也很好。',captionKind:'narration',screenText:'',screenDirection:'',prompt:'看书，手脚完整',references:['04-住宅环境/原木客厅参考.png'],anchors:['高丸子头'],forbidden:['无关文字']};
 const plan={title:'流程测试专用',synopsis:'测试夹具',arc:'拿起书、停下、望向窗外。',continuity:{characters:['1页1格 温蒂'],scenes:['原木客厅'],objects:['书'],copy:['1页1格 停一会儿，也很好。']},samples:[{title:'脸部',prompt:'脸部近景',references:[]},{title:'场景',prompt:'原木客厅',references:panel.references}],pages:[{number:1,title:'仅用于流程测试',purpose:'测试排版',time:'夏末午后',layout:'solo',panels:[panel]}]};
 const planFile=path.join(temp,'fixture-plan.json');fs.writeFileSync(planFile,JSON.stringify(plan));process.env.WENDI_TEST_PLAN_FILE=planFile;
@@ -22,7 +23,7 @@ const a=process.argv.slice(2);if(a[0]==='login'){console.log('Logged in using Ch
 fs.appendFileSync(process.env.WENDI_TEST_CALLS,'call\\n');
 const out=a[a.indexOf('-o')+1];let text='';
 if(a.includes('--output-schema')){const s=JSON.parse(fs.readFileSync(a[a.indexOf('--output-schema')+1]));const marker=process.env.WENDI_TEST_FAIL_SAMPLE_ONCE,crash=process.env.WENDI_TEST_CRASH_QA_ONCE;if(!s.properties.pages&&crash&&p.includes('脸部近景')&&!fs.existsSync(crash)){fs.writeFileSync(crash,'1');process.exit(42);}else if(!s.properties.pages&&marker&&p.includes('脸部近景')&&!fs.existsSync(marker)){fs.writeFileSync(marker,'1');text=JSON.stringify({pass:false,summary:'TEST FIXTURE REPAIR',issues:['前臂与提带关系不自然'],issueDetails:[{id:'arm-strap',category:'anatomy',severity:'blocking',location:'左前臂',description:'前臂与提带关系不自然',repairAction:'regenerate'}],repairPrompt:'修正前臂与提带关系'});}else text=JSON.stringify(s.properties.pages?JSON.parse(fs.readFileSync(process.env.WENDI_TEST_PLAN_FILE)): {pass:true,summary:'TEST FIXTURE CHECK ONLY',issues:[],issueDetails:[],repairPrompt:''});}
-else {const noImage=process.env.WENDI_TEST_NO_IMAGE_ONCE;if(noImage&&!fs.existsSync(noImage)){fs.writeFileSync(noImage,'1');text=process.env.WENDI_TEST_NO_IMAGE_TEXT||'未能生成：内置 image_gen 连接错误，目标路径尚不存在。';}else{const m=p.match(/复制到准确路径 ([^\\n]+?\\.png)/);if(!m)process.exit(2);const file=m[1];fs.mkdirSync(path.dirname(file),{recursive:true});const r=p.match(/目标原始画面宽高比 (\\d+):(\\d+)/);const w=r?+r[1]:750,h=r?+r[2]:1000;execFileSync('/Library/Frameworks/Python.framework/Versions/3.10/bin/python3',['-c','from PIL import Image,ImageDraw; import sys; im=Image.new("RGB",(int(sys.argv[2]),int(sys.argv[3])),"#d8dfce"); ImageDraw.Draw(im).text((20,20),"PIPELINE TEST ONLY",fill="black"); im.save(sys.argv[1])',file,String(w),String(h)]);text=file;}}
+else {const noImage=process.env.WENDI_TEST_NO_IMAGE_ONCE;if(noImage&&!fs.existsSync(noImage)){fs.writeFileSync(noImage,'1');text=process.env.WENDI_TEST_NO_IMAGE_TEXT||'未能生成：内置 image_gen 连接错误，目标路径尚不存在。';}else{const m=p.match(/复制到准确路径 ([^\\n]+?\\.png)/);if(!m)process.exit(2);const file=m[1];fs.mkdirSync(path.dirname(file),{recursive:true});const r=p.match(/目标原始画面宽高比 (\\d+):(\\d+)/);const w=r?+r[1]:750,h=r?+r[2]:1000;execFileSync('/Library/Frameworks/Python.framework/Versions/3.10/bin/python3',['-c','from PIL import Image,ImageDraw; import sys; im=Image.new("RGB",(int(sys.argv[2]),int(sys.argv[3])),"#d8dfce"); ImageDraw.Draw(im).text((20,20),"PIPELINE TEST ONLY",fill="black"); im.save(sys.argv[1])',file,String(w),String(h)]);text=file;const pause=process.env.WENDI_TEST_PAUSE_AFTER_IMAGE;if(pause&&!fs.existsSync(pause)){fs.writeFileSync(pause,'1');await new Promise(resolve=>setTimeout(resolve,10000));}}}
 fs.writeFileSync(out,text);console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text}}));console.log(JSON.stringify({type:'turn.completed'}));
 `,{mode:0o700});
 async function done(id){for(let i=0;i<200;i++){if(!E.active.has(id))return E.readProject(id);await new Promise(r=>setTimeout(r,50));}throw new Error('test job timed out');}
@@ -55,6 +56,17 @@ test('the durable local queue runs separate projects one at a time',async()=>{
   first=await done(first.id);second=await done(second.id);
   assert.deepEqual(events,['first-start','first-end','second-start','second-end']);assert.equal(first.queueJob,null);assert.equal(second.queueJob,null);
   const queue=path.join(process.env.WENDI_DATA_DIR,'.任务队列','jobs');const records=fs.readdirSync(queue).map(name=>JSON.parse(fs.readFileSync(path.join(queue,name),'utf8'))).filter(job=>[first.id,second.id].includes(job.projectId));assert.equal(records.length,2);assert(records.every(job=>job.status==='completed'&&job.heartbeatAt));
+});
+test('a queued job waits for an external executor lock and then runs',async()=>{
+  const external=new J.JobStore(process.env.WENDI_DATA_DIR),held=external.enqueue({projectId:'external',phase:'planning'}),owner=`${process.pid}:external-test`;assert(external.claim(held.id,owner));
+  let queued=E.createProject({...brief,idea:'等待外部执行锁的流程'}),invoked=false;E.job(queued,'planning',async()=>{invoked=true;});
+  await new Promise(resolve=>setTimeout(resolve,80));assert.equal(invoked,false);assert.equal(E.active.has(queued.id),true);
+  external.finish(held.id,owner,'completed');queued=await done(queued.id);assert.equal(invoked,true);assert.equal(E.active.has(queued.id),false);assert.equal(queued.queueJob,null);
+});
+test('restart consumes a queued record once and marks the project recoverable',()=>{
+  const store=new J.JobStore(process.env.WENDI_DATA_DIR);let queued=E.createProject({...brief,idea:'重启恢复待执行任务'});const record=store.enqueue({projectId:queued.id,phase:'planning'});queued.status='planning';E.saveProject(queued);
+  E.recover();queued=E.readProject(queued.id);assert.equal(queued.status,'paused');assert.equal(queued.queueJob.status,'recoverable');assert.equal(store.read(record.id).status,'interrupted');
+  E.recover();queued=E.readProject(queued.id);assert.equal(store.recoverable().some(job=>job.id===record.id),false);assert.equal(queued.queueJob.status,'recoverable');
 });
 test('planning, frozen approval, samples gate and production',async()=>{
   p=E.createProject(brief);assert.throws(()=>E.generatePages(p),/确认/);
@@ -96,21 +108,23 @@ test('sample QA stops at an explicit decision instead of automatically redrawing
   assert.equal(automatic.samples[0].key,'样张-1');
   assert.equal(automatic.sampleRepairCounts[0],0);
 });
-test('known image network failure stops without a misleading recovery state',async()=>{
+test('a network interruption remains recoverable instead of becoming definite no-output',async()=>{
   const marker=path.join(temp,'no-image-once');process.env.WENDI_TEST_NO_IMAGE_ONCE=marker;
   let failed=E.createProject(brief);E.planProject(failed);failed=await done(failed.id);E.approvePlan(failed,W.digest(failed.plan));failed=await done(failed.id);
   delete process.env.WENDI_TEST_NO_IMAGE_ONCE;
-  assert.equal(failed.status,'attention');assert.equal(failed.pending,null);assert.equal(failed.lastFailure.kind,'network');assert.equal(failed.lastFailure.attempts,1);
-  assert.match(failed.message,/没有取得图片/);assert.match(failed.message,/自动重试已停止/);assert.match(failed.message,/重试当前样张/);
-  assert.equal(failed.currentTask.status,'failed_no_output');assert.equal(failed.currentTask.providerInvocationLimit,1);assert.equal(failed.currentTask.providerInvocations,1);
+  assert.equal(failed.status,'attention');assert.equal(failed.lastFailure,null);assert.equal(failed.pending.key,'样张-1');
+  assert.match(failed.message,/检查已有原图|保存结果前中断/);assert.equal(failed.currentTask.status,'unknown_result');assert.equal(failed.currentTask.providerInvocations,1);
 });
-test('explicit no-image evidence never falls into the uncertain recovery path',async()=>{
-  for(const text of ['生成工具返回网络连接错误，未产生任何图片，也未写入目标路径。','本次请求未产出任何图片。']){
-    const marker=path.join(temp,`no-output-${Buffer.from(text).toString('hex').slice(0,12)}`);process.env.WENDI_TEST_NO_IMAGE_ONCE=marker;process.env.WENDI_TEST_NO_IMAGE_TEXT=text;
-    let failed=E.createProject(brief);E.planProject(failed);failed=await done(failed.id);E.approvePlan(failed,W.digest(failed.plan));failed=await done(failed.id);
-    assert.equal(failed.status,'attention',text);assert.equal(failed.pending,null,text);assert(['network','no-output'].includes(failed.lastFailure.kind),text);assert.equal(failed.currentTask.status,'failed_no_output',text);assert.doesNotMatch(failed.message,/检查已有原图|找回已生成图片/,text);
-  }
+test('only non-connection no-image evidence becomes retryable',async()=>{
+  const text='本次请求未产出任何图片。',marker=path.join(temp,'pure-no-output');process.env.WENDI_TEST_NO_IMAGE_ONCE=marker;process.env.WENDI_TEST_NO_IMAGE_TEXT=text;
+  let failed=E.createProject(brief);E.planProject(failed);failed=await done(failed.id);E.approvePlan(failed,W.digest(failed.plan));failed=await done(failed.id);
+  assert.equal(failed.status,'attention');assert.equal(failed.pending,null);assert.equal(failed.lastFailure.kind,'no-output');assert.equal(failed.currentTask.status,'failed_no_output');
   delete process.env.WENDI_TEST_NO_IMAGE_ONCE;delete process.env.WENDI_TEST_NO_IMAGE_TEXT;
+});
+test('retrying a failed panel stops after that one panel',async()=>{
+  let single=E.createProject({...brief,idea:'只重试一个分镜的流程'});const duo=structuredClone(plan);duo.pages[0].layout='duo';duo.pages[0].panels=[structuredClone(panel),structuredClone(panel)];single.plan=duo;single.version=1;single.approved={version:1,hash:W.digest(duo)};single.samplesApproved=true;single.status='attention';single.lastFailure={kind:'no-output',definiteNoOutput:true,key:'第1页-第1格',attempts:1,at:new Date().toISOString()};E.saveProject(single);
+  E.retryMissingImage(single,'第1页-第1格');single=await done(single.id);
+  assert.deepEqual(Object.keys(single.panels),['1-1']);assert.equal(single.pages.length,0);assert.equal(single.status,'paused');assert.equal(single.tasks.filter(task=>task.kind==='image').length,1);assert.match(single.message,/不会继续生成其他分镜/);
 });
 test('sample resume never redraws a failed sample without an explicit decision',async()=>{
   let continued=E.createProject(brief);E.planProject(continued);continued=await done(continued.id);E.approvePlan(continued,W.digest(continued.plan));continued=await done(continued.id);
@@ -143,6 +157,12 @@ test('an image artifact and its record survive a QA transport failure',async()=>
   delete process.env.WENDI_TEST_CRASH_QA_ONCE;
   const image=failed.artifacts.find(x=>x.id==='image:样张-1');assert(image);assert(fs.existsSync(W.inside(E.projectDir(failed.id),image.file)));assert.equal(failed.samples[0].file,image.file);assert.notEqual(failed.samples[0].qa?.pass,true);
 });
+test('pausing after image write still records the verified original',async()=>{
+  const marker=path.join(temp,'pause-after-image');process.env.WENDI_TEST_PAUSE_AFTER_IMAGE=marker;
+  let paused=E.createProject(brief);E.planProject(paused);paused=await done(paused.id);E.approvePlan(paused,W.digest(paused.plan));
+  for(let i=0;i<100&&!fs.existsSync(marker);i++)await new Promise(resolve=>setTimeout(resolve,20));assert(fs.existsSync(marker));E.active.get(paused.id).abort();paused=await done(paused.id);delete process.env.WENDI_TEST_PAUSE_AFTER_IMAGE;
+  assert.equal(paused.status,'paused');assert.equal(paused.pending,null);assert(paused.samples[0]);assert(fs.existsSync(W.inside(E.projectDir(paused.id),paused.samples[0].file)));assert.equal(paused.samples[0].qa.status,'unavailable');
+});
 test('rechecking a saved image adds only a review task and preserves the original',async()=>{
   let reviewed=E.createProject(brief);E.planProject(reviewed);reviewed=await done(reviewed.id);E.approvePlan(reviewed,W.digest(reviewed.plan));reviewed=await done(reviewed.id);
   const beforeFile=reviewed.samples[0].file,beforeImageTasks=reviewed.tasks.filter(task=>task.kind==='image').length;
@@ -159,6 +179,12 @@ test('ambiguous thread candidates stay recoverable instead of being claimed as t
   E.recoverImage(ambiguous);ambiguous=await done(ambiguous.id);
   assert.equal(ambiguous.status,'attention');assert.equal(ambiguous.pending.key,'样张-1');assert.equal(ambiguous.samples.length,0);
   delete process.env.CODEX_HOME;
+});
+test('a reported input reference path is never claimed as generated output',async()=>{
+  let inputOnly=E.createProject(brief);inputOnly.plan=structuredClone(plan);inputOnly.version=1;inputOnly.approved={version:1,hash:W.digest(inputOnly.plan)};
+  const run=path.join(E.projectDir(inputOnly.id),'.制作记录','input-only'),source=path.join(W.REFS,W.FACE[0]);fs.mkdirSync(run,{recursive:true});fs.writeFileSync(path.join(run,'response.txt'),`检查了参考图 ${source}`);
+  inputOnly.pending={key:'样张-1',file:path.join(E.projectDir(inputOnly.id),'v1','素材','missing.png'),dir:run,prompt:'脸部近景',refs:[],inputFiles:[source],at:new Date().toISOString()};inputOnly.status='attention';E.saveProject(inputOnly);
+  E.recoverImage(inputOnly);inputOnly=await done(inputOnly.id);assert.equal(inputOnly.pending.key,'样张-1');assert.equal(inputOnly.samples.length,0);
 });
 test('revisions invalidate approval but preserve history and accepted files',async()=>{
   const previous=p.pages[0].finalFile;
@@ -186,7 +212,7 @@ test('HTTP service serves built app and blocks foreign writes and unlisted files
     assert.equal((await fetch(base+'/')).status,200);
     const switched=await (await fetch(base+`/api/projects/${p.id}/settings`,{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:JSON.stringify({model:'fixture-model',reasoningEffort:'low'})})).json();assert.equal(switched.brief.model,'fixture-model');assert.equal(switched.modelHistory.at(-1).to.model,'fixture-model');
     const renamed=await (await fetch(base+`/api/projects/${p.id}/title`,{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:JSON.stringify({title:'已改名的流程测试'})})).json();assert.equal(renamed.title,'已改名的流程测试');
-    let retryable=E.createProject(brief);retryable.plan=structuredClone(plan);retryable.version=1;retryable.approved={version:1,hash:W.digest(retryable.plan)};retryable.samplesApproved=true;retryable.status='attention';retryable.pending=null;retryable.lastFailure={kind:'network',definiteNoOutput:true,key:'第1页-第1格',attempts:1,at:new Date().toISOString()};E.saveProject(retryable);
+    const retryable=E.createProject(brief);retryable.plan=structuredClone(plan);retryable.version=1;retryable.approved={version:1,hash:W.digest(retryable.plan)};retryable.samplesApproved=true;retryable.status='attention';retryable.pending=null;retryable.lastFailure=null;retryable.currentTask={id:'legacy-failed-task',kind:'image',target:'第1页-第1格',status:'failed_no_output',errorCode:'no-output',providerInvocations:1,completedAt:new Date().toISOString()};E.saveProject(retryable);
     const retryBody={confirmNoImage:true,idempotencyKey:`retry:${retryable.id}:fixture`},retryURL=base+`/api/projects/${retryable.id}/retry-missing`;
     const retried=await fetch(retryURL,{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:JSON.stringify(retryBody)});assert.equal(retried.status,200);const retriedProject=await retried.json();assert.notEqual(retriedProject.error,'请先确认没有生成图片。');
     const replay=await (await fetch(retryURL,{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:JSON.stringify(retryBody)})).json();assert.equal(replay.idempotent,true);

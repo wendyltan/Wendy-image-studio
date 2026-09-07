@@ -4,7 +4,7 @@ import path from 'node:path';
 import {execFile} from 'node:child_process';
 import {APP,ROOT,REFS,CHECKS,inside,digest} from './workflow.mjs';
 import {connectionStatus,appServerSnapshot,normalizeRateLimits} from './bridge.mjs';
-import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,resume,reviseImage,recoverImage,reviewImage,accept,recover,projectDir,syncRunningProject} from './engine.mjs';
+import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,resume,reviseImage,recoverImage,reviewImage,retryMissingImage,retryableImageFailure,accept,recover,projectDir,syncRunningProject} from './engine.mjs';
 import {CATEGORIES,listDocuments,listAssets,discoverArchiveStories,archiveStory,stageUpload,readCandidate,inspectStagedCandidate,saveManualAsset,searchAssets,analyzeAsset,saveAssetProposal,applyAssetProposal,saveDocument,suggestDocument,deleteProjectFolder,deleteArchiveStory} from './library.mjs';
 const PORT=Number(process.env.PORT||4318);const HOST='127.0.0.1';
 const front=path.join(APP,'dist/client');
@@ -111,7 +111,7 @@ function retryCommand(p,b){
   if(!key||key.length>200)throw new Error('缺少本次重试的防重复标识，请刷新页面后再试。');
   const records=Array.isArray(p.retryCommands)?p.retryCommands:[];
   const existing=records.find(record=>record.key===key);
-  const target=existing?.target||p.lastFailure?.key||p.pending?.key||'';
+  const target=existing?.target||retryableImageFailure(p)?.key||'';
   const fingerprint=digest({target,confirmNoImage:b.confirmNoImage===true});
   if(existing){if(existing.fingerprint!==fingerprint)throw new Error('这次重试标识已经用于另一张图片，请刷新后重试。');return {key,target,existing};}
   return {key,target,fingerprint,existing:null};
@@ -167,7 +167,7 @@ const server=http.createServer(async(req,res)=>{
       if(action==='pause'){active.get(p.id)?.abort();return send(res,{ok:true});}
       if(action==='title'){
         const title=String(b.title||'').trim().replace(/\s+/g,' ');
-        if(!title||[...title].length>60)throw new Error('作品名称请控制在 1—60 个字以内。');
+        if(!title||Array.from(title).length>60)throw new Error('作品名称请控制在 1—60 个字以内。');
         p.title=title;p.titleLocked=true;syncRunningProject(p.id,{title,titleLocked:true});saveProject(p);return send(res,publicProject(p));
       }
       if(action==='preview-decision'){
@@ -190,11 +190,12 @@ const server=http.createServer(async(req,res)=>{
         // re-entering the workflow and possibly spending another image request.
         if(command.existing)return send(res,{...publicProject(p),idempotent:true,command:{key:command.key,acceptedAt:command.existing.at}});
         if(active.has(p.id))throw new Error('这篇仍在制作，请稍候。');
-        const confirmedMissing=p.lastFailure?.definiteNoOutput===true;
-        if(b.confirmNoImage!==true||(!p.pending&&!confirmedMissing))throw new Error('请先确认没有生成图片。');
+        const confirmedMissing=retryableImageFailure(p);
+        if(b.confirmNoImage!==true||!confirmedMissing||confirmedMissing.key!==command.target)throw new Error('请先确认没有生成图片。');
         p.retryCommands=Array.isArray(p.retryCommands)?p.retryCommands:[];
         p.retryCommands.push({key:command.key,fingerprint:command.fingerprint,target:command.target,at:new Date().toISOString()});p.retryCommands=p.retryCommands.slice(-80);
-        p.revisionNotes.push({key:command.target||'当前图片',note:'用户确认本次没有取得图片，允许只重新生成这一张',at:new Date().toISOString()});p.pending=null;p.lastFailure=null;saveProject(p);resume(p);
+        p.revisionNotes.push({key:command.target||'当前图片',note:'用户确认本次没有取得图片，允许只重新生成这一张',at:new Date().toISOString()});saveProject(p);
+        try{retryMissingImage(p,command.target);}catch(error){p.retryCommands=p.retryCommands.filter(record=>record.key!==command.key);saveProject(p);throw error;}
         return send(res,{...publicProject(p),idempotent:false,command:{key:command.key,acceptedAt:new Date().toISOString()}});
       }
       if(active.has(p.id))throw new Error('这篇仍在制作，请稍候。');

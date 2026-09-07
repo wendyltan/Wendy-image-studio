@@ -7,7 +7,8 @@ import {JobStore} from './job-store.mjs';
 export const active = new Map();
 const runningProjects = new Map();
 fs.mkdirSync(DATA,{recursive:true});
-const jobStore=new JobStore(DATA),queueOwner=crypto.randomUUID();let queueTail=Promise.resolve();
+const jobStore=new JobStore(DATA),queueOwner=`${process.pid}:${crypto.randomUUID()}`;let queueTail=Promise.resolve();
+const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 const ID=/^[a-f0-9-]{36}$/;
 // Only phrases that explicitly say there was no usable image belong here. A
 // connection error by itself is ambiguous: the provider can finish an image
@@ -33,9 +34,14 @@ export function saveProject(p){
 }
 export function listProjects(){return fs.readdirSync(DATA).filter(id=>ID.test(id)&&fs.existsSync(path.join(DATA,id,'project.json'))).map(readProject).sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt));}
 export function recover(){
-  const interrupted=new Map(jobStore.recoverable().map(job=>[job.projectId,job]));
+  const recoverable=jobStore.recoverable();
+  for(const job of recoverable)if(job.status==='queued'){jobStore.cancel(job.id,'interrupted',{reason:'service_restarted_before_start'});job.status='recoverable';}
+  const interrupted=new Map(recoverable.map(job=>[job.projectId,job]));
   for(const p of listProjects()){
   let migrated=false;
+  if(!p.lastFailure&&p.currentTask?.status==='failed_no_output'&&!p.pending){
+    p.lastFailure={kind:p.currentTask.errorCode==='no-output'?'no-output':'network',definiteNoOutput:true,key:p.currentTask.target,attempts:p.currentTask.providerInvocations||1,inputTokens:0,diagnostics:p.currentTask.diagnostics||null,taskId:p.currentTask.id,at:p.currentTask.completedAt||p.updatedAt||new Date().toISOString()};migrated=true;
+  }
   if(p.lastFailure?.definiteNoOutput&&!p.currentTask){
     const task={id:p.lastFailure.taskId||crypto.randomUUID(),kind:'image',target:p.lastFailure.key,status:'failed_no_output',attempt:1,providerInvocationLimit:1,providerInvocations:p.lastFailure.attempts||1,startedAt:p.lastFailure.at,completedAt:p.lastFailure.at};
     p.tasks=Array.isArray(p.tasks)?p.tasks:[];p.tasks.push(task);p.currentTask=task;migrated=true;
@@ -55,7 +61,7 @@ export function recover(){
   if(['attention','paused'].includes(p.status)&&p.progress?.startedAt&&!p.progress.completedAt){p.progress.completedAt=p.lastFailure?.at||p.updatedAt||new Date().toISOString();migrated=true;}
   if(migrated)saveProject(p);
   const queued=interrupted.get(p.id);
-  if(queued?.status==='queued'){p.status='paused';p.message='上次有一步尚未开始，已安全保留。点击“继续制作”后会重新进入队列。';p.queueJob={id:queued.id,status:'recoverable',phase:queued.phase,queuedAt:queued.queuedAt};saveProject(p);}
+  if(queued?.status==='recoverable'){p.status='paused';p.message='上次有一步尚未开始，已安全保留。点击“继续制作”后会重新进入队列。';p.queueJob={id:queued.id,status:'recoverable',phase:queued.phase,queuedAt:queued.queuedAt};saveProject(p);}
   else if(['planning','sampling','generating','revising'].includes(p.status)||queued?.status==='interrupted'){p.status='paused';p.message='上次制作已暂停，已完成的内容都保留了。执行中的图片会先保留并核对，不会自动重生。';p.queueJob=queued?{id:queued.id,status:'interrupted',phase:queued.phase}:null;saveProject(p);}
 }}
 export function createProject(brief){
@@ -67,19 +73,22 @@ export function createProject(brief){
 export function job(p,phase,fn){
   if(active.has(p.id))throw new Error('这篇正在制作，请等待或先暂停。');
   const controller=new AbortController(),queued=jobStore.enqueue({projectId:p.id,phase});active.set(p.id,controller);runningProjects.set(p.id,p);
-  p.queueJob={id:queued.id,status:'queued',phase,queuedAt:queued.queuedAt};p.error=null;p.message='正在等待前一项本地创作任务完成…';p.progress={...(p.progress||{}),phase:'queued',startedAt:queued.queuedAt,completedAt:null};saveProject(p);
+  p.queueJob={id:queued.id,status:'queued',phase,queuedAt:queued.queuedAt};p.error=null;p.message='正在等待前一项本地创作任务完成…';p.progress={...p.progress,phase:'queued',startedAt:queued.queuedAt,completedAt:null};saveProject(p);
   const run=async()=>{
-    const claimed=jobStore.claim(queued.id,queueOwner);if(!claimed)return;
-    p.queueJob={id:queued.id,status:'running',phase,queuedAt:queued.queuedAt,startedAt:claimed.startedAt};p.status=phase;p.progress={...(p.progress||{}),phase,startedAt:claimed.startedAt,completedAt:null};saveProject(p);
-    const beat=setInterval(()=>jobStore.heartbeat(queued.id,queueOwner),5000);
-    try{await fn(controller.signal);jobStore.finish(queued.id,queueOwner,'completed');}
-    catch(e){p.status=controller.signal.aborted||e.code==='LOW_QUOTA'?'paused':'attention';p.error=String(e.message||e).slice(0,2000);p.message=p.error;p.progress={...p.progress,completedAt:new Date().toISOString()};if(p.currentTask?.status==='running')finishTask(p,p.currentTask,p.status==='paused'?'paused':'failed',{error:p.error});saveProject(p);jobStore.finish(queued.id,queueOwner,controller.signal.aborted?'paused':'failed',{error:p.error});}
-    finally{clearInterval(beat);p.queueJob=null;saveProject(p);active.delete(p.id);runningProjects.delete(p.id);}
+    let claimed=null,beat=null;
+    try{
+      while(!controller.signal.aborted&&!claimed){claimed=jobStore.claim(queued.id,queueOwner);if(!claimed){jobStore.reclaimOrphanedLock();await wait(200);}}
+      if(!claimed){jobStore.cancel(queued.id,'paused',{reason:'cancelled_before_start'});p.status='paused';p.message='已暂停，尚未开始这一步。';p.progress={...p.progress,completedAt:new Date().toISOString()};return;}
+      p.queueJob={id:queued.id,status:'running',phase,queuedAt:queued.queuedAt,startedAt:claimed.startedAt};p.status=phase;p.progress={...p.progress,phase,startedAt:claimed.startedAt,completedAt:null};saveProject(p);
+      beat=setInterval(()=>jobStore.heartbeat(queued.id,queueOwner),5000);
+      try{await fn(controller.signal);jobStore.finish(queued.id,queueOwner,'completed');}
+      catch(e){p.status=controller.signal.aborted||e.code==='LOW_QUOTA'?'paused':'attention';p.error=String(e.message||e).slice(0,2000);p.message=p.error;p.progress={...p.progress,completedAt:new Date().toISOString()};if(p.currentTask?.status==='running')finishTask(p,p.currentTask,p.status==='paused'?'paused':'failed',{error:p.error});saveProject(p);jobStore.finish(queued.id,queueOwner,controller.signal.aborted?'paused':'failed',{error:p.error});}
+    }finally{if(beat)clearInterval(beat);p.queueJob=null;saveProject(p);active.delete(p.id);runningProjects.delete(p.id);}
   };
   queueTail=queueTail.catch(()=>{}).then(run);return p;
 }
 function checkpoint(signal){if(signal.aborted)throw new Error('已暂停');}
-function activity(p,message,current=null,total=null,unit=null){p.message=message;p.progress={...(p.progress||{}),phase:p.status,current:current??p.progress?.current??0,total:total??p.progress?.total??1,unit:unit??p.progress?.unit??'步骤'};if(p.currentTask?.status==='running')p.currentTask.lastProgressAt=new Date().toISOString();saveProject(p);}
+function activity(p,message,current=null,total=null,unit=null){p.message=message;p.progress={...p.progress,phase:p.status,current:current??p.progress?.current??0,total:total??p.progress?.total??1,unit:unit??p.progress?.unit??'步骤'};if(p.currentTask?.status==='running')p.currentTask.lastProgressAt=new Date().toISOString();saveProject(p);}
 function addUsage(p,usage){if(!usage)return;p.metrics=p.metrics||{};for(const key of ['input_tokens','cached_input_tokens','output_tokens','reasoning_output_tokens'])p.metrics[{input_tokens:'inputTokens',cached_input_tokens:'cachedInputTokens',output_tokens:'outputTokens',reasoning_output_tokens:'reasoningOutputTokens'}[key]]=(p.metrics[{input_tokens:'inputTokens',cached_input_tokens:'cachedInputTokens',output_tokens:'outputTokens',reasoning_output_tokens:'reasoningOutputTokens'}[key]]||0)+(Number(usage[key])||0);p.metrics.totalRuns=(p.metrics.totalRuns||0)+1;}
 function modelArgs(p,effort=p.brief.reasoningEffort){return {model:p.brief.model||null,reasoningEffort:effort};}
 function promptHash(value){return crypto.createHash('sha256').update(String(value),'utf8').digest('hex');}
@@ -157,9 +166,10 @@ function runEvidence(dir){
 }
 function definiteImageFailure(pending,extra=''){
   if(!pending?.dir)return null;const evidence=runEvidence(pending.dir),classified=readGenerationEvidence(pending.dir),combined=[extra,evidence.text,evidence.eventText].filter(Boolean).join('\n');
+  if(NETWORK_FAILURE.test(combined)||classified.connectionRelated)return null;
   if(!DEFINITE_NO_IMAGE.test(combined)&&classified.outcome!=='no_image')return null;
   const attempts=Math.max(1,(evidence.eventText.match(/image generation failed/gi)||[]).length);
-  return {kind:NETWORK_FAILURE.test(combined)||classified.connectionRelated?'network':'no-output',definiteNoOutput:true,key:pending.key,attempts,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString()};
+  return {kind:'no-output',definiteNoOutput:true,key:pending.key,attempts,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString()};
 }
 function failureMessage(failure){const usage=failure.inputTokens?`本次后台处理记录约 ${failure.inputTokens.toLocaleString('zh-CN')} 输入 tokens；`:'';const action=String(failure.key||'').includes('样张')?'重试当前样张':'重试当前图片';return `${failure.kind==='network'?'生图服务连接失败':'本次生图未完成'}：已发起 ${failure.attempts} 次图片请求，但没有取得图片。${usage}自动重试已停止，上一张样张和当前节点都已保存。实际订阅余额以页面顶部为准；网络稳定后点击“${action}”，只会重试这一张。`;}
 function sampleRepairCount(p,index){
@@ -177,7 +187,7 @@ function sampleIndexFromKey(key=''){
 function panelKeyFromImageKey(key=''){
   const chinese=/第(\d+)页-第(\d+)格/.exec(key);
   if(chinese)return `${chinese[1]}-${chinese[2]}`;
-  const legacy=/^(\d+)-(\d+)-/.exec(key);
+  const legacy=/^(\d+)-(\d+)(?:-|$)/.exec(key);
   return legacy?`${legacy[1]}-${legacy[2]}`:null;
 }
 function attachImageRecord(p,record){
@@ -263,13 +273,6 @@ function generatedCandidates(dir,after){
     try{return fs.statSync(file).isFile()&&fs.statSync(file).mtimeMs>=after-5000;}catch{return false;}
   }).sort((a,b)=>fs.statSync(b).mtimeMs-fs.statSync(a).mtimeMs);
 }
-function findGenerated(dir,after){
-  const files=generatedCandidates(dir,after)||[];
-  // A thread can legitimately contain several outputs.  Selecting the newest
-  // one would attach somebody else's variant to this panel, so leave it
-  // recoverable until there is exactly one attributable candidate.
-  return files.length===1?files[0]:null;
-}
 function extensionForImage(info,file){
   const format=String(info?.format||'').toLowerCase();
   if(format==='jpeg')return '.jpg';if(['png','webp'].includes(format))return `.${format}`;
@@ -291,27 +294,31 @@ async function persistImage(source,target){
 }
 function writeRunResult(dir,result){if(dir)jsonWrite(path.join(dir,'result.json'),result);}
 function writeRunRequest(dir,p,task,pending){
+  const summarize=file=>{try{return {name:path.basename(file),sizeBytes:fs.statSync(file).size,sha256:checksum(file)};}catch{return {name:path.basename(file),missing:true};}};
   jsonWrite(path.join(dir,'request.json'),{schemaVersion:1,taskId:task.id,attempt:task.attempt,target:pending.key,createdAt:pending.at,
-    expectedOutput:path.relative(projectDir(p.id),pending.file),model:p.brief.model||null,reasoningEffort:p.brief.reasoningEffort,
-    promptSha256:pending.telemetry.promptSha256,promptCharacters:pending.telemetry.promptCharacters,referenceNames:pending.refs,source:task.source});
+    projectVersion:p.version,expectedOutput:path.relative(projectDir(p.id),pending.file),model:p.brief.model||null,reasoningEffort:p.brief.reasoningEffort,
+    promptSha256:pending.telemetry.promptSha256,promptCharacters:pending.telemetry.promptCharacters,referenceNames:pending.refs,referenceFiles:pending.inputFiles.map(summarize),editTarget:pending.prior?summarize(pending.prior):null,source:task.source});
 }
-async function generate(p,key,prompt,refnames,signal,prior=null,verify=true,qaKind='原始分镜'){
+function attributableCandidates(pending){
+  const evidence=readGenerationEvidence(pending.dir||''),inputs=new Set((pending.inputFiles||[]).map(file=>path.resolve(file)));
+  const target=fs.existsSync(pending.file)?[pending.file]:[],threaded=generatedCandidates(pending.dir,Date.parse(pending.at))||[];
+  const candidates=[...new Set([...target,...threaded].map(file=>path.resolve(file)).filter(file=>!inputs.has(file)))];
+  return {evidence,candidates};
+}
+async function generate(p,key,prompt,refnames,signal,prior=null,verify=true,qaKind='原始分镜',attempt=1){
   checkpoint(signal);await protectQuota(p);checkpoint(signal);const refs=imageRefs(p,refnames);const folder=path.join(versionDir(p),'素材');fs.mkdirSync(folder,{recursive:true});
   if(p.pending)throw new Error('当前图片任务尚未结束，请先检查已有原图。');
-  let file=path.join(folder,`${key}-${Date.now()}.png`);const dir=runDir(p,key);const telemetry=promptTelemetry(prompt,refs,{requestedReferenceCount:refnames.length,source:prior?'edit':'generate'});const task=beginTask(p,'image',key,{providerInvocationLimit:1,providerInvocations:0,source:prior?'edit':'generate',telemetry});const pending={key,file,dir,prompt,refs:refnames,taskId:task.id,telemetry,at:new Date().toISOString()};
+  let file=path.join(folder,`${key}-${Date.now()}.png`);const dir=runDir(p,key);const inputFiles=prior?[prior,...refs]:refs;const telemetry=promptTelemetry(prompt,refs,{requestedReferenceCount:refnames.length,source:prior?'edit':'generate'});const task=beginTask(p,'image',key,{attempt,providerInvocationLimit:1,providerInvocations:0,source:prior?'edit':'generate',telemetry});const pending={key,file,dir,prompt,refs:refnames,inputFiles,prior,taskId:task.id,telemetry,at:new Date().toISOString()};
   writeRunRequest(dir,p,task,pending);p.pending=pending;p.lastFailure=null;saveProject(p);
   let failure,made=null;
   try{task.providerInvocations=1;saveProject(p);made=await runCodex({dir,signal,image:true,writableDirs:[folder],images:prior?[prior,...refs]:refs,...modelArgs(p),
-    prompt:`你在本地温蒂漫画创作室后台执行已经由用户在网页明确确认的单张生图。用户已授权使用内置 image_gen，无需再次提问。只做这一张，不调用浏览器或API，不发布任何内容，不改任何既有文件。只允许调用一次 image_gen；若工具返回网络或连接错误，立即结束并明确说明没有产出，不要在同一次任务中第二次调用 image_gen。附件中的两张温蒂人设必须同时参考，其余附件仅锁定所需环境或物件；${prior?'第一张为编辑目标，只修订指定问题，保留其余正确内容。':'创建新的独立分镜。'}\n${fs.readFileSync(path.join(versionDir(p),'制作提示词胶囊.txt'),'utf8')}\n本次要求：${prompt}\n使用内置image_gen生成${prior?'或编辑':''}后，复制到准确路径 ${file}。不得用截屏或程序绘制代替。最后返回真实原图绝对路径。`,
+    prompt:`你在本地温蒂漫画创作室后台执行已经由用户在网页明确确认的单张生图。用户已授权使用内置 image_gen，无需再次提问。只做这一张，不调用浏览器或API，不发布任何内容，不改任何既有文件。只允许调用一次 image_gen；若工具返回网络或连接错误，立即结束并如实返回原始错误，不要推断远端是否已经产出，也不要在同一次任务中第二次调用 image_gen。附件中的两张温蒂人设必须同时参考，其余附件仅锁定所需环境或物件；${prior?'第一张为编辑目标，只修订指定问题，保留其余正确内容。':'创建新的独立分镜。'}\n${fs.readFileSync(path.join(versionDir(p),'制作提示词胶囊.txt'),'utf8')}\n本次要求：${prompt}\n使用内置image_gen生成${prior?'或编辑':''}后，复制到准确路径 ${file}。不得用截屏或程序绘制代替。最后返回真实原图绝对路径。`,
     });addUsage(p,made.usage);}catch(e){failure=e;}
-  checkpoint(signal);
   // A transport error after download must not trigger a second image request.
   // Prefer the explicit output path, then a reported path, then exactly one
   // image in this task's own thread.  Ambiguous candidates are recorded but
   // never guessed at.
-  const evidence=readGenerationEvidence(dir);const reported=[...new Set(evidence.imagePaths||[])].filter(candidate=>fs.existsSync(candidate));
-  const threaded=generatedCandidates(dir,Date.parse(pending.at))||[];
-  const candidates=[...new Set([fs.existsSync(file)?file:null,...reported,...threaded].filter(Boolean))];
+  const {evidence,candidates}=attributableCandidates(pending);
   let persisted=null;
   if(fs.existsSync(file))persisted=await persistImage(file,file);
   else if(candidates.length===1)persisted=await persistImage(candidates[0],file);
@@ -332,6 +339,7 @@ async function generate(p,key,prompt,refnames,signal,prior=null,verify=true,qaKi
   jsonWrite(file+'.json',record);recordArtifact(p,`image:${key}`,'image',record.file,prior?[`image:${key.replace(/-局部修订$/,'')}`]:[]);attachImageRecord(p,record);p.pending=null;p.lastFailure=null;finishTask(p,task,'artifact_saved',{artifact:file,qa:verify?'pending':'deferred'});saveProject(p);
   if(!verify)return record;
   try{
+    checkpoint(signal);
     const check=await qa(p,file,prompt,refs,signal,qaKind);
     record.qa=check;jsonWrite(file+'.json',record);finishTask(p,task,'completed',{artifact:file,qa:check.pass?'passed':'needs_review'});saveProject(p);return record;
   }catch(error){
@@ -485,12 +493,36 @@ export function resume(p){if(p.pending){
   }
   return generatePages(p);
 }
+export function retryableImageFailure(p){
+  if(p.lastFailure?.definiteNoOutput===true)return p.lastFailure;
+  const task=p.currentTask;
+  if(task?.status==='failed_no_output'&&task.target)return {kind:task.errorCode==='no-output'?'no-output':'network',definiteNoOutput:true,key:task.target,attempts:task.providerInvocations||1,taskId:task.id,at:task.completedAt||p.updatedAt||new Date().toISOString()};
+  return null;
+}
+export function retryMissingImage(p,target){
+  verifyApproval(p);if(p.pending)throw new Error('上次生成结果尚未确认，请先检查已保存图片。');
+  const failure=retryableImageFailure(p);if(!failure||failure.key!==target)throw new Error('当前没有可安全重试的这张图片。');
+  const sampleIndex=sampleIndexFromKey(target),panelKey=panelKeyFromImageKey(target);
+  if(sampleIndex===null&&!panelKey)throw new Error('无法识别需要重试的图片。');
+  p.lastFailure=null;p.error=null;
+  return job(p,'revising',async signal=>{
+    activity(p,`正在只重新生成 ${target}…`);
+    if(sampleIndex!==null){
+      const sample=p.plan.samples[sampleIndex];if(!sample)throw new Error('对应样张不存在。');
+      const result=await generate(p,`样张-${sampleIndex+1}`,`${sample.prompt}。单幅竖图，优先3:4；若内置生图返回标准2:3竖幅，保留原图，不裁切，也不要因此再次生图。`,sample.references,signal,null,true,'方向样张',(failure.attempts||1)+1);
+      p.samples[sampleIndex]=result;p.samplesApproved=false;p.samplesDecision=null;p.status='paused';p.message=`${target} 已重新生成并保存，请查看后继续。`;saveProject(p);return;
+    }
+    const [pageNumber,panelNumber]=panelKey.split('-').map(Number),page=p.plan.pages[pageNumber-1],panel=page?.panels[panelNumber-1];if(!panel)throw new Error('对应分镜不存在。');
+    const geoFile=path.join(runDir(p,'分镜比例'),'page.json');jsonWrite(geoFile,page);const geometry=JSON.parse(await pythonRun(['geometry',geoFile]))[panelNumber-1];
+    const prompt=compilePanelPrompt(pageNumber,panelNumber,panel,geometry,p.revisionNotes.filter(x=>x.key===panelKey||x.key===target));
+    const result=await generate(p,`第${pageNumber}页-第${panelNumber}格`,prompt,panel.references,signal,null,p.brief.workflowPreset==='careful','原始分镜',(failure.attempts||1)+1);
+    p.panels[panelKey]=result;p.pages=p.pages.filter(item=>item.number!==pageNumber);invalidateArtifacts(p,[`image:${panelKey}`,`page:${pageNumber}`]);p.storyQA=null;p.bundle=null;p.accepted=false;p.status='paused';p.message=`${target} 已重新生成并保存；本次不会继续生成其他分镜。`;saveProject(p);
+  });
+}
 export function recoverImage(p){verifyApproval(p);if(!p.pending)throw new Error('没有待找回的图片');return job(p,'revising',async()=>{
   const pending=p.pending;
   let file=pending.file;
-  const evidence=readGenerationEvidence(pending.dir||'');const reported=[...new Set(evidence.imagePaths||[])].filter(candidate=>fs.existsSync(candidate));
-  const threaded=generatedCandidates(pending.dir,Date.parse(pending.at))||[];
-  const candidates=[...new Set([fs.existsSync(file)?file:null,...reported,...threaded].filter(Boolean))];
+  const {evidence,candidates}=attributableCandidates(pending);
   let persisted=null;
   if(fs.existsSync(file))persisted=await persistImage(file,file);
   else if(candidates.length===1)persisted=await persistImage(candidates[0],file);

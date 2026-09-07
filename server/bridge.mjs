@@ -57,8 +57,10 @@ export function classifyGenerationEvidence({events=[],responseText='',runId=null
   const eventRunId=identifier(normalizedEvents,['run_id','runId','turn_id','turnId']);
   const clearNoImage=CLEAR_NO_IMAGE.test(evidenceText);
   const networkInterrupted=NETWORK_INTERRUPTION.test(evidenceText);
-  const outcome=imagePaths.length?'image_path_reported':clearNoImage?'no_image':networkInterrupted?'network_interrupted':'unknown';
-  const reason=outcome==='image_path_reported'?'reported_image_path':outcome==='no_image'?(networkInterrupted?'reported_no_image_after_connection_error':'reported_no_image'):outcome==='network_interrupted'?'connection_interrupted':'insufficient_evidence';
+  // A connection error can arrive after the provider has completed the image.
+  // Natural-language claims about "no image" do not make that state certain.
+  const outcome=imagePaths.length?'image_path_reported':networkInterrupted?'network_interrupted':clearNoImage?'no_image':'unknown';
+  const reason=outcome==='image_path_reported'?'reported_image_path':outcome==='no_image'?'reported_no_image':outcome==='network_interrupted'?'connection_interrupted':'insufficient_evidence';
   return {
     outcome,
     reason,
@@ -127,7 +129,7 @@ export function appServerSnapshot(timeoutMs=8000) {
   return new Promise(resolve=>{
     const child=spawn(bin,['app-server','--stdio'],{stdio:['pipe','pipe','pipe'],env:{...process.env,NO_COLOR:'1'}});
     const rl=readline.createInterface({input:child.stdout});
-    const found={models:null,rateLimits:null,usage:null};let settled=false,timer;
+    const found={models:null,rateLimits:null,usage:null};let settled=false;
     const finish=(extra={})=>{if(settled)return;settled=true;clearTimeout(timer);rl.close();child.kill('SIGTERM');resolve({...found,...extra});};
     const send=value=>child.stdin.write(JSON.stringify(value)+'\n');
     rl.on('line',line=>{try{
@@ -144,7 +146,7 @@ export function appServerSnapshot(timeoutMs=8000) {
     }catch{}});
     child.on('error',err=>finish({error:'无法读取创作账户：'+err.message}));
     child.on('close',code=>{if(!settled)finish({error:code===0?'创作账户信息暂不可用。':'创作账户连接中断。'});});
-    timer=setTimeout(()=>finish({status:'stale',error:'读取创作账户信息超时，可稍后刷新。'}),timeoutMs);
+    const timer=setTimeout(()=>finish({status:'stale',error:'读取创作账户信息超时，可稍后刷新。'}),timeoutMs);
     send({method:'initialize',id:0,params:{clientInfo:{name:'wendi_studio',title:'温蒂创作室',version:'2.0.0'}}});
   });
 }
@@ -179,11 +181,11 @@ export function rateLimitSnapshot(timeoutMs=12000,{force=false}={}){
   if(rateLimitCache.inFlight)return rateLimitCache.inFlight;
   rateLimitCache.inFlight=new Promise(resolve=>{
     const child=spawn(bin,['app-server','--stdio'],{stdio:['pipe','pipe','pipe'],env:{...process.env,NO_COLOR:'1'}});
-    const rl=readline.createInterface({input:child.stdout});let settled=false,timer;
+    const rl=readline.createInterface({input:child.stdout});let settled=false;
     const finish=value=>{if(settled)return;settled=true;clearTimeout(timer);rl.close();child.kill('SIGTERM');if(value){rateLimitCache.value=value;rateLimitCache.observedAt=Date.now();}resolve(value||rateLimitCache.value||null);};
     const send=value=>child.stdin.write(JSON.stringify(value)+'\n');
     rl.on('line',line=>{try{const msg=JSON.parse(line);if(msg.id===0&&msg.result){send({method:'initialized',params:{}});send({method:'account/rateLimits/read',id:1});}else if(msg.id===1)finish(normalizeRateLimits(msg.result));}catch{}});
-    child.on('error',()=>finish(null));child.on('close',()=>finish(null));timer=setTimeout(()=>finish(null),timeoutMs);
+    child.on('error',()=>finish(null));child.on('close',()=>finish(null));const timer=setTimeout(()=>finish(null),timeoutMs);
     send({method:'initialize',id:0,params:{clientInfo:{name:'wendi_studio_guard',title:'温蒂创作室额度保护',version:'2.1.0'}}});
   });
   return rateLimitCache.inFlight.finally(()=>{rateLimitCache.inFlight=null;});
