@@ -21,11 +21,12 @@ fs.writeFileSync(fake,`#!${process.execPath}\nimport fs from 'node:fs';import pa
 const a=process.argv.slice(2);if(a[0]==='login'){console.log('Logged in using ChatGPT');process.exit(0);}let p='';for await(const c of process.stdin)p+=c;
 fs.appendFileSync(process.env.WENDI_TEST_CALLS,'call\\n');
 const out=a[a.indexOf('-o')+1];let text='';
-if(a.includes('--output-schema')){const s=JSON.parse(fs.readFileSync(a[a.indexOf('--output-schema')+1]));const marker=process.env.WENDI_TEST_FAIL_SAMPLE_ONCE;if(!s.properties.pages&&marker&&p.includes('脸部近景')&&!fs.existsSync(marker)){fs.writeFileSync(marker,'1');text=JSON.stringify({pass:false,summary:'TEST FIXTURE REPAIR',issues:['前臂与提带关系不自然'],issueDetails:[{id:'arm-strap',category:'anatomy',severity:'blocking',location:'左前臂',description:'前臂与提带关系不自然',repairAction:'regenerate'}],repairPrompt:'修正前臂与提带关系'});}else text=JSON.stringify(s.properties.pages?JSON.parse(fs.readFileSync(process.env.WENDI_TEST_PLAN_FILE)): {pass:true,summary:'TEST FIXTURE CHECK ONLY',issues:[],issueDetails:[],repairPrompt:''});}
-else {const noImage=process.env.WENDI_TEST_NO_IMAGE_ONCE;if(noImage&&!fs.existsSync(noImage)){fs.writeFileSync(noImage,'1');text='未能生成：内置 image_gen 连接错误，目标路径尚不存在。';}else{const m=p.match(/复制到准确路径 ([^\\n]+?\\.png)/);if(!m)process.exit(2);const file=m[1];fs.mkdirSync(path.dirname(file),{recursive:true});const r=p.match(/目标原始画面宽高比 (\\d+):(\\d+)/);const w=r?+r[1]:750,h=r?+r[2]:1000;execFileSync('/Library/Frameworks/Python.framework/Versions/3.10/bin/python3',['-c','from PIL import Image,ImageDraw; import sys; im=Image.new("RGB",(int(sys.argv[2]),int(sys.argv[3])),"#d8dfce"); ImageDraw.Draw(im).text((20,20),"PIPELINE TEST ONLY",fill="black"); im.save(sys.argv[1])',file,String(w),String(h)]);text=file;}}
+if(a.includes('--output-schema')){const s=JSON.parse(fs.readFileSync(a[a.indexOf('--output-schema')+1]));const marker=process.env.WENDI_TEST_FAIL_SAMPLE_ONCE,crash=process.env.WENDI_TEST_CRASH_QA_ONCE;if(!s.properties.pages&&crash&&p.includes('脸部近景')&&!fs.existsSync(crash)){fs.writeFileSync(crash,'1');process.exit(42);}else if(!s.properties.pages&&marker&&p.includes('脸部近景')&&!fs.existsSync(marker)){fs.writeFileSync(marker,'1');text=JSON.stringify({pass:false,summary:'TEST FIXTURE REPAIR',issues:['前臂与提带关系不自然'],issueDetails:[{id:'arm-strap',category:'anatomy',severity:'blocking',location:'左前臂',description:'前臂与提带关系不自然',repairAction:'regenerate'}],repairPrompt:'修正前臂与提带关系'});}else text=JSON.stringify(s.properties.pages?JSON.parse(fs.readFileSync(process.env.WENDI_TEST_PLAN_FILE)): {pass:true,summary:'TEST FIXTURE CHECK ONLY',issues:[],issueDetails:[],repairPrompt:''});}
+else {const noImage=process.env.WENDI_TEST_NO_IMAGE_ONCE;if(noImage&&!fs.existsSync(noImage)){fs.writeFileSync(noImage,'1');text=process.env.WENDI_TEST_NO_IMAGE_TEXT||'未能生成：内置 image_gen 连接错误，目标路径尚不存在。';}else{const m=p.match(/复制到准确路径 ([^\\n]+?\\.png)/);if(!m)process.exit(2);const file=m[1];fs.mkdirSync(path.dirname(file),{recursive:true});const r=p.match(/目标原始画面宽高比 (\\d+):(\\d+)/);const w=r?+r[1]:750,h=r?+r[2]:1000;execFileSync('/Library/Frameworks/Python.framework/Versions/3.10/bin/python3',['-c','from PIL import Image,ImageDraw; import sys; im=Image.new("RGB",(int(sys.argv[2]),int(sys.argv[3])),"#d8dfce"); ImageDraw.Draw(im).text((20,20),"PIPELINE TEST ONLY",fill="black"); im.save(sys.argv[1])',file,String(w),String(h)]);text=file;}}
 fs.writeFileSync(out,text);console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text}}));console.log(JSON.stringify({type:'turn.completed'}));
 `,{mode:0o700});
 async function done(id){for(let i=0;i<200;i++){if(!E.active.has(id))return E.readProject(id);await new Promise(r=>setTimeout(r,50));}throw new Error('test job timed out');}
+function callCount(){return fs.existsSync(process.env.WENDI_TEST_CALLS)?fs.readFileSync(process.env.WENDI_TEST_CALLS,'utf8').split('\n').filter(Boolean).length:0;}
 const brief={idea:'测试这一个完整故事流程',pageCount:1,allowXiaolin:false,tangyuan:'不出现'};
 let p;
 test('input validation and restricted references',()=>{
@@ -47,6 +48,14 @@ test('manual title is retained when a later plan is saved',async()=>{
   E.planProject(named);named=await done(named.id);
   assert.equal(named.title,'用户指定名称');assert.equal(named.schemaVersion,3);assert(named.revision>0);
 });
+test('the durable local queue runs separate projects one at a time',async()=>{
+  let first=E.createProject(brief),second=E.createProject({...brief,idea:'第二个并发的队列流程'});const events=[];
+  E.job(first,'planning',async()=>{events.push('first-start');await new Promise(resolve=>setTimeout(resolve,80));events.push('first-end');});
+  E.job(second,'planning',async()=>{events.push('second-start');events.push('second-end');});
+  first=await done(first.id);second=await done(second.id);
+  assert.deepEqual(events,['first-start','first-end','second-start','second-end']);assert.equal(first.queueJob,null);assert.equal(second.queueJob,null);
+  const queue=path.join(process.env.WENDI_DATA_DIR,'.任务队列','jobs');const records=fs.readdirSync(queue).map(name=>JSON.parse(fs.readFileSync(path.join(queue,name),'utf8'))).filter(job=>[first.id,second.id].includes(job.projectId));assert.equal(records.length,2);assert(records.every(job=>job.status==='completed'&&job.heartbeatAt));
+});
 test('planning, frozen approval, samples gate and production',async()=>{
   p=E.createProject(brief);assert.throws(()=>E.generatePages(p),/确认/);
   E.planProject(p);p=await done(p.id);assert.equal(p.status,'review');assert.equal(p.pages.length,0);
@@ -54,6 +63,10 @@ test('planning, frozen approval, samples gate and production',async()=>{
   E.approvePlan(p,W.digest(p.plan));p=await done(p.id);assert.equal(p.status,'samples_review');assert.equal(p.samples.length,2);assert.equal(p.pages.length,0);
   const version=path.join(E.projectDir(p.id),'v1');assert(fs.existsSync(path.join(version,'工作要求快照.md')));
   assert(fs.existsSync(path.join(version,'参考',W.FACE[0])));assert(fs.existsSync(path.join(version,'参考',W.FACE[1])));
+  const imageRuns=fs.readdirSync(path.join(E.projectDir(p.id),'.制作记录')).filter(name=>name.includes('样张-'));
+  assert(imageRuns.length>=2);const manifestDir=path.join(E.projectDir(p.id),'.制作记录',imageRuns[0]);
+  const request=JSON.parse(fs.readFileSync(path.join(manifestDir,'request.json'),'utf8')),result=JSON.parse(fs.readFileSync(path.join(manifestDir,'result.json'),'utf8'));
+  assert.equal(request.schemaVersion,1);assert.equal(request.target.startsWith('样张-'),true);assert.equal(result.outcome,'artifact_saved');assert.equal(typeof result.integrity.sha256,'string');
   assert.throws(()=>E.generatePages(p),/样张/);
   E.approveSamples(p,p.approved.hash);p=await done(p.id);assert.equal(p.status,'ready');assert.equal(p.pages.length,1);assert.equal(p.accepted,false);
   const file=W.inside(E.projectDir(p.id),p.pages[0].file);const info=JSON.parse(await B.pythonRun(['info',file]));assert.deepEqual(info,{width:1080,height:1440,mode:'RGB',format:'PNG'});
@@ -74,14 +87,14 @@ test('legacy version snapshots restore missing prompt capsule and references bef
   assert(fs.existsSync(path.join(version,'制作提示词胶囊.txt')));
   assert(fs.existsSync(reference));
 });
-test('sample QA automatically makes a targeted repair before asking the user',async()=>{
+test('sample QA stops at an explicit decision instead of automatically redrawing',async()=>{
   const marker=path.join(temp,'failed-sample-once');process.env.WENDI_TEST_FAIL_SAMPLE_ONCE=marker;
   let automatic=E.createProject(brief);E.planProject(automatic);automatic=await done(automatic.id);E.approvePlan(automatic,W.digest(automatic.plan));automatic=await done(automatic.id);
   delete process.env.WENDI_TEST_FAIL_SAMPLE_ONCE;
-  assert.equal(automatic.status,'samples_review');
+  assert.equal(automatic.status,'samples_decision');
   assert(fs.existsSync(marker));
-  assert(automatic.samples[0].key.includes('自动修订1'));
-  assert.equal(automatic.sampleRepairCounts[0],1);
+  assert.equal(automatic.samples[0].key,'样张-1');
+  assert.equal(automatic.sampleRepairCounts[0],0);
 });
 test('known image network failure stops without a misleading recovery state',async()=>{
   const marker=path.join(temp,'no-image-once');process.env.WENDI_TEST_NO_IMAGE_ONCE=marker;
@@ -91,13 +104,19 @@ test('known image network failure stops without a misleading recovery state',asy
   assert.match(failed.message,/没有取得图片/);assert.match(failed.message,/自动重试已停止/);assert.match(failed.message,/重试当前样张/);
   assert.equal(failed.currentTask.status,'failed_no_output');assert.equal(failed.currentTask.providerInvocationLimit,1);assert.equal(failed.currentTask.providerInvocations,1);
 });
-test('sample resume reuses the last failed image and keeps a lifetime repair count',async()=>{
+test('explicit no-image evidence never falls into the uncertain recovery path',async()=>{
+  for(const text of ['生成工具返回网络连接错误，未产生任何图片，也未写入目标路径。','本次请求未产出任何图片。']){
+    const marker=path.join(temp,`no-output-${Buffer.from(text).toString('hex').slice(0,12)}`);process.env.WENDI_TEST_NO_IMAGE_ONCE=marker;process.env.WENDI_TEST_NO_IMAGE_TEXT=text;
+    let failed=E.createProject(brief);E.planProject(failed);failed=await done(failed.id);E.approvePlan(failed,W.digest(failed.plan));failed=await done(failed.id);
+    assert.equal(failed.status,'attention',text);assert.equal(failed.pending,null,text);assert(['network','no-output'].includes(failed.lastFailure.kind),text);assert.equal(failed.currentTask.status,'failed_no_output',text);assert.doesNotMatch(failed.message,/检查已有原图|找回已生成图片/,text);
+  }
+  delete process.env.WENDI_TEST_NO_IMAGE_ONCE;delete process.env.WENDI_TEST_NO_IMAGE_TEXT;
+});
+test('sample resume never redraws a failed sample without an explicit decision',async()=>{
   let continued=E.createProject(brief);E.planProject(continued);continued=await done(continued.id);E.approvePlan(continued,W.digest(continued.plan));continued=await done(continued.id);
   continued.samples[0].key='样张-1-自动修订1';continued.samples[0].qa={pass:false,summary:'TEST MATERIAL ISSUE',issues:['前臂与提带关系不自然'],repairPrompt:'修正前臂与提带关系'};continued.sampleRepairCounts=[1,0];continued.status='attention';E.saveProject(continued);
-  E.resume(continued);continued=await done(continued.id);
-  assert.equal(continued.status,'samples_review');assert(continued.samples[0].key.includes('自动修订2'));assert.equal(continued.sampleRepairCounts[0],2);
-  const prompt=fs.readFileSync(path.join(E.projectDir(continued.id),'.制作记录',fs.readdirSync(path.join(E.projectDir(continued.id),'.制作记录')).filter(x=>x.includes('样张-1-自动修订2')).sort().at(-1),'prompt.txt'),'utf8');
-  assert.match(prompt,/第一张为编辑目标/);assert.match(prompt,/只允许调用一次 image_gen/);
+  const before=callCount();E.resume(continued);continued=await done(continued.id);
+  assert.equal(continued.status,'samples_decision');assert.equal(continued.samples[0].key,'样张-1-自动修订1');assert.equal(callCount(),before);
 });
 test('sample-only 2:3 ratio issue is accepted without another image request',async()=>{
   let ratio=E.createProject(brief);E.planProject(ratio);ratio=await done(ratio.id);E.approvePlan(ratio,W.digest(ratio.plan));ratio=await done(ratio.id);
@@ -105,11 +124,41 @@ test('sample-only 2:3 ratio issue is accepted without another image request',asy
   const before=fs.readFileSync(process.env.WENDI_TEST_CALLS,'utf8');E.resume(ratio);ratio=await done(ratio.id);
   assert.equal(ratio.status,'samples_review');assert.equal(ratio.samples[0].qa.pass,true);assert.equal(fs.readFileSync(process.env.WENDI_TEST_CALLS,'utf8'),before);
 });
-test('manual continuation accepts a sample after its automatic repair limit',async()=>{
+test('resume never accepts a blocked sample or starts formal production without an explicit decision',async()=>{
   let blocked=E.createProject(brief);E.planProject(blocked);blocked=await done(blocked.id);E.approvePlan(blocked,W.digest(blocked.plan));blocked=await done(blocked.id);
   blocked.samples[0].qa={pass:false,summary:'需要人工决定',issues:['手部需要调整'],issueDetails:[{category:'anatomy',severity:'review',repairAction:'regenerate',description:'手部需要调整'}]};blocked.sampleRepairCounts=[2,0];blocked.status='attention';E.saveProject(blocked);
-  E.resume(blocked);blocked=await done(blocked.id);
-  assert.equal(blocked.samplesApproved,true);assert.equal(blocked.sampleAcceptance.mode,'manual_after_auto_limit');assert.equal(blocked.sampleAcceptance.knownIssues[0].sample,1);assert.equal(blocked.status,'ready');
+  const before=callCount();E.resume(blocked);blocked=await done(blocked.id);
+  assert.equal(blocked.status,'samples_decision');assert.equal(blocked.samplesApproved,false);assert.equal(blocked.pages.length,0);assert.equal(callCount(),before);assert.notEqual(blocked.sampleAcceptance?.mode,'manual_after_auto_limit');assert.throws(()=>E.generatePages(blocked),/确认/);
+});
+test('recovering an existing original is local and restores a viewable sample record',async()=>{
+  let restored=E.createProject(brief);E.planProject(restored);restored=await done(restored.id);E.approvePlan(restored,W.digest(restored.plan));restored=await done(restored.id);
+  const original=W.inside(E.projectDir(restored.id),restored.samples[0].file),file=path.join(E.projectDir(restored.id),'v1','素材','找回测试原图.png');fs.copyFileSync(original,file);
+  restored.samples=[];restored.pending={key:'样张-1',file,dir:path.join(E.projectDir(restored.id),'.制作记录','已找到原图'),prompt:'脸部近景',refs:[],at:new Date().toISOString()};restored.status='attention';E.saveProject(restored);
+  const before=callCount();E.recoverImage(restored);restored=await done(restored.id);
+  assert.equal(callCount(),before);assert.equal(restored.pending,null);assert.equal(restored.samples[0].file,path.relative(E.projectDir(restored.id),file));assert(fs.existsSync(W.inside(E.projectDir(restored.id),restored.samples[0].file)));assert(restored.artifacts.some(x=>x.id==='image:样张-1'));
+});
+test('an image artifact and its record survive a QA transport failure',async()=>{
+  const marker=path.join(temp,'qa-transport-failure');process.env.WENDI_TEST_CRASH_QA_ONCE=marker;
+  let failed=E.createProject(brief);E.planProject(failed);failed=await done(failed.id);E.approvePlan(failed,W.digest(failed.plan));failed=await done(failed.id);
+  delete process.env.WENDI_TEST_CRASH_QA_ONCE;
+  const image=failed.artifacts.find(x=>x.id==='image:样张-1');assert(image);assert(fs.existsSync(W.inside(E.projectDir(failed.id),image.file)));assert.equal(failed.samples[0].file,image.file);assert.notEqual(failed.samples[0].qa?.pass,true);
+});
+test('rechecking a saved image adds only a review task and preserves the original',async()=>{
+  let reviewed=E.createProject(brief);E.planProject(reviewed);reviewed=await done(reviewed.id);E.approvePlan(reviewed,W.digest(reviewed.plan));reviewed=await done(reviewed.id);
+  const beforeFile=reviewed.samples[0].file,beforeImageTasks=reviewed.tasks.filter(task=>task.kind==='image').length;
+  reviewed.samples[0].qa={pass:null,status:'unavailable',summary:'校对连接中断',issues:[],repairPrompt:''};reviewed.status='paused';E.saveProject(reviewed);
+  E.reviewImage(reviewed,'sample-1');reviewed=await done(reviewed.id);
+  assert.equal(reviewed.samples[0].file,beforeFile);assert.equal(reviewed.samples[0].qa.pass,true);assert.equal(reviewed.tasks.filter(task=>task.kind==='image').length,beforeImageTasks);assert.equal(reviewed.currentTask.kind,'review');
+});
+test('ambiguous thread candidates stay recoverable instead of being claimed as the newest image',async()=>{
+  let ambiguous=E.createProject(brief);ambiguous.plan=structuredClone(plan);ambiguous.version=1;ambiguous.approved={version:1,hash:W.digest(ambiguous.plan)};
+  const run=path.join(E.projectDir(ambiguous.id),'.制作记录','ambiguous');const thread='11111111-1111-4111-8111-111111111111',home=path.join(temp,'codex-home');process.env.CODEX_HOME=home;
+  fs.mkdirSync(run,{recursive:true});fs.writeFileSync(path.join(run,'events.jsonl'),JSON.stringify({type:'thread.started',thread_id:thread})+'\n');
+  const generated=path.join(home,'generated_images',thread);fs.mkdirSync(generated,{recursive:true});const source=path.join(W.REFS,W.FACE[0]);fs.copyFileSync(source,path.join(generated,'first.png'));fs.copyFileSync(source,path.join(generated,'second.png'));
+  ambiguous.pending={key:'样张-1',file:path.join(E.projectDir(ambiguous.id),'v1','素材','missing.png'),dir:run,prompt:'脸部近景',refs:[],at:new Date().toISOString()};ambiguous.status='attention';E.saveProject(ambiguous);
+  E.recoverImage(ambiguous);ambiguous=await done(ambiguous.id);
+  assert.equal(ambiguous.status,'attention');assert.equal(ambiguous.pending.key,'样张-1');assert.equal(ambiguous.samples.length,0);
+  delete process.env.CODEX_HOME;
 });
 test('revisions invalidate approval but preserve history and accepted files',async()=>{
   const previous=p.pages[0].finalFile;
@@ -137,6 +186,10 @@ test('HTTP service serves built app and blocks foreign writes and unlisted files
     assert.equal((await fetch(base+'/')).status,200);
     const switched=await (await fetch(base+`/api/projects/${p.id}/settings`,{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:JSON.stringify({model:'fixture-model',reasoningEffort:'low'})})).json();assert.equal(switched.brief.model,'fixture-model');assert.equal(switched.modelHistory.at(-1).to.model,'fixture-model');
     const renamed=await (await fetch(base+`/api/projects/${p.id}/title`,{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:JSON.stringify({title:'已改名的流程测试'})})).json();assert.equal(renamed.title,'已改名的流程测试');
+    let retryable=E.createProject(brief);retryable.plan=structuredClone(plan);retryable.version=1;retryable.approved={version:1,hash:W.digest(retryable.plan)};retryable.samplesApproved=true;retryable.status='attention';retryable.pending=null;retryable.lastFailure={kind:'network',definiteNoOutput:true,key:'第1页-第1格',attempts:1,at:new Date().toISOString()};E.saveProject(retryable);
+    const retryBody={confirmNoImage:true,idempotencyKey:`retry:${retryable.id}:fixture`},retryURL=base+`/api/projects/${retryable.id}/retry-missing`;
+    const retried=await fetch(retryURL,{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:JSON.stringify(retryBody)});assert.equal(retried.status,200);const retriedProject=await retried.json();assert.notEqual(retriedProject.error,'请先确认没有生成图片。');
+    const replay=await (await fetch(retryURL,{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:JSON.stringify(retryBody)})).json();assert.equal(replay.idempotent,true);
     assert.equal((await fetch(base+'/api/projects',{method:'POST',headers:{'Content-Type':'application/json',Origin:'https://untrusted.example','X-Wendi-Request':'studio'},body:JSON.stringify(brief)})).status,403);
     assert.equal((await fetch(base+'/api/projects',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(brief)})).status,403);
     assert.equal((await fetch(base+'/media/project/'+p.id+'/project.json')).status,404);

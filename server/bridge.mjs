@@ -3,6 +3,96 @@ import path from 'node:path';
 import {spawn, execFileSync} from 'node:child_process';
 import readline from 'node:readline';
 import {APP} from './workflow.mjs';
+
+const IMAGE_PATH = /(?:^|[\s"'`(])((?:\/[^\n<>"'`]+?)\.(?:png|webp|jpe?g))(?:$|[\s"'`,)])/gi;
+const CLEAR_NO_IMAGE = /(?:未产生(?:任何)?图片|未产出(?:任何)?图片|未能生成(?:图片)?|没有生成(?:替代品|图片)|没有(?:任何)?图片(?:产出|生成)?|目标路径尚不存在|未写入目标路径|no image (?:was )?(?:generated|produced|created)|image generation (?:did not|failed to) (?:produce|create))/i;
+const NETWORK_INTERRUPTION = /(?:network|connection|connect(?:ion)? (?:reset|refused|failed|closed)|websocket|tls|ssl|tunnel|econn(?:reset|refused|timeout)|enotfound|连接(?:错误|中断|失败|超时)?|网络(?:错误|中断|失败|超时)?|代理|隧道)/i;
+
+function eventObjects(value){
+  if(Array.isArray(value))return value.flatMap(eventObjects);
+  if(typeof value==='string')return value.split('\n').flatMap(line=>{try{return line.trim()?eventObjects(JSON.parse(line)):[];}catch{return line.trim()?[{message:line}]:[];}});
+  return value&&typeof value==='object'?[value]:[];
+}
+function eventText(events=[]){
+  return eventObjects(events).map(event=>{
+    try{return JSON.stringify(event);}catch{return '';}
+  }).filter(Boolean).join('\n');
+}
+function stringFields(value, out=[]){
+  if(Array.isArray(value)){for(const item of value)stringFields(item,out);return out;}
+  if(!value||typeof value!=='object')return out;
+  for(const [key,item] of Object.entries(value)){
+    if(typeof item==='string'&&/(?:path|file|image|output|text|message|error|content)$/i.test(key))out.push(item);
+    else if(item&&typeof item==='object')stringFields(item,out);
+  }
+  return out;
+}
+function imagePathsFromText(text=''){
+  const paths=[];IMAGE_PATH.lastIndex=0;
+  for(const match of String(text).matchAll(IMAGE_PATH))paths.push(match[1]);
+  return [...new Set(paths)];
+}
+function identifier(events, keys){
+  for(const event of eventObjects(events)){
+    for(const key of keys){
+      const value=event?.[key]??event?.item?.[key]??event?.result?.[key];
+      if(typeof value==='string'&&value.length<=200)return value;
+    }
+  }
+  return null;
+}
+
+/**
+ * Classify only the evidence returned by one CLI run. Callers must still check
+ * that a reported image path exists before treating it as a saved artifact.
+ */
+export function classifyGenerationEvidence({events=[],responseText='',runId=null,startedAt=null,endedAt=null,exitCode=null}={}){
+  const normalizedEvents=eventObjects(events);
+  const evidenceText=[responseText,eventText(normalizedEvents),...normalizedEvents.flatMap(event=>stringFields(event))].filter(Boolean).join('\n');
+  const imagePaths=[...new Set([
+    ...imagePathsFromText(responseText),
+    ...normalizedEvents.flatMap(event=>imagePathsFromText(stringFields(event).join('\n'))),
+  ])];
+  const threadId=identifier(normalizedEvents,['thread_id','threadId','thread']);
+  const eventRunId=identifier(normalizedEvents,['run_id','runId','turn_id','turnId']);
+  const clearNoImage=CLEAR_NO_IMAGE.test(evidenceText);
+  const networkInterrupted=NETWORK_INTERRUPTION.test(evidenceText);
+  const outcome=imagePaths.length?'image_path_reported':clearNoImage?'no_image':networkInterrupted?'network_interrupted':'unknown';
+  const reason=outcome==='image_path_reported'?'reported_image_path':outcome==='no_image'?(networkInterrupted?'reported_no_image_after_connection_error':'reported_no_image'):outcome==='network_interrupted'?'connection_interrupted':'insufficient_evidence';
+  return {
+    outcome,
+    reason,
+    imagePaths,
+    connectionRelated:networkInterrupted,
+    runId:eventRunId||runId||null,
+    threadId,
+    startedAt:startedAt||null,
+    endedAt:endedAt||null,
+    exitCode:Number.isInteger(exitCode)?exitCode:null,
+  };
+}
+
+/** A concise, path-free record suitable for project task diagnostics. */
+export function generationDiagnosticSummary(evidence={}){
+  return {
+    outcome:evidence.outcome||'unknown',
+    reason:evidence.reason||'insufficient_evidence',
+    connectionRelated:Boolean(evidence.connectionRelated),
+    reportedImageCount:Array.isArray(evidence.imagePaths)?evidence.imagePaths.length:0,
+    runId:evidence.runId||null,
+    threadId:evidence.threadId||null,
+    startedAt:evidence.startedAt||null,
+    endedAt:evidence.endedAt||null,
+    exitCode:Number.isInteger(evidence.exitCode)?evidence.exitCode:null,
+  };
+}
+
+export function readGenerationEvidence(dir){
+  const eventsFile=path.join(dir,'events.jsonl'),responseFile=path.join(dir,'response.txt');
+  const events=fs.existsSync(eventsFile)?fs.readFileSync(eventsFile,'utf8'):'';
+  const responseText=fs.existsSync(responseFile)?fs.readFileSync(responseFile,'utf8'):'';
+  return classifyGenerationEvidence({events,responseText,runId:path.basename(dir)});
+}
 export function findCodex() {
   if (process.env.WENDI_CODEX_BIN && fs.existsSync(process.env.WENDI_CODEX_BIN)) return process.env.WENDI_CODEX_BIN;
   for (const p of ['/Applications/ChatGPT.app/Contents/Resources/codex','/Applications/Codex.app/Contents/Resources/codex']) if(fs.existsSync(p))return p;
@@ -74,23 +164,35 @@ export function normalizeRateLimits(value){
   const secondary=clean(raw.secondary)||windows.find(x=>x.value!==primary&&x.value.windowDurationMins&&x.value.windowDurationMins>360)?.value||windows.find(x=>x.value!==primary)?.value||null;
   return {primary,secondary,planType:raw.planType||null,credits:raw.credits?{balance:raw.credits.balance,hasCredits:raw.credits.hasCredits}:null};
 }
-export function rateLimitSnapshot(timeoutMs=12000){
+const rateLimitCache={value:null,observedAt:0,inFlight:null};
+/**
+ * Account reads start a short-lived app-server process. Coalesce requests from
+ * adjacent image tasks so the quota guard itself does not add a second slow
+ * operation for every panel. The caller still receives null when no observed
+ * value exists; an unavailable read is never converted into a made-up quota.
+ */
+export function rateLimitSnapshot(timeoutMs=12000,{force=false}={}){
   const bin=findCodex();if(!bin)return Promise.resolve(null);
   if(process.env.WENDI_TEST_PLAN_FILE)return Promise.resolve({primary:{usedPercent:1,windowDurationMins:300},secondary:{usedPercent:2,windowDurationMins:10080}});
-  return new Promise(resolve=>{
+  const age=Date.now()-rateLimitCache.observedAt;
+  if(!force&&rateLimitCache.value&&age<60_000)return Promise.resolve(rateLimitCache.value);
+  if(rateLimitCache.inFlight)return rateLimitCache.inFlight;
+  rateLimitCache.inFlight=new Promise(resolve=>{
     const child=spawn(bin,['app-server','--stdio'],{stdio:['pipe','pipe','pipe'],env:{...process.env,NO_COLOR:'1'}});
     const rl=readline.createInterface({input:child.stdout});let settled=false,timer;
-    const finish=value=>{if(settled)return;settled=true;clearTimeout(timer);rl.close();child.kill('SIGTERM');resolve(value);};
+    const finish=value=>{if(settled)return;settled=true;clearTimeout(timer);rl.close();child.kill('SIGTERM');if(value){rateLimitCache.value=value;rateLimitCache.observedAt=Date.now();}resolve(value||rateLimitCache.value||null);};
     const send=value=>child.stdin.write(JSON.stringify(value)+'\n');
     rl.on('line',line=>{try{const msg=JSON.parse(line);if(msg.id===0&&msg.result){send({method:'initialized',params:{}});send({method:'account/rateLimits/read',id:1});}else if(msg.id===1)finish(normalizeRateLimits(msg.result));}catch{}});
     child.on('error',()=>finish(null));child.on('close',()=>finish(null));timer=setTimeout(()=>finish(null),timeoutMs);
     send({method:'initialize',id:0,params:{clientInfo:{name:'wendi_studio_guard',title:'温蒂创作室额度保护',version:'2.1.0'}}});
   });
+  return rateLimitCache.inFlight.finally(()=>{rateLimitCache.inFlight=null;});
 }
 export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},image=false,writableDirs=[],model=null,reasoningEffort='low',timeoutMs=900000}) {
   const bin=findCodex();if(!bin)throw new Error('请先打开 Codex 并登录。');
   fs.mkdirSync(dir,{recursive:true});
   const resultPath=path.join(dir,'response.txt');
+  const runId=path.basename(dir),startedAt=new Date().toISOString();
   const args=['exec','--ephemeral','--skip-git-repo-check','--ignore-user-config','--disable','plugins','--disable','apps','--disable','multi_agent','-c',`model_reasoning_effort="${reasoningEffort}"`,'-s',image?'workspace-write':'read-only','--json','-o',resultPath];
   if(model)args.push('-m',model);
   if(schema){const s=path.join(dir,'response.schema.json');fs.writeFileSync(s,JSON.stringify(schema));args.push('--output-schema',s);}
@@ -103,25 +205,36 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
     const child=spawn(bin,args,{cwd:dir,env:{...process.env,NO_COLOR:'1'},detached:true,stdio:['pipe','pipe','pipe']});
     const log=fs.createWriteStream(path.join(dir,'events.jsonl'),{mode:0o600});
     let buf='',last='',error='',settled=false,timedOut=false,usage=null;
+    const capturedEvents=[];
+    const evidence=(responseText='',exitCode=null)=>classifyGenerationEvidence({events:capturedEvents,responseText,runId,startedAt,endedAt:new Date().toISOString(),exitCode});
     const stop=()=>{try{process.kill(-child.pid,'SIGTERM');}catch{} setTimeout(()=>{try{process.kill(-child.pid,'SIGKILL');}catch{}},1500).unref();};
     const abort=()=>stop(); signal?.addEventListener('abort',abort,{once:true});
     const timer=setTimeout(()=>{timedOut=true;stop();},timeoutMs);
-    const finish=(err,result)=>{if(settled)return;settled=true;clearTimeout(timer);signal?.removeEventListener('abort',abort);log.end();err?reject(err):resolve(result);};
+    const finish=(err,result,{responseText='',exitCode=null}={})=>{
+      if(settled)return;settled=true;clearTimeout(timer);signal?.removeEventListener('abort',abort);log.end();
+      const runEvidence=evidence(responseText,exitCode);
+      if(err){Object.defineProperty(err,'generationEvidence',{value:runEvidence,enumerable:false});return reject(err);}
+      if(result&&typeof result==='object'){
+        Object.defineProperty(result,'__generationEvidence',{value:runEvidence,enumerable:false});
+        if(!Object.prototype.hasOwnProperty.call(result,'diagnostics'))Object.defineProperty(result,'diagnostics',{value:generationDiagnosticSummary(runEvidence),enumerable:true});
+      }
+      resolve(result);
+    };
     child.stdout.on('data',c=>{
       log.write(c);buf+=c;
       const lines=buf.split('\n');buf=lines.pop();
-      for(const line of lines){try{const e=JSON.parse(line);if(e.type==='item.completed'&&e.item?.type==='agent_message')last=e.item.text;if(e.type==='turn.completed'&&e.usage)usage=e.usage;if(e.type==='error'||e.type==='turn.failed')error=e.message||e.error?.message||'创作连接中断';onEvent(e);}catch{}}
+      for(const line of lines){try{const e=JSON.parse(line);capturedEvents.push(e);if(e.type==='item.completed'&&e.item?.type==='agent_message')last=e.item.text;if(e.type==='turn.completed'&&e.usage)usage=e.usage;if(e.type==='error'||e.type==='turn.failed')error=e.message||e.error?.message||'创作连接中断';onEvent(e);}catch{}}
     });
-    child.stderr.on('data',c=>log.write(JSON.stringify({stderr:String(c)})+'\n'));
+    child.stderr.on('data',c=>{const event={stderr:String(c)};capturedEvents.push(event);log.write(JSON.stringify(event)+'\n');});
     child.on('error',err=>finish(new Error('无法启动创作连接：'+err.message)));
     child.stdin.on('error',()=>{});
     child.on('close',code=>{
-      if(signal?.aborted)return finish(new Error('已暂停，已保存完成部分。'));
-      if(timedOut)return finish(new Error('本次等待时间较长，已暂停。已收到的图片保留在本地，可检查后继续。'));
-      if(code!==0)return finish(new Error(error||'创作连接中断，请确认账号可用后继续。'));
+      if(signal?.aborted)return finish(new Error('已暂停，已保存完成部分。'),null,{exitCode:code});
+      if(timedOut)return finish(new Error('本次等待时间较长，已暂停。已收到的图片保留在本地，可检查后继续。'),null,{exitCode:code});
+      if(code!==0)return finish(new Error(error||'创作连接中断，请确认账号可用后继续。'),null,{exitCode:code});
       const text=fs.existsSync(resultPath)?fs.readFileSync(resultPath,'utf8'):last;
-      if(schema){try{const parsed=JSON.parse(text);Object.defineProperty(parsed,'__usage',{value:usage,enumerable:false});return finish(null,parsed);}catch{return finish(new Error('未收到完整方案，需求已保留，请重新整理。'));}}
-      finish(null,{text,usage});
+      if(schema){try{const parsed=JSON.parse(text);Object.defineProperty(parsed,'__usage',{value:usage,enumerable:false});return finish(null,parsed,{responseText:text,exitCode:code});}catch{return finish(new Error('未收到完整方案，需求已保留，请重新整理。'),null,{responseText:text,exitCode:code});}}
+      finish(null,{text,usage},{responseText:text,exitCode:code});
     });
     if(signal?.aborted)stop(); else child.stdin.end(prompt);
   });

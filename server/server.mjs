@@ -4,8 +4,8 @@ import path from 'node:path';
 import {execFile} from 'node:child_process';
 import {APP,ROOT,REFS,CHECKS,inside,digest} from './workflow.mjs';
 import {connectionStatus,appServerSnapshot,normalizeRateLimits} from './bridge.mjs';
-import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,resume,reviseImage,recoverImage,accept,recover,projectDir,syncRunningProject} from './engine.mjs';
-import {CATEGORIES,listDocuments,listAssets,discoverArchiveStories,archiveStory,stageUpload,readCandidate,analyzeAsset,saveAssetProposal,applyAssetProposal,saveDocument,suggestDocument,deleteProjectFolder,deleteArchiveStory} from './library.mjs';
+import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,resume,reviseImage,recoverImage,reviewImage,accept,recover,projectDir,syncRunningProject} from './engine.mjs';
+import {CATEGORIES,listDocuments,listAssets,discoverArchiveStories,archiveStory,stageUpload,readCandidate,inspectStagedCandidate,saveManualAsset,searchAssets,analyzeAsset,saveAssetProposal,applyAssetProposal,saveDocument,suggestDocument,deleteProjectFolder,deleteArchiveStory} from './library.mjs';
 const PORT=Number(process.env.PORT||4318);const HOST='127.0.0.1';
 const front=path.join(APP,'dist/client');
 const mime={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.json':'application/json; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.webp':'image/webp','.ico':'image/x-icon','.woff2':'font/woff2','.zip':'application/zip','.md':'text/plain; charset=utf-8','.txt':'text/plain; charset=utf-8'};
@@ -32,6 +32,10 @@ async function account(force=false){
   try{return await accountInFlight;}finally{accountInFlight=null;}
 }
 function send(res,data,status=200){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(data));}
+function publicAsset(asset){
+  return {...asset,url:'/media/asset/'+asset.file.split('/').map(encodeURIComponent).join('/')};
+}
+function publicAssets(assets=listAssets()){return assets.map(publicAsset);}
 function file(res,file,download=false){
   if(!fs.existsSync(file)||!fs.statSync(file).isFile())return send(res,{error:'文件不存在'},404);
   const headers={'Content-Type':mime[path.extname(file).toLowerCase()]||'application/octet-stream','Content-Length':fs.statSync(file).size,'Cache-Control':'no-cache'};
@@ -40,11 +44,26 @@ function file(res,file,download=false){
 }
 function publicProject(p){
   const media=f=>f?`/media/project/${p.id}/${f.split(path.sep).map(encodeURIComponent).join('/')}`:null;
-  return {...p,pending:p.pending?{key:p.pending.key,at:p.pending.at}:null,history:p.history.map(h=>({version:h.version,title:h.plan.title,at:h.approved?.at,plan:h.plan,pages:h.pages.map(q=>({...q,url:media(q.finalFile||q.file)}))})),
+  const artifacts=Array.isArray(p.artifacts)?p.artifacts:[];
+  const artifactFor=(record,fallbackId)=>artifacts.find(item=>item.file===record?.file)||artifacts.find(item=>item.id===fallbackId)||null;
+  const publicImage=(record,fallbackId)=>{
+    if(!record)return record;
+    const {file,finalFile,rawFile:_rawFile,userDecision,...safe}=record,artifact=artifactFor(record,fallbackId),displayFile=finalFile||file;
+    // The file name is deliberately absent from the API. The browser gets a
+    // media URL plus a stable content token for an explicit user decision.
+    const sampleNumber=Number(/^image:样张-([12])$/.exec(fallbackId)?.[1]);
+    const isCurrentSample=Number.isInteger(sampleNumber)&&p.status==='samples_decision'&&p.samplesDecision?.sampleIndexes?.includes(sampleNumber)&&userDecision?.action!=='accept_current';
+    return {...safe,url:media(displayFile),artifactId:artifact?.id||fallbackId,contentHash:digest({artifactId:artifact?.id||fallbackId,file,at:record.at||artifact?.at||null}),review:record.qa||null,decision:userDecision||null,availableActions:isCurrentSample?['accept_current','regenerate_current']:[]};
+  };
+  const publicTask=task=>task?{id:task.id,kind:task.kind,target:task.target,status:task.status,attempt:task.attempt,providerInvocationLimit:task.providerInvocationLimit,providerInvocations:task.providerInvocations,startedAt:task.startedAt,lastProgressAt:task.lastProgressAt,completedAt:task.completedAt,qa:task.qa,errorCode:task.errorCode}:null;
+  const {pending,history=[],samples=[],panels={},pages=[],bundle,artifacts:ignoredArtifacts,tasks:ignoredTasks,currentTask,previewDecisionCommands:ignoredCommands,...safe}=p;
+  void ignoredArtifacts;void ignoredTasks;void ignoredCommands;
+  return {...safe,pending:pending?{key:pending.key,at:pending.at,taskId:pending.taskId}:null,currentTask:publicTask(currentTask),history:history.map(h=>({version:h.version,title:h.plan.title,at:h.approved?.at,plan:h.plan,pages:(h.pages||[]).map(q=>publicImage(q,`page:${q.number}`))})),
     planHash:p.plan?digest(p.plan):null,busy:active.has(p.id),
-    samples:p.samples.map(s=>s?{...s,url:media(s.file)}:s),
-    panels:Object.fromEntries(Object.entries(p.panels).map(([k,v])=>[k,{...v,url:media(v.file)}])),
-    pages:p.pages.map(q=>({...q,url:media(q.finalFile||q.file)})),bundleURL:media(p.bundle),outputFolder:p.accepted?path.join(projectDir(p.id),`v${p.version}`,'成品'):projectDir(p.id)};
+    samples:samples.map((sample,index)=>publicImage(sample,`image:样张-${index+1}`)),
+    panels:Object.fromEntries(Object.entries(panels).map(([key,panel])=>[key,publicImage(panel,`image:第${key.split('-')[0]}页-第${key.split('-')[1]}格`)])),
+    pages:pages.map(page=>publicImage(page,`page:${page.number}`)),bundleURL:media(bundle),outputFolder:p.accepted?'作品已保存到本地作品文件夹':null,
+    artifacts:artifacts.map(({file:_file,...artifact})=>artifact)};
 }
 function allowedProjectFiles(p){
   return new Set([...p.samples.filter(Boolean).map(x=>x.file),...Object.values(p.panels).map(x=>x.file),...p.pages.flatMap(x=>[x.file,x.finalFile]),p.bundle,
@@ -53,6 +72,50 @@ function allowedProjectFiles(p){
 async function body(req,max=250000){let b='';for await(const c of req){b+=c;if(Buffer.byteLength(b)>max){throw new Error('内容太长，请缩短后再提交。');}}try{return JSON.parse(b||'{}');}catch{throw new Error('提交内容无效');}}
 function chooseModel(snapshot,id,effort){const model=snapshot.models.find(m=>m.id===id)||snapshot.models.find(m=>m.isDefault)||snapshot.models[0];if(!model)throw new Error('当前没有可用的创作模型。');const reasoning=model.reasoningEfforts.includes(effort)?effort:model.defaultReasoningEffort;return {model:model.id,reasoningEffort:reasoning};}
 function projectSource(p,kind,key){let rel;if(kind==='page')rel=p.pages.find(x=>String(x.number)===String(key))?.finalFile||p.pages.find(x=>String(x.number)===String(key))?.file;else if(kind==='panel')rel=p.panels[key]?.file;else if(kind==='sample')rel=p.samples[Number(key)]?.file;if(!rel||!allowedProjectFiles(p).has(rel))throw new Error('这张作品图片不存在。');return inside(projectDir(p.id),rel);}
+function revisionConflict(p,expectedRevision){const error=new Error(`作品已更新（当前版本 ${p.revision}），请刷新后再提交这次决定。`);error.statusCode=409;error.code='REVISION_CONFLICT';error.currentRevision=p.revision;error.expectedRevision=expectedRevision;return error;}
+function previewFingerprint(input){return digest({planHash:input.planHash,artifactId:input.artifactId,contentHash:input.contentHash,decision:input.decision,acknowledgedIssueIds:input.acknowledgedIssueIds,continueProduction:input.continueProduction});}
+function duplicatePreviewDecision(p,b){
+  const key=String(b.idempotencyKey||'').trim();if(!key)return null;
+  const existing=(Array.isArray(p.previewDecisionCommands)?p.previewDecisionCommands:[]).find(record=>record.key===key);if(!existing)return null;
+  const candidate=previewFingerprint({planHash:String(b.planHash||''),artifactId:String(b.artifactId||''),contentHash:String(b.contentHash||''),decision:String(b.decision||''),acknowledgedIssueIds:Array.isArray(b.acknowledgedIssueIds)?[...new Set(b.acknowledgedIssueIds.map(String).filter(Boolean))]:[],continueProduction:b.continueProduction===true});
+  if(existing.fingerprint!==candidate)throw new Error('这次决定的防重复标识已经用于另一项操作，请刷新后重试。');
+  return {key,existing};
+}
+function previewDecisionInput(p,b){
+  if(!Object.prototype.hasOwnProperty.call(b,'expectedRevision')||!Number.isInteger(Number(b.expectedRevision)))throw new Error('缺少当前作品版本，请刷新页面后再决定。');
+  const expectedRevision=Number(b.expectedRevision);if(expectedRevision!==Number(p.revision))throw revisionConflict(p,expectedRevision);
+  const planHash=String(b.planHash||'');if(!planHash||planHash!==p.approved?.hash)throw new Error('方案已更新，请重新查看当前样张后再决定。');
+  if(p.status!=='samples_decision')throw new Error('当前没有等待你决定的样张。');
+  const artifactId=String(b.artifactId||'');const sampleMatch=/^image:样张-([12])(?:-|$)/.exec(artifactId);
+  if(!sampleMatch)throw new Error('当前只能对人物或场景样张作出决定。');
+  const sampleIndex=Number(sampleMatch[1]),sample=p.samples?.[sampleIndex-1];if(!sample)throw new Error('对应样张已经更新，请刷新后再决定。');
+  const artifact=(p.artifacts||[]).find(item=>item.id===artifactId)||null;
+  const actualContentHash=digest({artifactId,file:artifact?.file||sample.file,at:sample.at||artifact?.at||null});
+  if(String(b.contentHash||'')!==actualContentHash)throw new Error('样张内容已更新，请重新查看后再决定。');
+  const decision=String(b.decision||'');if(!['accept_current','regenerate_current'].includes(decision))throw new Error('请选择采用当前样张或重新生成当前样张。');
+  const acknowledgedIssueIds=Array.isArray(b.acknowledgedIssueIds)?[...new Set(b.acknowledgedIssueIds.map(String).filter(Boolean))]:[];
+  const requiredIssueIds=(sample.qa?.issueDetails||[]).filter(issue=>['blocking','review'].includes(issue.severity)).map(issue=>String(issue.id)).filter(Boolean);
+  if(decision==='accept_current'&&requiredIssueIds.some(id=>!acknowledgedIssueIds.includes(id)))throw new Error('请先确认样张中列出的待注意问题，再采用当前样张。');
+  const idempotencyKey=String(b.idempotencyKey||'').trim();if(!idempotencyKey||idempotencyKey.length>200)throw new Error('缺少本次决定的防重复标识，请刷新后再试。');
+  return {expectedRevision,planHash,artifactId,contentHash:actualContentHash,decision,acknowledgedIssueIds,continueProduction:b.continueProduction===true,idempotencyKey,sampleIndex};
+}
+function savedPreviewDecision(p,input){
+  const fingerprint=previewFingerprint(input);
+  const records=Array.isArray(p.previewDecisionCommands)?p.previewDecisionCommands:[];
+  const existing=records.find(record=>record.key===input.idempotencyKey);
+  if(existing){if(existing.fingerprint!==fingerprint)throw new Error('这次决定的防重复标识已经用于另一项操作，请刷新后重试。');return {existing,fingerprint};}
+  return {existing:null,fingerprint};
+}
+function retryCommand(p,b){
+  const key=String(b.idempotencyKey||'').trim();
+  if(!key||key.length>200)throw new Error('缺少本次重试的防重复标识，请刷新页面后再试。');
+  const records=Array.isArray(p.retryCommands)?p.retryCommands:[];
+  const existing=records.find(record=>record.key===key);
+  const target=existing?.target||p.lastFailure?.key||p.pending?.key||'';
+  const fingerprint=digest({target,confirmNoImage:b.confirmNoImage===true});
+  if(existing){if(existing.fingerprint!==fingerprint)throw new Error('这次重试标识已经用于另一张图片，请刷新后重试。');return {key,target,existing};}
+  return {key,target,fingerprint,existing:null};
+}
 const server=http.createServer(async(req,res)=>{
   res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','no-referrer');res.setHeader('X-Frame-Options','DENY');
   const host=req.headers.host;
@@ -66,15 +129,33 @@ const server=http.createServer(async(req,res)=>{
     }
     if(url.pathname==='/api/health')return send(res,{app:'wendi-studio',ready:true,connection,version:'2.1.0'});
     if(url.pathname==='/api/bootstrap'){
-      const snapshot=await account();const assets=listAssets().map(x=>({...x,url:'/media/asset/'+x.file.split('/').map(encodeURIComponent).join('/')}));const stories=discoverArchiveStories().map(s=>({...s,coverUrl:`/media/archive-story/${s.id}/0`,pages:s.pages.map((_,i)=>({index:i,url:`/media/archive-story/${s.id}/${i}`}))}));
+      const snapshot=await account();const assets=publicAssets();const stories=discoverArchiveStories().map(s=>({...s,coverUrl:`/media/archive-story/${s.id}/0`,pages:s.pages.map((_,i)=>({index:i,url:`/media/archive-story/${s.id}/${i}`}))}));
       return send(res,{connection,checks:CHECKS,projects:listProjects().map(publicProject),account:snapshot,categories:CATEGORIES,documents:listDocuments(),assets,references:assets.filter(x=>!x.file.startsWith('02-')),archiveStories:stories,hero:stories[0]?.coverUrl||assets[0]?.url});
     }
     if(url.pathname==='/api/account'&&req.method==='POST')return send(res,await account(true));
     if(url.pathname==='/api/connection'&&req.method==='POST'){connection=await connectionStatus();return send(res,connection);}
     if(url.pathname==='/api/projects'&&req.method==='POST'){const b=await body(req),selected=chooseModel(await account(),b.model,b.reasoningEffort);const p=createProject({...b,...selected});planProject(p);return send(res,publicProject(p),201);}
+    // The staged-upload route only validates local bytes and keeps the temporary
+    // candidate outside the visible library. It intentionally does not select a
+    // model or call the analysis workflow.
+    if(url.pathname==='/api/assets/stage'&&req.method==='POST'){const candidate=await stageUpload(await body(req,30000000));return send(res,{candidate});}
+    const candidateMatch=/^\/api\/assets\/candidates\/([a-f0-9-]{36})$/.exec(url.pathname);
+    if(candidateMatch&&req.method==='GET'){return send(res,{candidate:await inspectStagedCandidate(candidateMatch[1])});}
+    // Saving a manually classified candidate is local-only. `saveManualAsset`
+    // rechecks the content hash, so an existing image is returned without a
+    // second copy or another index entry.
+    if(url.pathname==='/api/assets/manual-save'&&req.method==='POST'){
+      const b=await body(req),result=await saveManualAsset({candidateId:b.candidateId,category:b.category,name:b.name,tags:b.tags,description:b.description,usage:b.usage,sourceLabel:b.sourceLabel});
+      return send(res,{...result,asset:result.asset?publicAsset(result.asset):null,assets:publicAssets()});
+    }
+    if(url.pathname==='/api/assets/search'&&req.method==='GET'){
+      const values=(single,plural)=>[...url.searchParams.getAll(single),...url.searchParams.getAll(plural)].flatMap(value=>value.split(',')).map(value=>value.trim()).filter(Boolean);
+      const assets=searchAssets({query:url.searchParams.get('query')||'',categories:values('category','categories'),usages:values('usage','usages'),tags:values('tag','tags')});
+      return send(res,{assets:publicAssets(assets),total:assets.length});
+    }
     if(url.pathname==='/api/assets/upload'&&req.method==='POST'){const b=await body(req,30000000),candidate=await stageUpload(b),meta=readCandidate(candidate.id),selected=chooseModel(await account(),b.model,b.reasoningEffort);const proposal=await analyzeAsset({file:meta.file,sourceLabel:'用户手动上传：'+meta.name,dir:path.join(APP,'.素材候选',candidate.id,'分析'),...selected});return send(res,{candidate,proposal:saveAssetProposal(proposal)});}
     if(url.pathname==='/api/assets/analyze'&&req.method==='POST'){const b=await body(req),p=readProject(b.projectId),source=projectSource(p,b.kind,b.key),selected=chooseModel(await account(),b.model,b.reasoningEffort);const proposal=await analyzeAsset({file:source,sourceLabel:`作品《${p.title}》${b.kind} ${b.key}`,dir:path.join(projectDir(p.id),'.制作记录',`素材分析-${Date.now()}`),...selected});return send(res,{proposal:saveAssetProposal(proposal)});}
-    if(url.pathname==='/api/assets/apply'&&req.method==='POST'){const b=await body(req);const result=applyAssetProposal({proposalId:b.proposalId,applyWorld:b.applyWorld===true,applyWorkflow:b.applyWorkflow===true});return send(res,{...result,assets:listAssets()});}
+    if(url.pathname==='/api/assets/apply'&&req.method==='POST'){const b=await body(req);const result=applyAssetProposal({proposalId:b.proposalId,applyWorld:b.applyWorld===true,applyWorkflow:b.applyWorkflow===true});return send(res,{...result,asset:result.asset?publicAsset(result.asset):null,assets:publicAssets()});}
     if(url.pathname==='/api/documents/suggest'&&req.method==='POST'){const b=await body(req),selected=chooseModel(await account(),b.model,b.reasoningEffort);return send(res,await suggestDocument({docPath:b.docPath,note:b.note,dir:path.join(APP,'.文档提案',`${Date.now()}`),...selected}));}
     if(url.pathname==='/api/documents/save'&&req.method==='POST'){const result=saveDocument(await body(req));return send(res,{...result,documents:listDocuments()});}
     const archiveDelete=/^\/api\/archive\/([A-Za-z0-9_-]+)\/delete$/.exec(url.pathname);if(archiveDelete&&req.method==='POST'){const b=await body(req);deleteArchiveStory(archiveDelete[1],b.confirmTitle);return send(res,{ok:true,archiveStories:discoverArchiveStories()});}
@@ -89,6 +170,33 @@ const server=http.createServer(async(req,res)=>{
         if(!title||[...title].length>60)throw new Error('作品名称请控制在 1—60 个字以内。');
         p.title=title;p.titleLocked=true;syncRunningProject(p.id,{title,titleLocked:true});saveProject(p);return send(res,publicProject(p));
       }
+      if(action==='preview-decision'){
+        const duplicate=duplicatePreviewDecision(p,b);
+        // A duplicate click is expected in a slow local UI. Return the latest
+        // persisted state before looking at active work, so it can never launch
+        // a second paid generation request.
+        if(duplicate)return send(res,{...publicProject(p),idempotent:true,command:{key:duplicate.key,acceptedAt:duplicate.existing.at}});
+        const input=previewDecisionInput(p,b),saved=savedPreviewDecision(p,input);
+        p.previewDecisionCommands=Array.isArray(p.previewDecisionCommands)?p.previewDecisionCommands:[];
+        p.previewDecisionCommands.push({key:input.idempotencyKey,fingerprint:saved.fingerprint,at:new Date().toISOString(),revision:p.revision,artifactId:input.artifactId,decision:input.decision,acknowledgedIssueIds:input.acknowledgedIssueIds,continueProduction:input.continueProduction});
+        p.previewDecisionCommands=p.previewDecisionCommands.slice(-80);saveProject(p);
+        try{decideSamples(p,{action:input.decision,sampleIndex:input.sampleIndex,hash:input.planHash});}
+        catch(error){p.previewDecisionCommands=p.previewDecisionCommands.filter(record=>record.key!==input.idempotencyKey);saveProject(p);throw error;}
+        return send(res,{...publicProject(p),idempotent:false,command:{key:input.idempotencyKey,acceptedAt:new Date().toISOString(),continueProduction:input.continueProduction}});
+      }
+      if(action==='retry-missing'){
+        const command=retryCommand(p,b);
+        // If the response was lost, returning the persisted state is safer than
+        // re-entering the workflow and possibly spending another image request.
+        if(command.existing)return send(res,{...publicProject(p),idempotent:true,command:{key:command.key,acceptedAt:command.existing.at}});
+        if(active.has(p.id))throw new Error('这篇仍在制作，请稍候。');
+        const confirmedMissing=p.lastFailure?.definiteNoOutput===true;
+        if(b.confirmNoImage!==true||(!p.pending&&!confirmedMissing))throw new Error('请先确认没有生成图片。');
+        p.retryCommands=Array.isArray(p.retryCommands)?p.retryCommands:[];
+        p.retryCommands.push({key:command.key,fingerprint:command.fingerprint,target:command.target,at:new Date().toISOString()});p.retryCommands=p.retryCommands.slice(-80);
+        p.revisionNotes.push({key:command.target||'当前图片',note:'用户确认本次没有取得图片，允许只重新生成这一张',at:new Date().toISOString()});p.pending=null;p.lastFailure=null;saveProject(p);resume(p);
+        return send(res,{...publicProject(p),idempotent:false,command:{key:command.key,acceptedAt:new Date().toISOString()}});
+      }
       if(active.has(p.id))throw new Error('这篇仍在制作，请稍候。');
       if(action==='revise-plan')planProject(p,b.note);
       else if(action==='approve-plan')approvePlan(p,b.hash);
@@ -96,10 +204,7 @@ const server=http.createServer(async(req,res)=>{
       else if(action==='resume')resume(p);
       else if(action==='revise-image')reviseImage(p,b.key,b.note);
       else if(action==='recover-image')recoverImage(p);
-      else if(action==='retry-missing'){
-        if(b.confirmNoImage!==true||!p.pending)throw new Error('请先确认没有生成图片。');
-        p.revisionNotes.push({key:'recovery',note:'用户确认未收到上次图片，允许重新尝试',at:new Date().toISOString()});p.pending=null;p.lastFailure=null;saveProject(p);resume(p);
-      }
+      else if(action==='review-image')reviewImage(p,b.key);
       else if(action==='accept')await accept(p,b.checks);
       else if(action==='settings'){
         if(p.status==='complete')throw new Error('已完成作品不需要切换制作模型。');
@@ -134,8 +239,17 @@ const server=http.createServer(async(req,res)=>{
     if(url.pathname.startsWith('/api/')||url.pathname.startsWith('/media/'))return send(res,{error:'内容不存在'},404);
     const filename=url.pathname==='/'?'index.html':decodeURIComponent(url.pathname.slice(1));
     const target=inside(front,filename);if(!fs.existsSync(target))return send(res,{error:'页面不存在'},404);return file(res,target);
-  }catch(e){if(!res.headersSent)send(res,{error:e.message||'操作未完成'},400);else res.end();}
+  }catch(e){if(!res.headersSent)send(res,{error:e.message||'操作未完成',code:e.code||null,currentRevision:e.currentRevision??null},Number(e.statusCode)||400);else res.end();}
 });
 server.on('error',err=>{console.error(err.code==='EADDRINUSE'?'创作室端口已被使用，请打开已有页面。':err.message);process.exit(1);});
 server.listen(PORT,HOST,()=>console.log(`温蒂创作室：http://${HOST}:${PORT}`));
-for(const sig of ['SIGINT','SIGTERM'])process.on(sig,()=>{for(const c of active.values())c.abort();server.close();setTimeout(()=>process.exit(0),2000).unref();});
+let shuttingDown=false;
+function shutdown(){
+  if(shuttingDown)return;shuttingDown=true;
+  for(const c of active.values())c.abort();
+  server.close();
+  const deadline=Date.now()+5000;
+  const finish=()=>{if(active.size===0||Date.now()>=deadline)process.exit(0);setTimeout(finish,100).unref();};
+  finish();
+}
+for(const sig of ['SIGINT','SIGTERM'])process.on(sig,shutdown);

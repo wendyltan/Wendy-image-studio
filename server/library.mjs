@@ -25,6 +25,11 @@ const CANDIDATES=path.join(APP,'.素材候选');
 const PROPOSALS=path.join(CANDIDATES,'.提案');
 const HISTORY=path.join(ROOT,'设定/.版本记录');
 const ASSET_METADATA=path.join(REFS,'.素材元数据.json');
+const MAX_UPLOAD_BYTES=20*1024*1024;
+const MAX_IMAGE_EDGE=16_384;
+const MAX_IMAGE_PIXELS=50_000_000;
+const MIN_IMAGE_EDGE=64;
+const MANUAL_USAGES=['本篇','常用参考','正式基线'];
 const ASSET_SCHEMA={type:'object',properties:{decision:{type:'string',enum:['keep','do_not_keep']},confidence:{type:'integer',minimum:0,maximum:100},reason:{type:'string'},category:{type:'string',enum:CATEGORIES.map(x=>x.id)},filename:{type:'string'},indexEntry:{type:'string'},worldSettingAddition:{type:'string'},workflowAddition:{type:'string'},warnings:{type:'array',items:{type:'string'}}},required:['decision','confidence','reason','category','filename','indexEntry','worldSettingAddition','workflowAddition','warnings'],additionalProperties:false};
 const DOC_SCHEMA={type:'object',properties:{summary:{type:'string'},revisedText:{type:'string'},risks:{type:'array',items:{type:'string'}}},required:['summary','revisedText','risks'],additionalProperties:false};
 
@@ -35,6 +40,54 @@ function safeName(name,ext='png'){
 function fileHash(file){return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');}
 function readAssetMetadata(){try{const value=JSON.parse(fs.readFileSync(ASSET_METADATA,'utf8'));return value&&typeof value==='object'?value:{};}catch{return {};}}
 function writeAssetMetadata(value){fs.mkdirSync(path.dirname(ASSET_METADATA),{recursive:true});jsonWrite(ASSET_METADATA,value);}
+function normalizedText(value,{field,max,required=false}={}){
+  const text=typeof value==='string'?value.replace(/[\r\n\t]+/g,' ').replace(/\s+/g,' ').trim():'';
+  if(required&&!text)throw new Error(`${field||'内容'}不能为空。`);
+  if(text.length>max)throw new Error(`${field||'内容'}不能超过 ${max} 个字。`);
+  return text;
+}
+function normalizedTags(value){
+  const raw=Array.isArray(value)?value:typeof value==='string'?value.split(/[，,]/):[];
+  if(raw.length>20)throw new Error('标签不能超过 20 个。');
+  return [...new Set(raw.map(tag=>normalizedText(String(tag),{field:'标签',max:32})).filter(Boolean))];
+}
+function imageTypeFromBytes(file){
+  const bytes=fs.readFileSync(file,{encoding:null}).subarray(0,16);
+  if(bytes.length>=8&&bytes.subarray(0,8).equals(Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a])))return {format:'PNG',extension:'png',mime:'image/png'};
+  if(bytes.length>=3&&bytes[0]===0xff&&bytes[1]===0xd8&&bytes[2]===0xff)return {format:'JPEG',extension:'jpg',mime:'image/jpeg'};
+  if(bytes.length>=12&&bytes.subarray(0,4).toString('ascii')==='RIFF'&&bytes.subarray(8,12).toString('ascii')==='WEBP')return {format:'WEBP',extension:'webp',mime:'image/webp'};
+  throw new Error('图片格式无法确认，请使用 PNG、JPG 或 WebP 图片。');
+}
+function candidateDirectory(id){
+  if(typeof id!=='string'||!/^[a-f0-9-]{36}$/.test(id))throw new Error('候选素材不存在。');
+  const dir=inside(CANDIDATES,id),metaFile=path.join(dir,'candidate.json');
+  if(!fs.existsSync(metaFile))throw new Error('候选素材不存在。');
+  const stat=fs.lstatSync(dir);if(!stat.isDirectory()||stat.isSymbolicLink())throw new Error('候选素材无效。');
+  return {dir,metaFile};
+}
+function candidateFile(id){
+  const {dir,metaFile}=candidateDirectory(id);let candidate;
+  try{candidate=JSON.parse(fs.readFileSync(metaFile,'utf8'));}catch{throw new Error('候选素材信息无法读取。');}
+  if(!candidate||candidate.id!==id||typeof candidate.file!=='string')throw new Error('候选素材信息无效。');
+  const file=path.resolve(candidate.file),prefix=path.resolve(dir)+path.sep;
+  if(!file.startsWith(prefix)||!fs.existsSync(file))throw new Error('候选原图已不存在。');
+  const stat=fs.lstatSync(file);if(!stat.isFile()||stat.isSymbolicLink())throw new Error('候选原图无效。');
+  const realDir=fs.realpathSync(dir),realFile=fs.realpathSync(file);
+  if(!realFile.startsWith(realDir+path.sep))throw new Error('候选原图无效。');
+  return {candidate:{...candidate,file},file,stat};
+}
+function publicAsset(asset,saved={}){
+  return {...asset,
+    tags:Array.isArray(saved.tags)?saved.tags:[],
+    description:typeof saved.description==='string'?saved.description:'',
+    usage:MANUAL_USAGES.includes(saved.usage)?saved.usage:null,
+    displayName:typeof saved.displayName==='string'&&saved.displayName?saved.displayName:asset.name,
+    source:saved.source||null,
+    addedAt:saved.addedAt||null,
+    humanDecision:saved.humanDecision||null,
+    isFormalBaseline:Boolean(saved.formalBaseline?.isFormalBaseline),
+  };
+}
 function uniqueFile(dir,name){
   let candidate=path.join(dir,name);const ext=path.extname(name),stem=path.basename(name,ext);let i=2;
   while(fs.existsSync(candidate))candidate=path.join(dir,`${stem}-v${i++}${ext}`);
@@ -47,7 +100,8 @@ export function listAssets(){
   const categoryById=Object.fromEntries(CATEGORIES.map(x=>[x.id,x])),metadata=readAssetMetadata();
   return fs.readdirSync(REFS,{recursive:true}).filter(x=>/\.(png|jpe?g|webp)$/i.test(x)).sort().map(file=>{
     const id=file.split('/')[0],meta=categoryById[id]||{group:'其他素材',label:id};
-    const absolute=inside(REFS,file),hash=fileHash(absolute),saved=metadata[hash]||{};return {file,name:path.basename(file),category:id,categoryLabel:meta.label,group:meta.group,hash,updatedAt:fs.statSync(absolute).mtime.toISOString(),tags:Array.isArray(saved.tags)?saved.tags:[],source:saved.source||null,addedAt:saved.addedAt||null};
+    const absolute=inside(REFS,file),hash=fileHash(absolute),saved=metadata[hash]||{};
+    return publicAsset({file,name:path.basename(file),category:id,categoryLabel:meta.label,group:meta.group,hash,updatedAt:fs.statSync(absolute).mtime.toISOString()},saved);
   });
 }
 export function discoverArchiveStories(){
@@ -71,13 +125,86 @@ export async function stageUpload({name,type,data}){
   const match=data.match(/^data:image\/(png|jpeg|webp);base64,(.+)$/);if(!match)throw new Error('请选择 PNG、JPG 或 WebP 图片。');
   const id=crypto.randomUUID(),dir=path.join(CANDIDATES,id);fs.mkdirSync(dir,{recursive:true});
   const file=path.join(dir,safeName(name,match[1]));fs.writeFileSync(file,Buffer.from(match[2],'base64'),{mode:0o600});
-  try{await pythonRun(['info',file]);}catch{fs.rmSync(dir,{recursive:true,force:true});throw new Error('图片文件无法读取。');}
   jsonWrite(path.join(dir,'candidate.json'),{id,file,name:path.basename(file),type,createdAt:new Date().toISOString()});
-  return {id,name:path.basename(file)};
+  try{
+    const inspection=await inspectStagedCandidate(id);
+    return {id,name:path.basename(file),inspection};
+  }catch(error){fs.rmSync(dir,{recursive:true,force:true});throw error;}
 }
 export function readCandidate(id){
-  if(!/^[a-f0-9-]{36}$/.test(id))throw new Error('候选素材不存在');const dir=inside(CANDIDATES,id),meta=path.join(dir,'candidate.json');
-  if(!fs.existsSync(meta))throw new Error('候选素材不存在');return JSON.parse(fs.readFileSync(meta,'utf8'));
+  return candidateFile(id).candidate;
+}
+/**
+ * Inspect a staged upload using only local bytes and Pillow. This is deliberately
+ * model-free so the HTTP layer can show a candidate before asking for any AI help.
+ */
+export async function inspectStagedCandidate(id){
+  const {candidate,file,stat}=candidateFile(id);
+  if(stat.size<1||stat.size>MAX_UPLOAD_BYTES)throw new Error('图片不能超过 20MB。');
+  const detected=imageTypeFromBytes(file);
+  let info;
+  try{info=JSON.parse(await pythonRun(['info',file]));}catch{throw new Error('图片文件无法读取。');}
+  const width=Number(info?.width),height=Number(info?.height);
+  if(!Number.isInteger(width)||!Number.isInteger(height)||width<MIN_IMAGE_EDGE||height<MIN_IMAGE_EDGE)throw new Error('图片尺寸过小，请上传至少 64×64 的图片。');
+  if(width>MAX_IMAGE_EDGE||height>MAX_IMAGE_EDGE||width*height>MAX_IMAGE_PIXELS)throw new Error('图片尺寸过大，请压缩后再上传。');
+  if(String(info?.format||'').toUpperCase()!==detected.format)throw new Error('图片格式无法确认，请重新导出后上传。');
+  const hash=fileHash(file),duplicate=listAssets().find(asset=>asset.hash===hash)||null;
+  return {id:candidate.id,name:candidate.name,fileType:detected.mime,extension:detected.extension,sizeBytes:stat.size,width,height,hash,duplicate:duplicate?{file:duplicate.file,asset:duplicate}:null};
+}
+function appendAssetIndex({category,file,name,tags,description,usage}){
+  const index=path.join(REFS,'00-素材索引.md');
+  if(fs.existsSync(index))backup(index);
+  const details=[description,...tags].filter(Boolean).join('；')||'人工整理的素材';
+  fs.appendFileSync(index,`\n- \`${category}/${file}\`：${name}（${usage}；${details}；由温蒂创作室人工入库，${new Date().toLocaleDateString('zh-CN')}）\n`);
+}
+/**
+ * Save a staged image without AI analysis. This writes only the asset library and
+ * its index; it never changes the world setting or the workflow guide.
+ */
+export async function saveManualAsset({candidateId,category,name,tags=[],description='',usage,sourceLabel=''}){
+  if(!CATEGORIES.some(item=>item.id===category))throw new Error('请选择有效的素材分类。');
+  if(!MANUAL_USAGES.includes(usage))throw new Error('请选择素材用途：本篇、常用参考或正式基线。');
+  const displayName=normalizedText(name,{field:'素材名称',max:80,required:true});
+  const cleanTags=normalizedTags(tags);
+  const cleanDescription=normalizedText(description,{field:'素材说明',max:500});
+  const cleanSourceLabel=normalizedText(sourceLabel,{field:'来源说明',max:160})||'用户手动上传';
+  const inspection=await inspectStagedCandidate(candidateId);
+  if(inspection.duplicate)return {file:inspection.duplicate.file,duplicate:true,asset:inspection.duplicate.asset,inspection};
+  const {candidate,file}=candidateFile(candidateId);
+  // Recheck immediately before copy so a concurrent save cannot create a duplicate.
+  const sourceHash=fileHash(file),existing=listAssets().find(asset=>asset.hash===sourceHash);
+  if(existing)return {file:existing.file,duplicate:true,asset:existing,inspection:{...inspection,duplicate:{file:existing.file,asset:existing}}};
+  const dir=inside(REFS,category);fs.mkdirSync(dir,{recursive:true});
+  const dest=uniqueFile(dir,safeName(displayName,inspection.extension));fs.copyFileSync(file,dest);
+  const now=new Date().toISOString();
+  const metadata=readAssetMetadata();metadata[sourceHash]={
+    tags:cleanTags,
+    description:cleanDescription,
+    displayName,
+    usage,
+    source:{kind:'manual_upload',label:cleanSourceLabel,candidateId,originalName:candidate.name},
+    addedAt:now,
+    humanDecision:{action:'manual_save',decidedAt:now,usage,category,displayName},
+    formalBaseline:usage==='正式基线'?{isFormalBaseline:true,confirmedAt:now,decision:'manual_save'}:undefined,
+  };writeAssetMetadata(metadata);
+  appendAssetIndex({category,file:path.basename(dest),name:displayName,tags:cleanTags,description:cleanDescription,usage});
+  return {file:path.relative(REFS,dest),duplicate:false,asset:listAssets().find(asset=>asset.hash===sourceHash),inspection};
+}
+/** Local-only search for the library screen. No model call or image analysis occurs here. */
+export function searchAssets({query='',categories=[],usages=[],tags=[]}={}){
+  const needle=normalizedText(query,{field:'搜索词',max:160}).toLocaleLowerCase('zh-CN');
+  const categoryFilter=new Set((Array.isArray(categories)?categories:[categories]).filter(category=>CATEGORIES.some(item=>item.id===category)));
+  const usageFilter=new Set((Array.isArray(usages)?usages:[usages]).filter(usage=>MANUAL_USAGES.includes(usage)));
+  const tagFilter=new Set(normalizedTags(tags).map(tag=>tag.toLocaleLowerCase('zh-CN')));
+  return listAssets().filter(asset=>{
+    if(categoryFilter.size&&!categoryFilter.has(asset.category))return false;
+    if(usageFilter.size&&!usageFilter.has(asset.usage))return false;
+    const assetTags=asset.tags.map(tag=>String(tag).toLocaleLowerCase('zh-CN'));
+    if(tagFilter.size&&![...tagFilter].every(tag=>assetTags.includes(tag)))return false;
+    if(!needle)return true;
+    const haystack=[asset.displayName,asset.name,asset.category,asset.categoryLabel,asset.group,asset.description,asset.usage,...asset.tags].filter(Boolean).join('\n').toLocaleLowerCase('zh-CN');
+    return haystack.includes(needle);
+  });
 }
 export async function analyzeAsset({file,sourceLabel,model,reasoningEffort='low',dir}){
   const result=await runCodex({dir,schema:ASSET_SCHEMA,images:[file],model,reasoningEffort,
