@@ -4,12 +4,14 @@ import path from 'node:path';
 import {execFile} from 'node:child_process';
 import {APP,ROOT,REFS,CHECKS,inside,digest} from './workflow.mjs';
 import {connectionStatus,appServerSnapshot,normalizeRateLimits} from './bridge.mjs';
+import {webWorkerStatus} from './chatgpt-web-provider.mjs';
 import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,resume,reviseImage,recoverImage,reviewImage,retryMissingImage,imageRetryState,accept,recover,projectDir,syncRunningProject,refreshQuotaPauses} from './engine.mjs';
 import {CATEGORIES,listDocuments,listAssets,discoverArchiveStories,archiveStory,stageUpload,readCandidate,inspectStagedCandidate,saveManualAsset,searchAssets,analyzeAsset,saveAssetProposal,applyAssetProposal,saveDocument,suggestDocument,deleteProjectFolder,deleteArchiveStory} from './library.mjs';
 const PORT=Number(process.env.PORT||4318);const HOST='127.0.0.1';
 const front=path.join(APP,'dist/client');
 const mime={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.json':'application/json; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.webp':'image/webp','.ico':'image/x-icon','.woff2':'font/woff2','.zip':'application/zip','.md':'text/plain; charset=utf-8','.txt':'text/plain; charset=utf-8'};
 let connection=await connectionStatus();
+const connectionSnapshot=()=>({...connection,imageWorker:webWorkerStatus()});
 const ACCOUNT_CACHE_FILE=path.join(APP,'.runtime','account-cache.json');
 function readAccountCache(){try{return JSON.parse(fs.readFileSync(ACCOUNT_CACHE_FILE,'utf8'));}catch{return null;}}
 function writeAccountCache(value){try{fs.mkdirSync(path.dirname(ACCOUNT_CACHE_FILE),{recursive:true});fs.writeFileSync(ACCOUNT_CACHE_FILE,JSON.stringify(value),{mode:0o600});}catch{}}
@@ -128,13 +130,13 @@ const server=http.createServer(async(req,res)=>{
       const origin=req.headers.origin;const allowed=[`http://127.0.0.1:${PORT}`,`http://localhost:${PORT}`,'http://127.0.0.1:5173','http://localhost:5173'];
       if(req.headers['x-wendi-request']!=='studio'||!String(req.headers['content-type']).startsWith('application/json')||(origin&&!allowed.includes(origin)))return send(res,{error:'请从本地创作室提交'},403);
     }
-    if(url.pathname==='/api/health')return send(res,{app:'wendi-studio',ready:true,connection,version:'2.1.0'});
+    if(url.pathname==='/api/health')return send(res,{app:'wendi-studio',ready:true,connection:connectionSnapshot(),version:'2.2.0'});
     if(url.pathname==='/api/bootstrap'){
       const snapshot=await account();const assets=publicAssets();const stories=discoverArchiveStories().map(s=>({...s,coverUrl:`/media/archive-story/${s.id}/0`,pages:s.pages.map((_,i)=>({index:i,url:`/media/archive-story/${s.id}/${i}`}))}));
-      return send(res,{connection,checks:CHECKS,projects:listProjects().map(publicProject),account:snapshot,categories:CATEGORIES,documents:listDocuments(),assets,references:assets.filter(x=>!x.file.startsWith('02-')),archiveStories:stories,hero:stories[0]?.coverUrl||assets[0]?.url});
+      return send(res,{connection:connectionSnapshot(),checks:CHECKS,projects:listProjects().map(publicProject),account:snapshot,categories:CATEGORIES,documents:listDocuments(),assets,references:assets.filter(x=>!x.file.startsWith('02-')),archiveStories:stories,hero:stories[0]?.coverUrl||assets[0]?.url});
     }
     if(url.pathname==='/api/account'&&req.method==='POST')return send(res,await account(true));
-    if(url.pathname==='/api/connection'&&req.method==='POST'){connection=await connectionStatus();return send(res,connection);}
+    if(url.pathname==='/api/connection'&&req.method==='POST'){connection=await connectionStatus();return send(res,connectionSnapshot());}
     if(url.pathname==='/api/projects'&&req.method==='POST'){const b=await body(req),selected=chooseModel(await account(),b.model,b.reasoningEffort);const p=createProject({...b,...selected});planProject(p);return send(res,publicProject(p),201);}
     // The staged-upload route only validates local bytes and keeps the temporary
     // candidate outside the visible library. It intentionally does not select a

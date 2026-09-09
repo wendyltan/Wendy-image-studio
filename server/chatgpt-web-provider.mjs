@@ -32,6 +32,17 @@ export function readWebWorkerConfig(file=process.env.WENDI_CHATGPT_WEB_WORKER_CO
   }catch{return null;}
 }
 
+export function webWorkerStatus(){
+  const worker=readWebWorkerConfig();
+  if(!worker)return {ready:false,message:'网页生图后台尚未初始化。'};
+  if(process.env.WENDI_TEST_PLAN_FILE)return {ready:true,message:'网页生图后台已就绪。',verifiedAt:worker.verifiedAt};
+  const sessions=path.join(process.env.CODEX_HOME||path.join(process.env.HOME||'','.codex'),'sessions');
+  let localSession=false;
+  try{localSession=fs.globSync(`**/*${worker.threadId}.jsonl`,{cwd:sessions}).length>0;}catch{}
+  if(!localSession)return {ready:false,message:'网页生图后台记录已失效，需要重新初始化。',verifiedAt:worker.verifiedAt};
+  return {ready:true,message:'网页生图后台已就绪。',verifiedAt:worker.verifiedAt};
+}
+
 export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceFiles=[],editTarget=null,conversationUrl=null,capsule=''}){
   const action=editTarget
     ? '第一项附件是待编辑原图。请只修订明确指出的问题，保持其他正确内容。'
@@ -82,23 +93,30 @@ function queueMessage(requestFile){
   return `执行温蒂创作室网页生图作业。用户已经在创作室执行本次 action-time 确认，request.authorization 是确认凭据，不得再次询问。只读取 ${requestFile}，再读取其中 instructionFile 的完整指令并严格执行。在当前同一个回合内新建或复用 Codex IAB，完成附件上传、唯一一次发送、等待和原图下载；回合结束会清理标签页，所以不得在 ready 后停下。禁止 image_gen 和外部浏览器。每个阶段都按 instructionFile 原子更新 manifestFile；聊天消息最多发送一次。不要浏览或修改其他项目文件。`;
 }
 
-function queueOnce(bin,args,{cwd,logFile}){
+export function queueOnce(bin,args,{cwd,logFile,signal,timeoutMs=30000,killGraceMs=1500}){
+  if(signal?.aborted){const error=new Error('已暂停，网页生图任务尚未开始。');error.code='WEB_WORKER_QUEUE_ABORTED';return Promise.reject(error);}
   return new Promise((resolve,reject)=>{
     const child=spawn(bin,args,{cwd,env:{...process.env,NO_COLOR:'1'},stdio:['ignore','pipe','pipe']});
-    let stdout='',stderr='';
+    let stdout='',stderr='',settled=false,termination=null,killTimer=null;
+    const log=code=>fs.appendFileSync(logFile,JSON.stringify({at:new Date().toISOString(),kind:'queue',code,termination,stdout:stdout.slice(-4000),stderr:stderr.slice(-4000)})+'\n',{mode:0o600});
+    const stop=(kind,message,code)=>{
+      if(settled||termination)return;
+      termination={kind,message,code};child.kill('SIGTERM');killTimer=setTimeout(()=>{if(!settled)child.kill('SIGKILL');},killGraceMs);killTimer.unref?.();
+    };
+    const timer=setTimeout(()=>stop('timeout','唤醒网页生图后台超时。任务记录已保留，不会自动重复提交。','WEB_WORKER_QUEUE_TIMEOUT'),timeoutMs);timer.unref?.();
+    const onAbort=()=>stop('aborted','已暂停等待；网页后台若已收到任务仍会继续，完成的原图将保留。','WEB_WORKER_QUEUE_ABORTED');signal?.addEventListener('abort',onAbort,{once:true});
+    const finish=callback=>{if(settled)return;settled=true;clearTimeout(timer);if(killTimer)clearTimeout(killTimer);signal?.removeEventListener('abort',onAbort);callback();};
     child.stdout.on('data',chunk=>stdout+=chunk);
     child.stderr.on('data',chunk=>stderr+=chunk);
-    child.on('error',reject);
+    child.on('error',error=>finish(()=>reject(error)));
     child.on('close',code=>{
-      fs.appendFileSync(logFile,JSON.stringify({at:new Date().toISOString(),kind:'queue',code,stdout:stdout.slice(-4000),stderr:stderr.slice(-4000)})+'\n',{mode:0o600});
-      if(code===0)return resolve({stdout,stderr});
-      const error=new Error(stderr.trim()||stdout.trim()||'无法唤醒 Codex 网页生图后台。');error.code='WEB_WORKER_QUEUE_FAILED';reject(error);
+      finish(()=>{log(code);if(termination){const error=new Error(termination.message);error.code=termination.code;return reject(error);}if(code===0)return resolve({stdout,stderr});const error=new Error(stderr.trim()||stdout.trim()||'无法唤醒 Codex 网页生图后台。');error.code='WEB_WORKER_QUEUE_FAILED';reject(error);});
     });
   });
 }
 
 /** Queue exactly one turn on the dedicated Codex task, then observe its durable manifest. */
-export async function dispatchChatGptWebJob({codexBin,dir,outputFile,prompt,referenceFiles=[],editTarget=null,conversationUrl=null,capsule='',signal,timeoutMs=900000}){
+export async function dispatchChatGptWebJob({codexBin,dir,outputFile,prompt,referenceFiles=[],editTarget=null,conversationUrl=null,capsule='',signal,timeoutMs=900000,queueTimeoutMs=30000}){
   if(!codexBin){const error=new Error('请先打开 Codex 并登录。');error.code='WEB_WORKER_QUEUE_FAILED';throw error;}
   const worker=readWebWorkerConfig();
   if(!worker){const error=new Error('Browser is not available: iab。Codex 网页生图后台尚未完成初始化，没有提交图片请求。');error.code='IAB_UNAVAILABLE';throw error;}
@@ -109,8 +127,17 @@ export async function dispatchChatGptWebJob({codexBin,dir,outputFile,prompt,refe
   const createdAt=new Date().toISOString();
   writeJson(requestFile,{schemaVersion:1,provider:WEB_IMAGE_PROVIDER,requestId:crypto.randomUUID(),authorization:{confirmed:true,scope:'one_chatgpt_web_image_submission',confirmedAt:createdAt},instructionFile,manifestFile,outputFile:path.resolve(outputFile),referenceFiles:referenceFiles.map(file=>path.resolve(file)),editTarget:editTarget?path.resolve(editTarget):null,conversationUrl,createdAt});
   const args=['queue','--thread',worker.threadId,'--message',queueMessage(requestFile),'-C',APP,'-s','workspace-write','--disable','image_generation','--disable','browser_use_external'];
-  await queueOnce(codexBin,args,{cwd:APP,logFile:eventsFile});
   const started=Date.now();
+  try{await queueOnce(codexBin,args,{cwd:APP,logFile:eventsFile,signal,timeoutMs:Math.min(queueTimeoutMs,timeoutMs)});}
+  catch(error){
+    const manifest=readWebManifest(manifestFile);error.webManifest=manifest;
+    if(manifest?.state==='downloaded')return {text:[manifest.artifactPath,manifest.conversationUrl].filter(Boolean).join('\n'),usage:null,manifest};
+    if(manifest?.state==='failed'){error.message=String(manifest.error||error.message);error.code=manifest.errorCode||error.code;throw error;}
+    // The browser may submit after the local queue client disconnects. Once the
+    // worker is ready, keep observing durable state instead of guessing no image.
+    if(!['ready','submitted'].includes(manifest?.state))throw error;
+    if(signal?.aborted){error.code='WEB_IMAGE_WAIT_PAUSED';throw error;}
+  }
   while(true){
     const manifest=readWebManifest(manifestFile);
     if(manifest&&TERMINAL_STATES.has(manifest.state)){

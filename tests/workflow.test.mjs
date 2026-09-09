@@ -65,11 +65,37 @@ test('web worker state accepts only a configured thread and durable manifest sta
   process.env.WENDI_CHATGPT_WEB_WORKER_CONFIG=config;
   fs.writeFileSync(config,JSON.stringify({threadId:'01a085cd-21a2-7553-b2e3-4acdafd55e55',hostId:'local'}));
   assert.equal(G.readWebWorkerConfig().threadId,'01a085cd-21a2-7553-b2e3-4acdafd55e55');
+  assert.equal(G.webWorkerStatus().ready,true);
   fs.writeFileSync(manifest,JSON.stringify({state:'submitted',submitted:true,conversationUrl:'https://chatgpt.com/c/example'}));
   assert.deepEqual(G.readWebManifest(manifest),{state:'submitted',submitted:true,conversationUrl:'https://chatgpt.com/c/example'});
   fs.writeFileSync(manifest,JSON.stringify({state:'downloaded',submitted:true,conversationUrl:'https://evil.example/c/example'}));
   assert.equal(G.readWebManifest(manifest).conversationUrl,null);
   delete process.env.WENDI_CHATGPT_WEB_WORKER_CONFIG;
+});
+test('web worker queue has a hard timeout and writes termination evidence',async()=>{
+  const logFile=path.join(temp,'queue-timeout.jsonl');
+  await assert.rejects(
+    G.queueOnce(process.execPath,['--input-type=module','-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{cwd:temp,logFile,timeoutMs:40,killGraceMs:20}),
+    error=>error.code==='WEB_WORKER_QUEUE_TIMEOUT',
+  );
+  const event=JSON.parse(fs.readFileSync(logFile,'utf8').trim());
+  assert.equal(event.termination.kind,'timeout');
+});
+test('web worker queue honors cancellation before spawning',async()=>{
+  const controller=new AbortController();controller.abort();
+  await assert.rejects(
+    G.queueOnce(process.execPath,['--version'],{cwd:temp,logFile:path.join(temp,'queue-abort.jsonl'),signal:controller.signal}),
+    error=>error.code==='WEB_WORKER_QUEUE_ABORTED',
+  );
+  assert.equal(fs.existsSync(path.join(temp,'queue-abort.jsonl')),false);
+});
+test('an invalid web worker is rejected before image production starts',async()=>{
+  let project=E.createProject({...brief,idea:'失效网页后台确认测试'});E.planProject(project);project=await done(project.id);
+  const previous=process.env.WENDI_CHATGPT_WEB_WORKER_CONFIG;
+  process.env.WENDI_CHATGPT_WEB_WORKER_CONFIG=path.join(temp,'missing-worker.json');
+  try{assert.throws(()=>E.approvePlan(project,W.digest(project.plan)),/尚未初始化/);}
+  finally{if(previous)process.env.WENDI_CHATGPT_WEB_WORKER_CONFIG=previous;else delete process.env.WENDI_CHATGPT_WEB_WORKER_CONFIG;}
+  project=E.readProject(project.id);assert.equal(project.status,'review');assert.equal(project.samples.length,0);
 });
 test('missing hidden IAB is definite pre-submission no-output evidence',()=>{
   const evidence=B.classifyGenerationEvidence({responseText:'Browser is not available: iab',exitCode:0});
@@ -184,6 +210,7 @@ test('an unavailable hidden IAB stops before any provider submission',async()=>{
   assert.equal(failed.pending,null);assert.equal(failed.lastFailure.kind,'browser-unavailable');assert.equal(failed.lastFailure.attempts,0);
   assert.equal(failed.currentTask.providerInvocations,0);assert.equal(failed.currentTask.status,'failed_no_output');assert.match(failed.message,/没有打开你的浏览器/);
   delete process.env.WENDI_TEST_NO_IMAGE_ONCE;delete process.env.WENDI_TEST_NO_IMAGE_TEXT;
+  E.retryMissingImage(failed,'样张-1');failed=await done(failed.id);assert.equal(failed.currentTask.attempt,1);assert.equal(failed.progress.current,1);assert.equal(failed.progress.total,2);
 });
 test('a durable pre-submission web failure is safely retryable after restart',()=>{
   let failed=E.createProject({...brief,idea:'网页提交前失败恢复测试'});const dir=path.join(E.projectDir(failed.id),'.制作记录','pre-submit');

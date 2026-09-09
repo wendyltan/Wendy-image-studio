@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import {DATA,REFS,FACE,CHECKS,jsonWrite,inside,rules,digest,validatePlan,PLAN_SCHEMA,QA_SCHEMA,plannerPrompt,planMarkdown} from './workflow.mjs';
 import {runCodex,pythonRun,rateLimitSnapshot,readGenerationEvidence,generationDiagnosticSummary,findCodex} from './bridge.mjs';
 import {JobStore} from './job-store.mjs';
-import {WEB_IMAGE_PROVIDER,chatGptWebImagePrompt,dispatchChatGptWebJob,readWebManifest} from './chatgpt-web-provider.mjs';
+import {WEB_IMAGE_PROVIDER,chatGptWebImagePrompt,dispatchChatGptWebJob,readWebManifest,webWorkerStatus} from './chatgpt-web-provider.mjs';
 export const active = new Map();
 const runningProjects = new Map();
 fs.mkdirSync(DATA,{recursive:true});
@@ -287,6 +287,7 @@ function ensureVersionFiles(p){
 export function approvePlan(p,hash){
   if(active.has(p.id))throw new Error('方案仍在整理中。');
   if(p.status!=='review'||!p.plan||digest(p.plan)!==hash)throw new Error('方案已更新，请重新查看并确认当前版本。');
+  const worker=webWorkerStatus();if(!worker.ready)throw new Error(worker.message);
   validatePlan(p.plan,p.brief);
   const text=rules();ensureVersionFiles(p);
   p.approved={version:p.version,hash,rulesHash:digest(text),at:new Date().toISOString()};p.accepted=false;
@@ -583,14 +584,14 @@ export function retryMissingImage(p,target,{allowUnknownResult=false}={}){
     activity(p,`正在只重新生成 ${target}…`);
     if(sampleIndex!==null){
       const sample=p.plan.samples[sampleIndex];if(!sample)throw new Error('对应样张不存在。');
-      const result=await generate(p,`样张-${sampleIndex+1}`,`${sample.prompt}。单幅竖图，优先3:4；若内置生图返回标准2:3竖幅，保留原图，不裁切，也不要因此再次生图。`,sample.references,signal,null,true,'方向样张',(failure.attempts||1)+1);
-      p.samples[sampleIndex]=result;p.samplesApproved=false;p.samplesDecision=null;p.status='paused';p.message=`${target} 已重新生成并保存，请查看后继续。`;saveProject(p);return;
+      const result=await generate(p,`样张-${sampleIndex+1}`,`${sample.prompt}。单幅竖图，优先3:4；若内置生图返回标准2:3竖幅，保留原图，不裁切，也不要因此再次生图。`,sample.references,signal,null,true,'方向样张',Math.max(1,Number(failure.attempts||0)+1));
+      p.samples[sampleIndex]=result;p.samplesApproved=false;p.samplesDecision=null;p.status='paused';activity(p,`${target} 已重新生成并保存，请查看后继续。`,p.samples.filter(Boolean).length,2,'样张');return;
     }
     const [pageNumber,panelNumber]=panelKey.split('-').map(Number),page=p.plan.pages[pageNumber-1],panel=page?.panels[panelNumber-1];if(!panel)throw new Error('对应分镜不存在。');
     const geoFile=path.join(runDir(p,'分镜比例'),'page.json');jsonWrite(geoFile,page);const geometry=JSON.parse(await pythonRun(['geometry',geoFile]))[panelNumber-1];
     const prompt=compilePanelPrompt(pageNumber,panelNumber,panel,geometry,p.revisionNotes.filter(x=>x.key===panelKey||x.key===target));
-    const result=await generate(p,`第${pageNumber}页-第${panelNumber}格`,prompt,panel.references,signal,null,p.brief.workflowPreset==='careful','原始分镜',(failure.attempts||1)+1);
-    p.panels[panelKey]=result;p.pages=p.pages.filter(item=>item.number!==pageNumber);invalidateArtifacts(p,[`image:${panelKey}`,`page:${pageNumber}`]);p.storyQA=null;p.bundle=null;p.accepted=false;p.status='paused';p.message=`${target} 已重新生成并保存；本次不会继续生成其他分镜。`;saveProject(p);
+    const result=await generate(p,`第${pageNumber}页-第${panelNumber}格`,prompt,panel.references,signal,null,p.brief.workflowPreset==='careful','原始分镜',Math.max(1,Number(failure.attempts||0)+1));
+    p.panels[panelKey]=result;p.pages=p.pages.filter(item=>item.number!==pageNumber);invalidateArtifacts(p,[`image:${panelKey}`,`page:${pageNumber}`]);p.storyQA=null;p.bundle=null;p.accepted=false;p.status='paused';const totalPanels=p.plan.pages.reduce((total,item)=>total+item.panels.length,0);activity(p,`${target} 已重新生成并保存；本次不会继续生成其他分镜。`,Object.keys(p.panels).length,totalPanels,'分镜');
   });
 }
 export function recoverImage(p){verifyApproval(p);if(!p.pending)throw new Error('没有待找回的图片');return job(p,'revising',async()=>{
