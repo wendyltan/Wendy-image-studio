@@ -4,7 +4,7 @@ import path from 'node:path';
 import {execFile} from 'node:child_process';
 import {APP,ROOT,REFS,CHECKS,inside,digest} from './workflow.mjs';
 import {connectionStatus,appServerSnapshot,normalizeRateLimits} from './bridge.mjs';
-import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,resume,reviseImage,recoverImage,reviewImage,retryMissingImage,retryableImageFailure,accept,recover,projectDir,syncRunningProject} from './engine.mjs';
+import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,resume,reviseImage,recoverImage,reviewImage,retryMissingImage,imageRetryState,accept,recover,projectDir,syncRunningProject,refreshQuotaPauses} from './engine.mjs';
 import {CATEGORIES,listDocuments,listAssets,discoverArchiveStories,archiveStory,stageUpload,readCandidate,inspectStagedCandidate,saveManualAsset,searchAssets,analyzeAsset,saveAssetProposal,applyAssetProposal,saveDocument,suggestDocument,deleteProjectFolder,deleteArchiveStory} from './library.mjs';
 const PORT=Number(process.env.PORT||4318);const HOST='127.0.0.1';
 const front=path.join(APP,'dist/client');
@@ -26,7 +26,7 @@ async function account(force=false){
     const fresh=limits.primary||limits.secondary;
     const previous=accountCache.value;
     const clean={models:models.length?models:(previous?.models||fallbackModels),rateLimits:fresh?limits:(previous?.rateLimits||null),usage:raw.usage?{planType:raw.usage.planType||null,credits:raw.usage.credits?{balance:raw.usage.credits.balance}:null}:null,status:fresh?(raw.status||'fresh'):(previous?.rateLimits?'stale':'unavailable'),error:raw.error||(!fresh?'额度暂不可用。':'')||null,updatedAt:new Date().toISOString()};
-    if(fresh&&!process.env.WENDI_TEST_PLAN_FILE)writeAccountCache(clean);
+    if(fresh&&!process.env.WENDI_TEST_PLAN_FILE){writeAccountCache(clean);refreshQuotaPauses(limits.primary?.remainingPercent);}
     accountCache={at:Date.now(),value:clean};return clean;
   })();
   try{return await accountInFlight;}finally{accountInFlight=null;}
@@ -58,7 +58,8 @@ function publicProject(p){
   const publicTask=task=>task?{id:task.id,kind:task.kind,target:task.target,status:task.status,attempt:task.attempt,providerInvocationLimit:task.providerInvocationLimit,providerInvocations:task.providerInvocations,startedAt:task.startedAt,lastProgressAt:task.lastProgressAt,completedAt:task.completedAt,qa:task.qa,errorCode:task.errorCode}:null;
   const {pending,history=[],samples=[],panels={},pages=[],bundle,artifacts:ignoredArtifacts,tasks:ignoredTasks,currentTask,previewDecisionCommands:ignoredCommands,...safe}=p;
   void ignoredArtifacts;void ignoredTasks;void ignoredCommands;
-  return {...safe,pending:pending?{key:pending.key,at:pending.at,taskId:pending.taskId}:null,currentTask:publicTask(currentTask),history:history.map(h=>({version:h.version,title:h.plan.title,at:h.approved?.at,plan:h.plan,pages:(h.pages||[]).map(q=>publicImage(q,`page:${q.number}`))})),
+  const retryState=imageRetryState(p);
+  return {...safe,pending:pending?{key:pending.key,at:pending.at,taskId:pending.taskId}:null,currentTask:publicTask(currentTask),imageRetry:retryState?{certainty:retryState.certainty,target:retryState.target}:null,history:history.map(h=>({version:h.version,title:h.plan.title,at:h.approved?.at,plan:h.plan,pages:(h.pages||[]).map(q=>publicImage(q,`page:${q.number}`))})),
     planHash:p.plan?digest(p.plan):null,busy:active.has(p.id),
     samples:samples.map((sample,index)=>publicImage(sample,`image:样张-${index+1}`)),
     panels:Object.fromEntries(Object.entries(panels).map(([key,panel])=>[key,publicImage(panel,`image:第${key.split('-')[0]}页-第${key.split('-')[1]}格`)])),
@@ -111,8 +112,8 @@ function retryCommand(p,b){
   if(!key||key.length>200)throw new Error('缺少本次重试的防重复标识，请刷新页面后再试。');
   const records=Array.isArray(p.retryCommands)?p.retryCommands:[];
   const existing=records.find(record=>record.key===key);
-  const target=existing?.target||retryableImageFailure(p)?.key||'';
-  const fingerprint=digest({target,confirmNoImage:b.confirmNoImage===true});
+  const target=existing?.target||imageRetryState(p)?.target||'';
+  const fingerprint=digest({target,confirmNoImage:b.confirmNoImage===true,confirmUnknownResult:b.confirmUnknownResult===true});
   if(existing){if(existing.fingerprint!==fingerprint)throw new Error('这次重试标识已经用于另一张图片，请刷新后重试。');return {key,target,existing};}
   return {key,target,fingerprint,existing:null};
 }
@@ -190,12 +191,13 @@ const server=http.createServer(async(req,res)=>{
         // re-entering the workflow and possibly spending another image request.
         if(command.existing)return send(res,{...publicProject(p),idempotent:true,command:{key:command.key,acceptedAt:command.existing.at}});
         if(active.has(p.id))throw new Error('这篇仍在制作，请稍候。');
-        const confirmedMissing=retryableImageFailure(p);
-        if(b.confirmNoImage!==true||!confirmedMissing||confirmedMissing.key!==command.target)throw new Error('请先确认没有生成图片。');
+        const retryState=imageRetryState(p),confirmed=retryState?.certainty==='confirmed_missing'&&b.confirmNoImage===true,unknownApproved=retryState?.certainty==='unknown_result'&&b.confirmUnknownResult===true;
+        if(!retryState||retryState.target!==command.target||(!confirmed&&!unknownApproved))throw new Error(retryState?.certainty==='unknown_result'?'请明确确认仍要重新生成这张结果未知的图片。':'请先确认没有生成图片。');
         p.retryCommands=Array.isArray(p.retryCommands)?p.retryCommands:[];
-        p.retryCommands.push({key:command.key,fingerprint:command.fingerprint,target:command.target,at:new Date().toISOString()});p.retryCommands=p.retryCommands.slice(-80);
-        p.revisionNotes.push({key:command.target||'当前图片',note:'用户确认本次没有取得图片，允许只重新生成这一张',at:new Date().toISOString()});saveProject(p);
-        try{retryMissingImage(p,command.target);}catch(error){p.retryCommands=p.retryCommands.filter(record=>record.key!==command.key);saveProject(p);throw error;}
+        const decision=unknownApproved?'retry_unknown_result':'confirmed_missing';
+        p.retryCommands.push({key:command.key,fingerprint:command.fingerprint,target:command.target,decision,at:new Date().toISOString()});p.retryCommands=p.retryCommands.slice(-80);
+        p.revisionNotes.push({key:command.target||'当前图片',note:unknownApproved?'用户知晓结果仍无法确认，明确允许只重新生成这一张':'用户确认本次没有取得图片，允许只重新生成这一张',at:new Date().toISOString()});saveProject(p);
+        try{retryMissingImage(p,command.target,{allowUnknownResult:unknownApproved});}catch(error){p.retryCommands=p.retryCommands.filter(record=>record.key!==command.key);saveProject(p);throw error;}
         return send(res,{...publicProject(p),idempotent:false,command:{key:command.key,acceptedAt:new Date().toISOString()}});
       }
       if(active.has(p.id))throw new Error('这篇仍在制作，请稍候。');

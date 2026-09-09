@@ -2,8 +2,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import {DATA,REFS,FACE,CHECKS,jsonWrite,inside,rules,digest,validatePlan,PLAN_SCHEMA,QA_SCHEMA,plannerPrompt,planMarkdown} from './workflow.mjs';
-import {runCodex,pythonRun,rateLimitSnapshot,readGenerationEvidence,generationDiagnosticSummary} from './bridge.mjs';
+import {runCodex,pythonRun,rateLimitSnapshot,readGenerationEvidence,generationDiagnosticSummary,findCodex} from './bridge.mjs';
 import {JobStore} from './job-store.mjs';
+import {WEB_IMAGE_PROVIDER,chatGptWebImagePrompt,dispatchChatGptWebJob,readWebManifest} from './chatgpt-web-provider.mjs';
 export const active = new Map();
 const runningProjects = new Map();
 fs.mkdirSync(DATA,{recursive:true});
@@ -15,9 +16,10 @@ const ID=/^[a-f0-9-]{36}$/;
 // before the local copy step fails, so it must remain recoverable.
 const DEFINITE_NO_IMAGE=/(?:未能生成(?:任何)?(?:替代品|图片)?|没有生成(?:任何)?(?:替代品|图片)?|未(?:产生|产出)(?:任何)?图片|未(?:生成|输出)(?:任何)?图片|没有(?:产生|产出)(?:任何)?图片|目标路径尚不存在|no image (?:was )?(?:generated|produced|created|returned)|(?:did not|didn't) (?:generate|produce|return) (?:an? )?image|image generation (?:produced|returned) no image)/i;
 const NETWORK_FAILURE=/(?:network|connection|连接|网络|websocket)/i;
+const IAB_UNAVAILABLE=/(?:Browser is not available:\s*iab|隐藏\s*IAB.*不可用)/i;
 export function projectDir(id){if(!ID.test(id))throw new Error('作品不存在');return inside(DATA,id);}
 export function readProject(id){const p=path.join(projectDir(id),'project.json');if(!fs.existsSync(p))throw new Error('作品不存在');return JSON.parse(fs.readFileSync(p,'utf8'));}
-export function syncRunningProject(id,patch){const running=runningProjects.get(id);if(!running)return;Object.assign(running,patch);if(patch.brief)running.brief={...running.brief,...patch.brief};}
+export function syncRunningProject(id,patch){const running=runningProjects.get(id);if(!running)return;const brief=patch.brief?{...running.brief,...patch.brief}:running.brief;Object.assign(running,patch);running.brief=brief;}
 export function saveProject(p){
   const file=path.join(projectDir(p.id),'project.json');
   // A running task keeps an in-memory snapshot. Preserve user changes made from
@@ -38,12 +40,19 @@ export function recover(){
   for(const job of recoverable)if(job.status==='queued'){jobStore.cancel(job.id,'interrupted',{reason:'service_restarted_before_start'});job.status='recoverable';}
   const interrupted=new Map(recoverable.map(job=>[job.projectId,job]));
   for(const p of listProjects()){
+  if(jobStore.hasLiveWork(p.id))continue;
   let migrated=false;
+  if(p.lastFailure?.kind==='network'&&p.lastFailure.definiteNoOutput!==false){p.lastFailure.definiteNoOutput=false;migrated=true;}
+  if(p.currentTask?.status==='failed_no_output'&&(!['no-output','browser-unavailable'].includes(p.currentTask.errorCode)||p.lastFailure?.kind==='network')){p.currentTask.status='unknown_result';p.currentTask.errorCode='network';p.status='attention';p.message=unknownResultMessage(p.currentTask.target);p.error=p.message;migrated=true;}
   if(!p.lastFailure&&p.currentTask?.status==='failed_no_output'&&!p.pending){
-    p.lastFailure={kind:p.currentTask.errorCode==='no-output'?'no-output':'network',definiteNoOutput:true,key:p.currentTask.target,attempts:p.currentTask.providerInvocations||1,inputTokens:0,diagnostics:p.currentTask.diagnostics||null,taskId:p.currentTask.id,at:p.currentTask.completedAt||p.updatedAt||new Date().toISOString()};migrated=true;
+    const state=imageRetryState(p);
+    if(state?.certainty==='confirmed_missing')p.lastFailure={...state.failure,taskId:p.currentTask.id};
+    else {p.currentTask.status='unknown_result';p.currentTask.errorCode='network';p.status='attention';p.message=unknownResultMessage(state?.target||p.currentTask.target);p.error=p.message;}
+    migrated=true;
   }
-  if(p.lastFailure?.definiteNoOutput&&!p.currentTask){
-    const task={id:p.lastFailure.taskId||crypto.randomUUID(),kind:'image',target:p.lastFailure.key,status:'failed_no_output',attempt:1,providerInvocationLimit:1,providerInvocations:p.lastFailure.attempts||1,startedAt:p.lastFailure.at,completedAt:p.lastFailure.at};
+  if(p.lastFailure&&!p.currentTask){
+    const state=imageRetryState(p),confirmed=state?.certainty==='confirmed_missing';
+    const task={id:p.lastFailure.taskId||crypto.randomUUID(),kind:'image',target:p.lastFailure.key,status:confirmed?'failed_no_output':'unknown_result',errorCode:confirmed?p.lastFailure.kind:'network',attempt:1,providerInvocationLimit:1,providerInvocations:p.lastFailure.attempts||0,startedAt:p.lastFailure.at,completedAt:p.lastFailure.at};
     p.tasks=Array.isArray(p.tasks)?p.tasks:[];p.tasks.push(task);p.currentTask=task;migrated=true;
   }
   if(p.pending&&!fs.existsSync(p.pending.file)){
@@ -51,12 +60,17 @@ export function recover(){
     if(failure){
       const sample=/(?:样张-|sample-)([12])/.exec(p.pending.key||'');
       if(sample)sampleRepairCount(p,Number(sample[1])-1);
+      const task=(p.tasks||[]).find(item=>item.id===p.pending.taskId);
+      const taskPatch={status:'failed_no_output',errorCode:failure.kind,providerInvocations:failure.attempts||0,completedAt:new Date().toISOString()};
+      if(task)Object.assign(task,taskPatch);
+      if(p.currentTask?.id===p.pending.taskId)Object.assign(p.currentTask,taskPatch);
       p.pending=null;p.lastFailure=failure;p.status='attention';p.message=failureMessage(failure);p.error=p.message;saveProject(p);continue;
     }
   }
-  if(p.lastFailure?.definiteNoOutput&&!p.pending&&p.status==='attention'){
-    const message=failureMessage(p.lastFailure);
-    if(p.message!==message){p.message=message;p.error=message;migrated=true;}
+  const retryState=imageRetryState(p);
+  if(retryState&&!p.pending&&['attention','paused'].includes(p.status)){
+    const message=retryState.certainty==='confirmed_missing'?failureMessage(retryState.failure):unknownResultMessage(retryState.target);
+    if(p.status!=='attention'||p.message!==message){p.status='attention';p.message=message;p.error=message;migrated=true;}
   }
   if(['attention','paused'].includes(p.status)&&p.progress?.startedAt&&!p.progress.completedAt){p.progress.completedAt=p.lastFailure?.at||p.updatedAt||new Date().toISOString();migrated=true;}
   if(migrated)saveProject(p);
@@ -72,18 +86,18 @@ export function createProject(brief){
 }
 export function job(p,phase,fn){
   if(active.has(p.id))throw new Error('这篇正在制作，请等待或先暂停。');
-  const controller=new AbortController(),queued=jobStore.enqueue({projectId:p.id,phase});active.set(p.id,controller);runningProjects.set(p.id,p);
+  const controller=new AbortController(),queued=jobStore.enqueue({projectId:p.id,phase,submitter:queueOwner});active.set(p.id,controller);runningProjects.set(p.id,p);
   p.queueJob={id:queued.id,status:'queued',phase,queuedAt:queued.queuedAt};p.error=null;p.message='正在等待前一项本地创作任务完成…';p.progress={...p.progress,phase:'queued',startedAt:queued.queuedAt,completedAt:null};saveProject(p);
   const run=async()=>{
     let claimed=null,beat=null;
     try{
-      while(!controller.signal.aborted&&!claimed){claimed=jobStore.claim(queued.id,queueOwner);if(!claimed){jobStore.reclaimOrphanedLock();await wait(200);}}
+      while(!controller.signal.aborted&&!claimed){if(jobStore.read(queued.id)?.status!=='queued')break;claimed=jobStore.claim(queued.id,queueOwner);if(!claimed){jobStore.reclaimOrphanedLock();await wait(200);}}
       if(!claimed){jobStore.cancel(queued.id,'paused',{reason:'cancelled_before_start'});p.status='paused';p.message='已暂停，尚未开始这一步。';p.progress={...p.progress,completedAt:new Date().toISOString()};return;}
       p.queueJob={id:queued.id,status:'running',phase,queuedAt:queued.queuedAt,startedAt:claimed.startedAt};p.status=phase;p.progress={...p.progress,phase,startedAt:claimed.startedAt,completedAt:null};saveProject(p);
       beat=setInterval(()=>jobStore.heartbeat(queued.id,queueOwner),5000);
       try{await fn(controller.signal);jobStore.finish(queued.id,queueOwner,'completed');}
       catch(e){p.status=controller.signal.aborted||e.code==='LOW_QUOTA'?'paused':'attention';p.error=String(e.message||e).slice(0,2000);p.message=p.error;p.progress={...p.progress,completedAt:new Date().toISOString()};if(p.currentTask?.status==='running')finishTask(p,p.currentTask,p.status==='paused'?'paused':'failed',{error:p.error});saveProject(p);jobStore.finish(queued.id,queueOwner,controller.signal.aborted?'paused':'failed',{error:p.error});}
-    }finally{if(beat)clearInterval(beat);p.queueJob=null;saveProject(p);active.delete(p.id);runningProjects.delete(p.id);}
+    }finally{if(beat)clearInterval(beat);p.queueJob=null;try{saveProject(p);}finally{active.delete(p.id);runningProjects.delete(p.id);}}
   };
   queueTail=queueTail.catch(()=>{}).then(run);return p;
 }
@@ -128,6 +142,20 @@ async function protectQuota(p){
   p.lastQuotaCheck={remaining,resetsAt:limits.primary?.resetsAt,checkedAt:new Date().toISOString(),status:'fresh'};saveProject(p);
   if(remaining<10){const when=limits.primary?.resetsAt?new Date(limits.primary.resetsAt*1000).toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'}):'下一次额度重置后';const error=new Error(`5小时创作额度只剩 ${Math.floor(remaining)}%。当前工作节点已经保存，并已暂停新的生图。建议在 ${when} 之后点击“继续制作”。`);error.code='LOW_QUOTA';throw error;}
 }
+export function refreshQuotaPauses(remaining){
+  if(!Number.isFinite(Number(remaining))||Number(remaining)<10)return 0;
+  let changed=0;
+  for(const p of listProjects()){
+    if(active.has(p.id)||!/5小时创作额度只剩\s*\d+%/.test(String(p.message||p.error||'')))continue;
+    const retry=imageRetryState(p);
+    p.status=retry?'attention':'paused';
+    p.message=retry?(retry.certainty==='confirmed_missing'?failureMessage(retry.failure):unknownResultMessage(retry.target)):'额度已恢复，可以继续制作。';
+    p.error=retry?p.message:null;
+    p.lastQuotaCheck={remaining:Number(remaining),checkedAt:new Date().toISOString(),status:'fresh'};
+    saveProject(p);changed++;
+  }
+  return changed;
+}
 function runDir(p,label){return path.join(projectDir(p.id),'.制作记录',`${Date.now()}-${crypto.randomUUID().slice(0,8)}-${label}`);}
 function beginTask(p,kind,target,detail={}){
   const now=new Date().toISOString();p.tasks=Array.isArray(p.tasks)?p.tasks:[];
@@ -166,12 +194,22 @@ function runEvidence(dir){
 }
 function definiteImageFailure(pending,extra=''){
   if(!pending?.dir)return null;const evidence=runEvidence(pending.dir),classified=readGenerationEvidence(pending.dir),combined=[extra,evidence.text,evidence.eventText].filter(Boolean).join('\n');
+  const manifest=readWebManifest(path.join(pending.dir,'web-generation.json'));
+  // Once the chat message was sent, absence of a local file is never proof
+  // that the provider produced no image. Preserve it for recovery instead.
+  if(manifest?.submitted)return null;
+  if(manifest?.state==='failed'){
+    const unavailable=/(?:IAB|Browser is not available)/i.test(String(manifest.errorCode||manifest.error||''));
+    return {kind:unavailable?'browser-unavailable':'no-output',definiteNoOutput:true,key:pending.key,attempts:0,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString()};
+  }
   if(NETWORK_FAILURE.test(combined)||classified.connectionRelated)return null;
-  if(!DEFINITE_NO_IMAGE.test(combined)&&classified.outcome!=='no_image')return null;
+  const manifestError=[manifest?.errorCode,manifest?.error].filter(Boolean).join(' ');
+  if(IAB_UNAVAILABLE.test(combined)||IAB_UNAVAILABLE.test(manifestError))return {kind:'browser-unavailable',definiteNoOutput:true,key:pending.key,attempts:0,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString()};
+  if(!DEFINITE_NO_IMAGE.test(combined)&&!DEFINITE_NO_IMAGE.test(manifestError)&&classified.outcome!=='no_image')return null;
   const attempts=Math.max(1,(evidence.eventText.match(/image generation failed/gi)||[]).length);
   return {kind:'no-output',definiteNoOutput:true,key:pending.key,attempts,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString()};
 }
-function failureMessage(failure){const usage=failure.inputTokens?`本次后台处理记录约 ${failure.inputTokens.toLocaleString('zh-CN')} 输入 tokens；`:'';const action=String(failure.key||'').includes('样张')?'重试当前样张':'重试当前图片';return `${failure.kind==='network'?'生图服务连接失败':'本次生图未完成'}：已发起 ${failure.attempts} 次图片请求，但没有取得图片。${usage}自动重试已停止，上一张样张和当前节点都已保存。实际订阅余额以页面顶部为准；网络稳定后点击“${action}”，只会重试这一张。`;}
+function failureMessage(failure){const usage=failure.inputTokens?`本次后台处理记录约 ${failure.inputTokens.toLocaleString('zh-CN')} 输入 tokens；`:'';const action=String(failure.key||'').includes('样张')?'重试当前样张':'重试当前图片';if(failure.kind==='browser-unavailable')return `Codex 网页后台暂不可用，没有打开你的浏览器，也没有提交图片请求。${usage}当前节点已经保存；Codex 内嵌浏览器可用后点击“${action}”，只会重试这一张。`;return `${failure.kind==='network'?'生图服务连接失败':'本次生图未完成'}：已发起 ${failure.attempts} 次图片请求，但没有取得图片。${usage}自动重试已停止，上一张样张和当前节点都已保存。实际订阅余额以页面顶部为准；网络稳定后点击“${action}”，只会重试这一张。`;}
 function sampleRepairCount(p,index){
   p.sampleRepairCounts=Array.isArray(p.sampleRepairCounts)?p.sampleRepairCounts:[0,0];
   const parsed=Number(/自动修订(\d+)/.exec(p.samples[index]?.key||'')?.[1])||0;
@@ -295,47 +333,65 @@ async function persistImage(source,target){
 function writeRunResult(dir,result){if(dir)jsonWrite(path.join(dir,'result.json'),result);}
 function writeRunRequest(dir,p,task,pending){
   const summarize=file=>{try{return {name:path.basename(file),sizeBytes:fs.statSync(file).size,sha256:checksum(file)};}catch{return {name:path.basename(file),missing:true};}};
-  jsonWrite(path.join(dir,'request.json'),{schemaVersion:1,taskId:task.id,attempt:task.attempt,target:pending.key,createdAt:pending.at,
+  jsonWrite(path.join(dir,'request.json'),{schemaVersion:2,provider:pending.provider||'legacy',taskId:task.id,attempt:task.attempt,target:pending.key,createdAt:pending.at,
     projectVersion:p.version,expectedOutput:path.relative(projectDir(p.id),pending.file),model:p.brief.model||null,reasoningEffort:p.brief.reasoningEffort,
     promptSha256:pending.telemetry.promptSha256,promptCharacters:pending.telemetry.promptCharacters,referenceNames:pending.refs,referenceFiles:pending.inputFiles.map(summarize),editTarget:pending.prior?summarize(pending.prior):null,source:task.source});
 }
+function previousConversation(prior){
+  if(!prior)return null;
+  try{
+    const record=JSON.parse(fs.readFileSync(prior+'.json','utf8'));
+    return /^https:\/\/chatgpt\.com\/c\/[^\s?#]+/.test(String(record.conversationUrl||''))?String(record.conversationUrl):null;
+  }catch{return null;}
+}
 function attributableCandidates(pending){
   const evidence=readGenerationEvidence(pending.dir||''),inputs=new Set((pending.inputFiles||[]).map(file=>path.resolve(file)));
-  const target=fs.existsSync(pending.file)?[pending.file]:[],threaded=generatedCandidates(pending.dir,Date.parse(pending.at))||[];
-  const candidates=[...new Set([...target,...threaded].map(file=>path.resolve(file)).filter(file=>!inputs.has(file)))];
+  const target=fs.existsSync(pending.file)?[pending.file]:[];
+  const reported=(evidence.imagePaths||[]).filter(file=>path.isAbsolute(file)&&fs.existsSync(file));
+  const legacy=pending.provider===WEB_IMAGE_PROVIDER?[]:(generatedCandidates(pending.dir,Date.parse(pending.at))||[]);
+  const candidates=[...new Set([...target,...reported,...legacy].map(file=>path.resolve(file)).filter(file=>!inputs.has(file)))];
   return {evidence,candidates};
 }
 async function generate(p,key,prompt,refnames,signal,prior=null,verify=true,qaKind='原始分镜',attempt=1){
   checkpoint(signal);await protectQuota(p);checkpoint(signal);const refs=imageRefs(p,refnames);const folder=path.join(versionDir(p),'素材');fs.mkdirSync(folder,{recursive:true});
   if(p.pending)throw new Error('当前图片任务尚未结束，请先检查已有原图。');
-  let file=path.join(folder,`${key}-${Date.now()}.png`);const dir=runDir(p,key);const inputFiles=prior?[prior,...refs]:refs;const telemetry=promptTelemetry(prompt,refs,{requestedReferenceCount:refnames.length,source:prior?'edit':'generate'});const task=beginTask(p,'image',key,{attempt,providerInvocationLimit:1,providerInvocations:0,source:prior?'edit':'generate',telemetry});const pending={key,file,dir,prompt,refs:refnames,inputFiles,prior,taskId:task.id,telemetry,at:new Date().toISOString()};
+  let file=path.join(folder,`${key}-${Date.now()}.png`);const dir=runDir(p,key);const inputFiles=prior?[prior,...refs]:refs;const telemetry=promptTelemetry(prompt,refs,{requestedReferenceCount:refnames.length,source:prior?'edit':'generate'});const task=beginTask(p,'image',key,{attempt,provider:WEB_IMAGE_PROVIDER,providerInvocationLimit:1,providerInvocations:0,source:prior?'edit':'generate',telemetry});const pending={key,file,dir,prompt,refs:refnames,inputFiles,prior,provider:WEB_IMAGE_PROVIDER,taskId:task.id,telemetry,at:new Date().toISOString()};
   writeRunRequest(dir,p,task,pending);p.pending=pending;p.lastFailure=null;saveProject(p);
-  let failure,made=null;
-  try{task.providerInvocations=1;saveProject(p);made=await runCodex({dir,signal,image:true,writableDirs:[folder],images:prior?[prior,...refs]:refs,...modelArgs(p),
-    prompt:`你在本地温蒂漫画创作室后台执行已经由用户在网页明确确认的单张生图。用户已授权使用内置 image_gen，无需再次提问。只做这一张，不调用浏览器或API，不发布任何内容，不改任何既有文件。只允许调用一次 image_gen；若工具返回网络或连接错误，立即结束并如实返回原始错误，不要推断远端是否已经产出，也不要在同一次任务中第二次调用 image_gen。附件中的两张温蒂人设必须同时参考，其余附件仅锁定所需环境或物件；${prior?'第一张为编辑目标，只修订指定问题，保留其余正确内容。':'创建新的独立分镜。'}\n${fs.readFileSync(path.join(versionDir(p),'制作提示词胶囊.txt'),'utf8')}\n本次要求：${prompt}\n使用内置image_gen生成${prior?'或编辑':''}后，复制到准确路径 ${file}。不得用截屏或程序绘制代替。最后返回真实原图绝对路径。`,
-    });addUsage(p,made.usage);}catch(e){failure=e;}
+  let failure,made=null;const manifestFile=path.join(dir,'web-generation.json'),conversationUrl=previousConversation(prior),capsule=fs.readFileSync(path.join(versionDir(p),'制作提示词胶囊.txt'),'utf8');
+  try{
+    if(process.env.WENDI_TEST_PLAN_FILE){
+      task.providerInvocations=1;saveProject(p);
+      made=await runCodex({dir,signal,image:true,browserMode:'iab',writableDirs:[projectDir(p.id)],...modelArgs(p),
+        prompt:chatGptWebImagePrompt({outputFile:file,manifestFile,prompt,referenceFiles:inputFiles,editTarget:prior,conversationUrl,capsule})});
+    }else{
+      made=await dispatchChatGptWebJob({codexBin:findCodex(),dir,outputFile:file,prompt,referenceFiles:inputFiles,editTarget:prior,conversationUrl,capsule,signal});
+    }
+    addUsage(p,made.usage);
+  }catch(e){failure=e;}
+  const webManifest=readWebManifest(manifestFile)||failure?.webManifest||made?.manifest||null;
+  task.providerInvocations=webManifest?.submitted?1:(process.env.WENDI_TEST_PLAN_FILE?task.providerInvocations:0);saveProject(p);
   // A transport error after download must not trigger a second image request.
-  // Prefer the explicit output path, then a reported path, then exactly one
-  // image in this task's own thread.  Ambiguous candidates are recorded but
-  // never guessed at.
+  // Prefer the explicit output path, then a path explicitly reported by this
+  // browser run. Legacy tasks alone retain the old generated_images fallback.
+  // Ambiguous candidates are recorded but never guessed at.
   const {evidence,candidates}=attributableCandidates(pending);
   let persisted=null;
   if(fs.existsSync(file))persisted=await persistImage(file,file);
   else if(candidates.length===1)persisted=await persistImage(candidates[0],file);
   if(!persisted){
     const candidateNames=candidates.map(candidate=>path.basename(candidate));
-    writeRunResult(dir,{schemaVersion:1,taskId:task.id,attempt:task.attempt,endedAt:new Date().toISOString(),outcome:'artifact_not_located',diagnostics:generationDiagnosticSummary(evidence),candidateCount:candidateNames.length,candidateNames,error:failure?String(failure.message||failure).slice(0,500):null});
-    const known=definiteImageFailure(pending,made?.text||'');
-    if(known){p.pending=null;p.lastFailure={...known,taskId:task.id};finishTask(p,task,'failed_no_output',{errorCode:known.kind});saveProject(p);const error=new Error(failureMessage(known));error.code='IMAGE_NO_OUTPUT';throw error;}
+    writeRunResult(dir,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:task.id,attempt:task.attempt,endedAt:new Date().toISOString(),outcome:'artifact_not_located',diagnostics:generationDiagnosticSummary(evidence),candidateCount:candidateNames.length,candidateNames,error:failure?String(failure.message||failure).slice(0,500):null});
+    const known=definiteImageFailure(pending,[made?.text,failure?.message,webManifest?.errorCode,webManifest?.error].filter(Boolean).join('\n'));
+    if(known){if(known.kind==='browser-unavailable')task.providerInvocations=0;p.pending=null;p.lastFailure={...known,taskId:task.id};finishTask(p,task,'failed_no_output',{errorCode:known.kind});saveProject(p);const error=new Error(failureMessage(known));error.code='IMAGE_NO_OUTPUT';throw error;}
     finishTask(p,task,'unknown_result',{errorCode:'unknown_result'});
     throw failure||new Error('连接在保存结果前中断。当前节点已保存，请先检查已有原图，避免重复生成。');
   }
   file=persisted.file;pending.file=file;pending.integrity=persisted.integrity;
-  writeRunResult(dir,{schemaVersion:1,taskId:task.id,attempt:task.attempt,endedAt:new Date().toISOString(),outcome:'artifact_saved',artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,diagnostics:generationDiagnosticSummary(evidence)});
+  writeRunResult(dir,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:task.id,attempt:task.attempt,endedAt:new Date().toISOString(),outcome:'artifact_saved',artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,diagnostics:generationDiagnosticSummary(evidence)});
   // Persist the recovered file before asking the model to inspect it. A QA
   // timeout is never evidence that the image did not exist, and must not make
   // the next click repeat a paid image request.
-  const record={key,file:path.relative(projectDir(p.id),file),prompt,refs:refnames,telemetry,integrity:persisted.integrity,qa:verify?{pass:null,status:'pending',summary:'原图已保存，等待画面校对。',issues:[],repairPrompt:''}:{pass:true,status:'deferred',summary:'已完成本地文件检查；将在整页成稿中统一校对。',issues:[],repairPrompt:''},at:new Date().toISOString()};
+  const record={key,file:path.relative(projectDir(p.id),file),provider:WEB_IMAGE_PROVIDER,conversationUrl:webManifest?.conversationUrl||conversationUrl||null,prompt,refs:refnames,telemetry,integrity:persisted.integrity,qa:verify?{pass:null,status:'pending',summary:'原图已保存，等待画面校对。',issues:[],repairPrompt:''}:{pass:true,status:'deferred',summary:'已完成本地文件检查；将在整页成稿中统一校对。',issues:[],repairPrompt:''},at:new Date().toISOString()};
   jsonWrite(file+'.json',record);recordArtifact(p,`image:${key}`,'image',record.file,prior?[`image:${key.replace(/-局部修订$/,'')}`]:[]);attachImageRecord(p,record);p.pending=null;p.lastFailure=null;finishTask(p,task,'artifact_saved',{artifact:file,qa:verify?'pending':'deferred'});saveProject(p);
   if(!verify)return record;
   try{
@@ -419,7 +475,7 @@ async function addScreen(p,key,panel,signal){
   const dir=runDir(p,'内屏文字排版');const output=path.join(dir,'内屏排版.png');
   activity(p,`正在把第 ${key.split('-')[0]} 页的文字排进玻璃内屏…`);
   const composed=await runCodex({dir,signal,image:true,images:[input],...modelArgs(p,'low'),
-    prompt:`执行已经授权的确定性漫画中文后期排版。这不是生图任务，不调用image_gen，不调用浏览器，不覆盖原图。原图 ${input} 已附上，请视觉检查原始尺寸，识别手机或车机的玻璃内屏四角、圆角、边框、刘海、手指遮挡和反光。用本机Python与Pillow、STHeiti字体，绘制正确中文界面并透视变换到内屏坐标系，圆角遮罩、手指遮挡必须保留，反光融合而非不透明平面截图浮贴。不要修改屏幕外任何像素。内屏逐字内容：${panel.screenText}。界面状态与要求：${panel.screenDirection}。有输入、删除、灰色不可发送等状态时准确表现差异。写出布局数据与可复用脚本到本次目录，再输出 ${output}。完成后查看局部放大及全图核对，若无法可靠定位内屏不要猜测，不生成假完成图片，说明原因。最终仅返回真实输出路径。`});addUsage(p,composed.usage);
+    prompt:`执行已经授权的确定性漫画中文后期排版。这不是生图任务，不触发任何新的图片生成，不调用浏览器，不覆盖原图。原图 ${input} 已附上，请视觉检查原始尺寸，识别手机或车机的玻璃内屏四角、圆角、边框、刘海、手指遮挡和反光。用本机Python与Pillow、STHeiti字体，绘制正确中文界面并透视变换到内屏坐标系，圆角遮罩、手指遮挡必须保留，反光融合而非不透明平面截图浮贴。不要修改屏幕外任何像素。内屏逐字内容：${panel.screenText}。界面状态与要求：${panel.screenDirection}。有输入、删除、灰色不可发送等状态时准确表现差异。写出布局数据与可复用脚本到本次目录，再输出 ${output}。完成后查看局部放大及全图核对，若无法可靠定位内屏不要猜测，不生成假完成图片，说明原因。最终仅返回真实输出路径。`});addUsage(p,composed.usage);
   checkpoint(signal);if(!fs.existsSync(output))throw new Error('这张内屏的透视位置还需调整，原图已保留，请补充修改要求。');
   await pythonRun(['info',output]);
   const report=await qa(p,output,JSON.stringify(panel),[input,...imageRefs(p,panel.references)],signal,'已添加内屏中文的单分镜；必须核对内屏逐字文案、透视、手指遮挡及屏幕外保持不变');
@@ -494,16 +550,34 @@ export function resume(p){if(p.pending){
   return generatePages(p);
 }
 export function retryableImageFailure(p){
-  if(p.lastFailure?.definiteNoOutput===true)return p.lastFailure;
-  const task=p.currentTask;
-  if(task?.status==='failed_no_output'&&task.target)return {kind:task.errorCode==='no-output'?'no-output':'network',definiteNoOutput:true,key:task.target,attempts:task.providerInvocations||1,taskId:task.id,at:task.completedAt||p.updatedAt||new Date().toISOString()};
-  return null;
+  const state=imageRetryState(p);return state?.certainty==='confirmed_missing'?state.failure:null;
 }
-export function retryMissingImage(p,target){
-  verifyApproval(p);if(p.pending)throw new Error('上次生成结果尚未确认，请先检查已保存图片。');
-  const failure=retryableImageFailure(p);if(!failure||failure.key!==target)throw new Error('当前没有可安全重试的这张图片。');
+export function imageRetryState(p){
+  const task=p.currentTask;
+  if(p.pending){
+    if(task?.status==='unknown_result'&&task.target===p.pending.key)return {certainty:'unknown_result',target:task.target,failure:{kind:'network',definiteNoOutput:false,key:task.target,attempts:task.providerInvocations||1,taskId:task.id,at:task.completedAt||p.updatedAt||new Date().toISOString()}};
+    return null;
+  }
+  const failure=p.lastFailure;
+  if(failure?.key){
+    if(['no-output','browser-unavailable'].includes(failure.kind)&&failure.definiteNoOutput===true)return {certainty:'confirmed_missing',target:failure.key,failure};
+    if(failure.kind==='network')return {certainty:'unknown_result',target:failure.key,failure};
+  }
+  if(!task?.target||!['failed_no_output','unknown_result'].includes(task.status))return null;
+  if(task.status==='failed_no_output'&&['no-output','browser-unavailable'].includes(task.errorCode))return {certainty:'confirmed_missing',target:task.target,failure:{kind:task.errorCode,definiteNoOutput:true,key:task.target,attempts:task.errorCode==='browser-unavailable'?0:(task.providerInvocations||1),taskId:task.id,at:task.completedAt||p.updatedAt||new Date().toISOString()}};
+  return {certainty:'unknown_result',target:task.target,failure:{kind:'network',definiteNoOutput:false,key:task.target,attempts:task.providerInvocations||1,taskId:task.id,at:task.completedAt||p.updatedAt||new Date().toISOString()}};
+}
+function unknownResultMessage(target='当前图片'){return `${target} 的连接在结果确认前中断，无法证明远端是否已经生成。系统不会自行重试；你可以先检查本地记录，或明确选择重新生成这一张。`;}
+export function retryMissingImage(p,target,{allowUnknownResult=false}={}){
+  verifyApproval(p);const state=imageRetryState(p),failure=state?.failure;
+  if(p.pending&&!(allowUnknownResult&&state?.certainty==='unknown_result'))throw new Error('上次生成结果尚未确认，请先检查已保存图片。');
+  if(!state||state.target!==target||(state.certainty==='unknown_result'&&!allowUnknownResult))throw new Error('当前没有可安全重试的这张图片。');
   const sampleIndex=sampleIndexFromKey(target),panelKey=panelKeyFromImageKey(target);
   if(sampleIndex===null&&!panelKey)throw new Error('无法识别需要重试的图片。');
+  if(p.pending){
+    p.supersededPending=Array.isArray(p.supersededPending)?p.supersededPending:[];
+    p.supersededPending.push({...p.pending,supersededAt:new Date().toISOString(),reason:'explicit_unknown_result_retry'});p.supersededPending=p.supersededPending.slice(-20);p.pending=null;
+  }
   p.lastFailure=null;p.error=null;
   return job(p,'revising',async signal=>{
     activity(p,`正在只重新生成 ${target}…`);
@@ -527,17 +601,17 @@ export function recoverImage(p){verifyApproval(p);if(!p.pending)throw new Error(
   if(fs.existsSync(file))persisted=await persistImage(file,file);
   else if(candidates.length===1)persisted=await persistImage(candidates[0],file);
   if(!persisted){
-    writeRunResult(pending.dir,{schemaVersion:1,taskId:pending.taskId||null,endedAt:new Date().toISOString(),outcome:'artifact_still_unknown',diagnostics:generationDiagnosticSummary(evidence),candidateCount:candidates.length,candidateNames:candidates.map(candidate=>path.basename(candidate))});
+    writeRunResult(pending.dir,{schemaVersion:2,provider:pending.provider||'legacy',taskId:pending.taskId||null,endedAt:new Date().toISOString(),outcome:'artifact_still_unknown',diagnostics:generationDiagnosticSummary(evidence),candidateCount:candidates.length,candidateNames:candidates.map(candidate=>path.basename(candidate))});
     const known=definiteImageFailure(pending);
     if(known){p.pending=null;p.lastFailure=known;const task=(p.tasks||[]).find(item=>item.id===pending.taskId);finishTask(p,task,'failed_no_output',{errorCode:known.kind});saveProject(p);throw new Error(failureMessage(known));}
     throw new Error('连接在保存结果前中断，系统仍无法确认是否已经生成。稍后可再次检查已有原图；检查本身不会重新生图。');
   }
   file=persisted.file;pending.file=file;
-  writeRunResult(pending.dir,{schemaVersion:1,taskId:pending.taskId||null,endedAt:new Date().toISOString(),outcome:'artifact_recovered',artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,diagnostics:generationDiagnosticSummary(evidence)});
+  writeRunResult(pending.dir,{schemaVersion:2,provider:pending.provider||'legacy',taskId:pending.taskId||null,endedAt:new Date().toISOString(),outcome:'artifact_recovered',artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,diagnostics:generationDiagnosticSummary(evidence)});
   // Recovery is deliberately local-only. It attaches a verified file to the
   // project but does not run the model QA again and therefore never consumes a
   // new model call or image opportunity.
-  const record={key:pending.key,file:path.relative(projectDir(p.id),file),prompt:pending.prompt,refs:pending.refs,integrity:persisted.integrity,qa:{pass:null,status:'recovered_pending_review',summary:'原图已找回，尚未自动校对。请查看图片后选择继续或修改。',issues:[],repairPrompt:''},at:new Date().toISOString()};
+  const record={key:pending.key,file:path.relative(projectDir(p.id),file),provider:pending.provider||'legacy',prompt:pending.prompt,refs:pending.refs,integrity:persisted.integrity,qa:{pass:null,status:'recovered_pending_review',summary:'原图已找回，尚未自动校对。请查看图片后选择继续或修改。',issues:[],repairPrompt:''},at:new Date().toISOString()};
   jsonWrite(file+'.json',record);recordArtifact(p,`image:${pending.key}`,'image',record.file);attachImageRecord(p,record);
   const sampleIndex=sampleIndexFromKey(pending.key);if(sampleIndex!==null)sampleRepairCount(p,sampleIndex);
   p.pending=null;p.lastFailure=null;p.status='paused';const task=(p.tasks||[]).find(item=>item.id===pending.taskId);finishTask(p,task,'recovered_local',{artifact:file,qa:'not_run'});activity(p,'原图已找回并挂接到作品。未重新生图，也没有再次自动校对。');
