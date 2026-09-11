@@ -6,8 +6,18 @@ import {APP} from './workflow.mjs';
 
 export const WEB_IMAGE_PROVIDER='chatgpt-web-iab';
 export const WEB_WORKER_CONFIG=path.join(APP,'.runtime','chatgpt-web-worker.json');
+export const WEB_WORKER_PROBE_RESULT=path.join(APP,'.runtime','chatgpt-web-worker-probe-result.json');
 const THREAD_ID=/^[a-f0-9-]{36}$/;
+const REQUEST_ID=/^[a-f0-9-]{36}$/;
 const TERMINAL_STATES=new Set(['downloaded','failed']);
+const MANIFEST_STATES=new Set(['queued','accepted','ready','submitted','downloaded','failed']);
+const ACCEPTED_STATES=new Set(['accepted','ready','submitted']);
+const DEFAULT_READY_TTL_MS=15*60*1000;
+const PROBE_RESULT_RELATIVE='.runtime/chatgpt-web-worker-probe-result.json';
+
+function savedProbeDescriptor(source='saved-result'){
+  return {source,action:source==='saved-result'?'refresh-saved-only':'test-fixture',executionAvailable:false,responseFile:PROBE_RESULT_RELATIVE,message:'当前操作只重读已保存的隔离探针结果；新的探针必须由隔离后台实际写入。'};
+}
 
 function listedFiles(files=[]){
   return files.map((file,index)=>`${index+1}. ${JSON.stringify(path.resolve(file))}`).join('\n');
@@ -18,9 +28,10 @@ export function readWebManifest(file){
     const value=JSON.parse(fs.readFileSync(file,'utf8'));
     if(!value||typeof value!=='object')return null;
     const state=String(value.state||'');
-    if(!['queued','ready','submitted','downloaded','failed'].includes(state))return null;
+    if(!MANIFEST_STATES.has(state))return null;
     const conversationUrl=/^https:\/\/chatgpt\.com\/(?:c\/[^\s?#]+)?(?:[?#][^\s]*)?$/.test(String(value.conversationUrl||''))?String(value.conversationUrl):null;
-    return {...value,state,submitted:value.submitted===true,conversationUrl};
+    const requestId=REQUEST_ID.test(String(value.requestId||''))?String(value.requestId):null;
+    return {...value,state,submitted:value.submitted===true,conversationUrl,...(requestId?{requestId}:{}),...(value.accepted===true?{accepted:true}: {})};
   }catch{return null;}
 }
 
@@ -32,18 +43,39 @@ export function readWebWorkerConfig(file=process.env.WENDI_CHATGPT_WEB_WORKER_CO
   }catch{return null;}
 }
 
+export function readWebWorkerProbe(file=process.env.WENDI_CHATGPT_WEB_WORKER_PROBE_RESULT||WEB_WORKER_PROBE_RESULT){
+  try{
+    const value=JSON.parse(fs.readFileSync(file,'utf8'));
+    const checkedAt=String(value.checkedAt||'');
+    if(!value||typeof value!=='object'||value.schemaVersion!==1||!THREAD_ID.test(String(value.threadId||''))||!String(value.hostId||'')||!Number.isFinite(Date.parse(checkedAt)))return null;
+    return {schemaVersion:1,threadId:String(value.threadId),hostId:String(value.hostId),ok:value.ok===true,iabAvailable:value.iabAvailable===true,chatgptLoggedIn:value.chatgptLoggedIn===true,inputAvailable:value.inputAvailable===true,checkedAt,error:value.error?String(value.error):null};
+  }catch{return null;}
+}
+
+function readyTtlMs(){
+  const configured=Number(process.env.WENDI_WEB_WORKER_READY_TTL_MS);
+  return Number.isFinite(configured)&&configured>0?configured:DEFAULT_READY_TTL_MS;
+}
+
 export function webWorkerStatus(){
   const worker=readWebWorkerConfig();
-  if(!worker)return {ready:false,message:'网页生图后台尚未初始化。'};
-  if(process.env.WENDI_TEST_PLAN_FILE)return {ready:true,message:'网页生图后台已就绪。',verifiedAt:worker.verifiedAt};
+  if(!worker)return {ready:false,state:'unavailable',configured:false,historical:false,probe:savedProbeDescriptor(),message:'网页生图后台尚未初始化；当前入口只重读已保存结果，无法执行新的隔离探针。'};
+  if(process.env.WENDI_TEST_PLAN_FILE)return {ready:true,state:'verified-ready',configured:true,historical:false,probe:savedProbeDescriptor('test-fixture'),message:'网页生图后台已就绪。',threadId:worker.threadId,hostId:worker.hostId,verifiedAt:worker.verifiedAt};
   const sessions=path.join(process.env.CODEX_HOME||path.join(process.env.HOME||'','.codex'),'sessions');
   let localSession=false;
   try{localSession=fs.globSync(`**/*${worker.threadId}.jsonl`,{cwd:sessions}).length>0;}catch{}
-  if(!localSession)return {ready:false,message:'网页生图后台记录已失效，需要重新初始化。',verifiedAt:worker.verifiedAt};
-  return {ready:true,message:'网页生图后台已就绪。',verifiedAt:worker.verifiedAt};
+  const probe=readWebWorkerProbe();
+  const base={ready:false,state:'unknown',configured:true,historical:localSession,threadId:worker.threadId,hostId:worker.hostId,configuredAt:worker.verifiedAt||null,probe:savedProbeDescriptor()};
+  if(!probe)return {...base,evidence:'missing',message:'网页生图后台已配置，但还没有当前身份匹配的隔离就绪证据；历史会话不能代替验证。当前入口只重读已保存结果，新的探针必须由隔离后台实际写入。'};
+  if(probe.threadId!==worker.threadId||probe.hostId!==worker.hostId)return {...base,evidence:'identity-mismatch',message:'网页生图后台就绪记录属于其他会话或宿主，不能用于当前后台。',probeThreadId:probe.threadId,probeHostId:probe.hostId};
+  const age=Date.now()-Date.parse(probe.checkedAt);
+  if(!Number.isFinite(age)||age<0)return {...base,evidence:'invalid-time',message:'网页生图后台就绪记录的时间无效，不能放行。'};
+  if(age>readyTtlMs())return {...base,evidence:'stale',message:'网页生图后台就绪记录已过期，请通过隔离探针重新核对；不会自动唤醒旧任务。',verifiedAt:probe.checkedAt,expiresAt:new Date(Date.parse(probe.checkedAt)+readyTtlMs()).toISOString()};
+  if(!(probe.ok&&probe.iabAvailable&&probe.chatgptLoggedIn&&probe.inputAvailable))return {...base,evidence:'probe-failed',message:probe.error||'网页生图后台最近一次隔离就绪检查未通过。',verifiedAt:probe.checkedAt};
+  return {ready:true,state:'verified-ready',configured:true,historical:localSession,threadId:worker.threadId,hostId:worker.hostId,probe:savedProbeDescriptor(),evidence:'fresh-probe',message:'网页生图后台已通过最近的隔离就绪检查。',verifiedAt:probe.checkedAt,expiresAt:new Date(Date.parse(probe.checkedAt)+readyTtlMs()).toISOString()};
 }
 
-export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceFiles=[],editTarget=null,conversationUrl=null,capsule=''}){
+export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceFiles=[],editTarget=null,conversationUrl=null,capsule='',requestId=null}){
   const action=editTarget
     ? '第一项附件是待编辑原图。请只修订明确指出的问题，保持其他正确内容。'
     : '创建一张新的独立分镜图。';
@@ -62,13 +94,14 @@ export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceF
 - 除写入下列目标图片和执行记录外，不修改本地文件。
 
 执行步骤：
-1. 复用本任务已有的 chatgpt.com IAB 标签页。${conversation}
-2. 确认已登录且聊天输入框可用。把所有参考文件逐一上传，并确认每个文件都显示为独立附件。
-3. 在发送聊天消息前，原子更新 ${JSON.stringify(path.resolve(manifestFile))}：provider=${WEB_IMAGE_PROVIDER}、state=ready、conversationUrl、referenceCount、submitted=false。若此时失败，写 state=failed、submitted=false、errorCode 和 error 后停止。
-4. 一次性提交下面的冻结提示词；消息发送成功后立刻更新同一清单为 state=submitted、submitted=true、conversationUrl 和 submittedAt。页面显示生成中时只等待，绝不再次发送。
-5. 页面显示生成完成后，从下载控件取得原始 PNG/JPG/WebP，复制到准确路径 ${path.resolve(outputFile)}。不得把缩略图或截图当成原图。
-6. 验证目标文件存在且可读取，把清单更新为 state=downloaded、submitted=true、artifactPath、conversationUrl、downloadedAt。最后只返回真实原图绝对路径和会话 URL。
-7. 如果提交后发生任何错误，仍须更新清单为 state=failed、submitted=true、conversationUrl、errorCode 和 error。不要重发。
+1. 真正开始处理本次 requestId（${requestId||'从 worker-request.json 读取'}）并核对 worker-request.json 中的 manifestFile、instructionFile 和 outputFile 后，先原子更新 ${JSON.stringify(path.resolve(manifestFile))} 为 provider=${WEB_IMAGE_PROVIDER}、state=accepted、accepted=true、requestId（必须完全匹配）、acceptedAt。这个状态是后台接单凭据，不是 CLI 排队成功；若无法写入，写 state=failed、submitted=false、errorCode 和 error 后停止。未写入 accepted 前不得打开或准备网页、登录、上传附件。
+2. 通过 accepted 后，复用本任务已有的 chatgpt.com IAB 标签页。空标签列表只是没有现存页面，不表示 IAB 后端不可用；没有可复用页面时，必须用当前工具公开的 createBrowserTab("iab", "https://chatgpt.com", {visible:false}) 或等价受支持 IAB 新建入口尝试创建一次，并读取页面状态。不得仅因外部 Chrome 出现在列表或 IAB 无标签就报 IAB_UNAVAILABLE；只有实际 IAB 选择或创建失败才记录该错误，并保留失败原因。登录或页面加载问题单独记录，不伪装成后端缺失。${conversation}
+3. 确认已登录且聊天输入框可用。把所有参考文件逐一上传，并确认每个文件都显示为独立附件。
+4. 在发送聊天消息前，原子更新同一清单为 state=ready、conversationUrl、referenceCount、submitted=false、requestId 和 acceptedAt。若此时失败，写 state=failed、submitted=false、requestId、acceptedAt、errorCode 和 error 后停止。
+5. 一次性提交下面的冻结提示词；消息发送成功后立刻更新同一清单为 state=submitted、submitted=true、conversationUrl、requestId、acceptedAt 和 submittedAt。页面显示生成中时只等待，绝不再次发送。
+6. 页面显示生成完成后，从下载控件取得原始 PNG/JPG/WebP，复制到准确路径 ${path.resolve(outputFile)}。不得把缩略图或截图当成原图。
+7. 验证目标文件存在且可读取，把清单更新为 state=downloaded、submitted=true、artifactPath、conversationUrl、requestId、acceptedAt 和 downloadedAt。最后只返回真实原图绝对路径和会话 URL。
+8. 如果提交后发生任何错误，仍须更新清单为 state=failed、submitted=true、requestId、acceptedAt、conversationUrl、errorCode 和 error。不要重发。
 
 附件绝对路径（按此顺序上传）：
 ${listedFiles(referenceFiles)}
@@ -90,7 +123,7 @@ function writeJson(file,value){
 }
 
 function queueMessage(requestFile){
-  return `执行温蒂创作室网页生图作业。用户已经在创作室执行本次 action-time 确认，request.authorization 是确认凭据，不得再次询问。只读取 ${requestFile}，再读取其中 instructionFile 的完整指令并严格执行。在当前同一个回合内新建或复用 Codex IAB，完成附件上传、唯一一次发送、等待和原图下载；回合结束会清理标签页，所以不得在 ready 后停下。禁止 image_gen 和外部浏览器。每个阶段都按 instructionFile 原子更新 manifestFile；聊天消息最多发送一次。不要浏览或修改其他项目文件。`;
+  return `执行温蒂创作室网页生图作业。用户已经在创作室执行本次 action-time 确认，request.authorization 是确认凭据，不得再次询问。只读取 ${requestFile}，再读取其中 instructionFile 的完整指令并严格执行。真正开始处理后先按 request.requestId 原子写入 manifestFile 的 accepted 接单凭据；CLI 返回成功不等于已接单。在当前同一个回合内新建或复用 Codex IAB，完成附件上传、唯一一次发送、等待和原图下载；回合结束会清理标签页，所以不得在 accepted 或 ready 后停下。禁止 image_gen 和外部浏览器。每个阶段都按 instructionFile 原子更新 manifestFile；聊天消息最多发送一次。不要浏览或修改其他项目文件。`;
 }
 
 export function queueOnce(bin,args,{cwd,logFile,signal,timeoutMs=30000,killGraceMs=1500}){
@@ -116,36 +149,45 @@ export function queueOnce(bin,args,{cwd,logFile,signal,timeoutMs=30000,killGrace
 }
 
 /** Queue exactly one turn on the dedicated Codex task, then observe its durable manifest. */
-export async function dispatchChatGptWebJob({codexBin,dir,outputFile,prompt,referenceFiles=[],editTarget=null,conversationUrl=null,capsule='',signal,timeoutMs=900000,queueTimeoutMs=30000}){
+export async function dispatchChatGptWebJob({codexBin,dir,outputFile,prompt,referenceFiles=[],editTarget=null,conversationUrl=null,capsule='',signal,timeoutMs=900000,queueTimeoutMs=30000,acceptTimeoutMs=60000,pollIntervalMs=1000,workerConfigFile=null}){
   if(!codexBin){const error=new Error('请先打开 Codex 并登录。');error.code='WEB_WORKER_QUEUE_FAILED';throw error;}
-  const worker=readWebWorkerConfig();
+  const worker=workerConfigFile?readWebWorkerConfig(workerConfigFile):readWebWorkerConfig();
   if(!worker){const error=new Error('Browser is not available: iab。Codex 网页生图后台尚未完成初始化，没有提交图片请求。');error.code='IAB_UNAVAILABLE';throw error;}
   fs.mkdirSync(dir,{recursive:true});
   const manifestFile=path.join(dir,'web-generation.json'),instructionFile=path.join(dir,'prompt.txt'),requestFile=path.join(dir,'worker-request.json'),eventsFile=path.join(dir,'events.jsonl');
-  fs.writeFileSync(instructionFile,chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceFiles,editTarget,conversationUrl,capsule}),{mode:0o600});
-  writeJson(manifestFile,{schemaVersion:1,provider:WEB_IMAGE_PROVIDER,state:'queued',submitted:false,createdAt:new Date().toISOString()});
-  const createdAt=new Date().toISOString();
-  writeJson(requestFile,{schemaVersion:1,provider:WEB_IMAGE_PROVIDER,requestId:crypto.randomUUID(),authorization:{confirmed:true,scope:'one_chatgpt_web_image_submission',confirmedAt:createdAt},instructionFile,manifestFile,outputFile:path.resolve(outputFile),referenceFiles:referenceFiles.map(file=>path.resolve(file)),editTarget:editTarget?path.resolve(editTarget):null,conversationUrl,createdAt});
+  const requestId=crypto.randomUUID(),createdAt=new Date().toISOString();
+  fs.writeFileSync(instructionFile,chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceFiles,editTarget,conversationUrl,capsule,requestId}),{mode:0o600});
+  writeJson(manifestFile,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,state:'queued',requestId,accepted:false,submitted:false,createdAt});
+  writeJson(requestFile,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,requestId,authorization:{confirmed:true,scope:'one_chatgpt_web_image_submission',confirmedAt:createdAt},instructionFile,manifestFile,outputFile:path.resolve(outputFile),referenceFiles:referenceFiles.map(file=>path.resolve(file)),editTarget:editTarget?path.resolve(editTarget):null,conversationUrl,createdAt});
   const args=['queue','--thread',worker.threadId,'--message',queueMessage(requestFile),'-C',APP,'-s','workspace-write','--disable','image_generation','--disable','browser_use_external'];
-  const started=Date.now();
+  const matchesRequest=manifest=>manifest?.requestId===requestId;
+  const hasAcceptance=manifest=>matchesRequest(manifest)&&manifest?.accepted===true&&ACCEPTED_STATES.has(manifest?.state);
+  const hasDownloadedArtifact=manifest=>matchesRequest(manifest)&&manifest?.state==='downloaded'&&manifest?.accepted===true&&manifest?.submitted===true;
   try{await queueOnce(codexBin,args,{cwd:APP,logFile:eventsFile,signal,timeoutMs:Math.min(queueTimeoutMs,timeoutMs)});}
   catch(error){
     const manifest=readWebManifest(manifestFile);error.webManifest=manifest;
-    if(manifest?.state==='downloaded')return {text:[manifest.artifactPath,manifest.conversationUrl].filter(Boolean).join('\n'),usage:null,manifest};
-    if(manifest?.state==='failed'){error.message=String(manifest.error||error.message);error.code=manifest.errorCode||error.code;throw error;}
+    if(hasDownloadedArtifact(manifest))return {text:[manifest.artifactPath,manifest.conversationUrl].filter(Boolean).join('\n'),usage:null,manifest};
+    if(manifest?.state==='failed'&&matchesRequest(manifest)){error.message=String(manifest.error||error.message);error.code=manifest.errorCode||error.code;throw error;}
     // The browser may submit after the local queue client disconnects. Once the
-    // worker is ready, keep observing durable state instead of guessing no image.
-    if(!['ready','submitted'].includes(manifest?.state))throw error;
+    // matching worker receipt exists, keep observing durable state instead of
+    // guessing no image. A queued task remains recoverable and is never requeued.
+    if(!hasAcceptance(manifest))throw error;
     if(signal?.aborted){error.code='WEB_IMAGE_WAIT_PAUSED';throw error;}
   }
+  const queuedAt=Date.now(),acceptDeadline=queuedAt+Math.max(0,Number(acceptTimeoutMs)||0),generationDeadline=queuedAt+Math.max(0,Number(timeoutMs)||0);
   while(true){
     const manifest=readWebManifest(manifestFile);
     if(manifest&&TERMINAL_STATES.has(manifest.state)){
-      if(manifest.state==='downloaded')return {text:[manifest.artifactPath,manifest.conversationUrl].filter(Boolean).join('\n'),usage:null,manifest};
-      const error=new Error(String(manifest.error||'网页生图后台未取得图片。'));error.code=manifest.errorCode||'WEB_IMAGE_FAILED';error.webManifest=manifest;throw error;
+      if(hasDownloadedArtifact(manifest))return {text:[manifest.artifactPath,manifest.conversationUrl].filter(Boolean).join('\n'),usage:null,manifest};
+      if(manifest.state==='failed'&&matchesRequest(manifest)){
+        const error=new Error(String(manifest.error||'网页生图后台未取得图片。'));error.code=manifest.errorCode||'WEB_IMAGE_FAILED';error.webManifest=manifest;throw error;
+      }
     }
+    const accepted=hasAcceptance(manifest);
     if(signal?.aborted){const error=new Error('已暂停等待；网页后台若已提交仍会继续，完成的原图将保留。');error.code='WEB_IMAGE_WAIT_PAUSED';error.webManifest=manifest;throw error;}
-    if(Date.now()-started>=timeoutMs){const error=new Error('网页生图等待超时。当前记录已保留，不会自动重新提交。');error.code='WEB_IMAGE_WAIT_TIMEOUT';error.webManifest=manifest;throw error;}
-    await new Promise(resolve=>setTimeout(resolve,1000));
+    if(!accepted&&Date.now()>=acceptDeadline){const error=new Error('Codex CLI 已排队，但网页生图后台尚未写入本次 requestId 的接单凭据。已停止本机等待，不会自动重复提交。');error.code='WEB_WORKER_NOT_ACCEPTED';error.webManifest=manifest;throw error;}
+    if(accepted&&Date.now()>=generationDeadline){const error=new Error('网页生图等待超时。当前记录已保留，不会自动重新提交。');error.code='WEB_IMAGE_WAIT_TIMEOUT';error.webManifest=manifest;throw error;}
+    if(!accepted&&Date.now()>=generationDeadline){const error=new Error('网页生图后台尚未接单，当前记录已保留，不会自动重新提交。');error.code='WEB_WORKER_NOT_ACCEPTED';error.webManifest=manifest;throw error;}
+    await new Promise(resolve=>setTimeout(resolve,Math.max(1,Number(pollIntervalMs)||1000)));
   }
 }

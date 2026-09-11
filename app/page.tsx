@@ -85,6 +85,20 @@ type Task = {
   providerInvocationLimit?: number;
   providerInvocations?: number;
   errorCode?: string;
+  webState?: string | null;
+};
+type Pending = {
+  key: string;
+  at: string;
+  taskId?: string;
+  provider?: string | null;
+  webState?: string | null;
+  requestId?: string | null;
+  accepted?: boolean;
+  acceptedAt?: string | null;
+  submitted?: boolean;
+  submittedAt?: string | null;
+  errorCode?: string | null;
 };
 type Project = {
   id: string;
@@ -112,12 +126,19 @@ type Project = {
     sampleIndexes: number[];
     issues?: { sample: number; issues: string[] }[];
   } | null;
+  panelDecision?: {
+    state: string;
+    panelKey: string;
+    artifactId?: string;
+    projectVersion?: number;
+    issueIds?: string[];
+  } | null;
   panels: Record<string, Picture>;
   pages: Picture[];
   accepted: boolean;
   bundleURL: string;
   outputFolder: string;
-  pending: unknown;
+  pending: Pending | null;
   currentTask?: Task | null;
   imageRetry?: {
     certainty: 'confirmed_missing' | 'unknown_result';
@@ -209,8 +230,18 @@ type Bootstrap = {
     message: string;
     imageWorker?: {
       ready: boolean;
+      state?: 'unavailable' | 'unknown' | 'verified-ready';
+      evidence?: string;
       message: string;
+      probe?: {
+        source?: 'saved-result' | 'test-fixture';
+        action?: 'refresh-saved-only' | 'test-fixture';
+        executionAvailable?: boolean;
+        responseFile?: string;
+        message?: string;
+      };
       verifiedAt?: string | null;
+      expiresAt?: string | null;
     };
   };
   projects: Project[];
@@ -225,7 +256,7 @@ type Bootstrap = {
     };
     status?: 'fresh' | 'stale' | 'unavailable';
     error?: string;
-    updatedAt?: string;
+    updatedAt?: string | null;
   };
   categories: { id: string; group: string; label: string }[];
   documents: Doc[];
@@ -306,6 +337,16 @@ function resetText(timestamp?: number) {
       })
     : '更新时间暂不可用';
 }
+function observedAccountText(timestamp?: string | null) {
+  return timestamp
+    ? new Date(timestamp).toLocaleString('zh-CN', {
+        month: 'numeric',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      })
+    : '时间未知';
+}
 export default function Studio() {
   const [data, setData] = useState<Bootstrap | null>(null),
     [section, setSection] = useState<'create' | 'library' | 'setting'>(
@@ -322,6 +363,7 @@ export default function Studio() {
     [effort, setEffort] = useState('medium'),
     [preset, setPreset] = useState('balanced');
   const [waiting, setWaiting] = useState(false),
+    [workerRefreshing, setWorkerRefreshing] = useState(false),
     [error, setError] = useState(''),
     [toast, setToast] = useState(''),
     [note, setNote] = useState(''),
@@ -394,6 +436,24 @@ export default function Studio() {
       setError('');
     } catch (e) {
       setError((e as Error).message);
+    }
+  }, []);
+  const refreshWorker = useCallback(async () => {
+    setWorkerRefreshing(true);
+    try {
+      const connection = await request<Bootstrap['connection']>(
+        '/api/connection',
+        {},
+      );
+      setData((currentData) =>
+        currentData ? { ...currentData, connection } : currentData,
+      );
+      setError('');
+      setToast('已刷新已保存的网页生图后台状态；没有执行新的隔离探针。');
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setWorkerRefreshing(false);
     }
   }, []);
   useEffect(() => {
@@ -969,6 +1029,23 @@ export default function Studio() {
               {data?.connection.imageWorker?.message || '作品只保存在这台电脑'}
             </small>
           </span>
+          <button
+            title="刷新已保存的网页生图后台状态（不执行新探针）"
+            aria-label="刷新已保存的网页生图后台状态（不执行新探针）"
+            disabled={workerRefreshing}
+            onClick={() => void refreshWorker()}
+          >
+            {workerRefreshing ? (
+              <LoaderCircle className="spin" size={14} />
+            ) : (
+              <RotateCcw size={14} />
+            )}
+          </button>
+          <small>
+            {data?.connection.imageWorker?.probe?.executionAvailable
+              ? '可执行新探针'
+              : '此按钮只刷新已保存状态；新探针需由隔离后台实际写入'}
+          </small>
         </div>
       </aside>
       <main>
@@ -991,7 +1068,11 @@ export default function Studio() {
               1周{' '}
               {weeklyRemaining === null ? '暂不可用' : `${weeklyRemaining}%`}
             </b>
-            {data?.account.status === 'stale' && <small>上次读取</small>}
+            {data?.account.status === 'stale' && (
+              <small>
+                上次成功读取 {observedAccountText(data.account.updatedAt)}
+              </small>
+            )}
             <button
               title="刷新实际额度"
               onClick={async () => {
@@ -1248,7 +1329,7 @@ export default function Studio() {
                   </p>
                   <small>
                     {data.account.status === 'stale'
-                      ? '显示上一次成功读取的额度，等待刷新。'
+                      ? `显示 ${observedAccountText(data.account.updatedAt)} 成功读取的额度；本次刷新失败，不把它当作实时额度。`
                       : '显示账户提供的实际额度，不把图片张数误当成固定次数。'}
                   </small>
                 </div>
@@ -2018,11 +2099,16 @@ function ProjectView({
   ].find(
     (item): item is { key: string; title: string; image: Picture } =>
       item !== null &&
-      item.image.qa.pass === null &&
-      ['pending', 'unavailable', 'recovered_pending_review'].includes(
-        item.image.qa.status || '',
-      ),
+      ((item.image.qa.pass === null &&
+        ['pending', 'unavailable', 'recovered_pending_review'].includes(
+          item.image.qa.status || '',
+        )) ||
+        (item.image.qa.pass === false &&
+          item.key === project.panelDecision?.panelKey)),
   );
+  const panelDecisionTarget = project.panelDecision?.panelKey
+    ? project.panels[project.panelDecision.panelKey]
+    : null;
   return (
     <>
       <div className="steps">
@@ -2083,6 +2169,23 @@ function ProjectView({
       {reviewable && !project.busy && (
         <ReviewCard target={reviewable} disabled={disabled} action={action} />
       )}
+      {panelDecisionTarget &&
+        project.panelDecision?.state === 'required' &&
+        !project.busy && (
+          <PanelDecisionCard
+            project={project}
+            panelKey={project.panelDecision.panelKey}
+            image={panelDecisionTarget}
+            disabled={disabled}
+            action={action}
+            onEdit={() =>
+              setEdit({
+                key: project.panelDecision!.panelKey,
+                title: `分镜 ${project.panelDecision!.panelKey}`,
+              })
+            }
+          />
+        )}
       {project.metrics && (
         <div className="metrics-strip">
           <span>本篇调用 {project.metrics.totalRuns || 0} 次</span>
@@ -2512,12 +2615,37 @@ function WorkflowStatus({
     recovered_local: '已找回原图',
     review_failed: '检查未完成',
     paused: '已暂停',
+    not_accepted: '后台尚未接单',
     failed: '需要查看',
   };
   const taskState = task?.status ? taskLabels[task.status] || '需要查看' : '';
   const taskText = task?.target
     ? `当前：${task.target}${taskState ? `（${taskState}）` : ''}`
     : '';
+  const webStateLabels: Record<string, string> = {
+    queued: '等待后台接单',
+    accepted: '后台已接单，开始处理',
+    ready: '已准备提交',
+    submitted: '已提交生成，等待原图',
+    downloaded: '原图已保存',
+    failed: '网页生图阶段失败',
+  };
+  const webText = project.pending?.webState
+    ? webStateLabels[project.pending.webState] || '网页后台处理中'
+    : '';
+  const webFailureText =
+    project.pending?.webState === 'failed'
+      ? project.pending.accepted && project.pending.errorCode === 'IAB_UNAVAILABLE'
+        ? '后台已接单，但提交前 Codex IAB 不可用；没有上传附件或发送消息。当前请求已失败，记录仍保留。'
+        : project.pending.accepted
+          ? '后台已接单，但当前网页生图请求已失败；请求记录和原图找回入口仍保留。'
+          : '网页生图请求已失败；请求记录和原图找回入口仍保留。'
+      : '';
+  const statusMessage =
+    webFailureText ||
+    (task?.status === 'not_accepted'
+      ? '后台尚未确认接单，已停止本机等待；请求已保留，不会自动重试。'
+      : webText || project.message);
   const canResume =
     !project.pending &&
     !recoveryPending &&
@@ -2537,7 +2665,7 @@ function WorkflowStatus({
           <CircleCheck />
         )}
         <span>
-          {noOutput ? '本次没有取得图片，可重试这一张。' : project.message}
+          {noOutput ? '本次没有取得图片，可重试这一张。' : statusMessage}
           <small>
             <Clock /> 已用时{' '}
             {elapsed(progress?.startedAt, progress?.completedAt)} ·{' '}
@@ -2714,6 +2842,74 @@ function ReviewCard({
           重新检查这张图
         </button>
       </div>
+    </div>
+  );
+}
+function PanelDecisionCard({
+  project,
+  panelKey,
+  image,
+  disabled,
+  action,
+  onEdit,
+}: {
+  project: Project;
+  panelKey: string;
+  image: Picture;
+  disabled: boolean;
+  action: (name: string, body?: unknown) => void;
+  onEdit: () => void;
+}) {
+  const revision = project.revision ?? project.version,
+    issueIds = (image.qa.issueDetails || [])
+      .filter(
+        (issue) =>
+          issue.id && ['blocking', 'review'].includes(issue.severity || ''),
+      )
+      .map((issue) => String(issue.id)),
+    ready = Boolean(project.planHash && image.artifactId && image.contentHash);
+  return (
+    <div className="approval-card">
+      <h2>正式分镜需要你来决定</h2>
+      <p>
+        第 {panelKey.split('-')[0]} 页第 {panelKey.split('-')[1]} 格的模型质检没有通过。
+        请先查看原图和问题，再选择采用当前图片或修改这一张。
+      </p>
+      {image.qa.issues.length > 0 && (
+        <small>检查问题：{image.qa.issues.join('；')}</small>
+      )}
+      <div className="inline-actions">
+        <button
+          className="primary"
+          disabled={disabled || !ready}
+          onClick={() => {
+            if (
+              confirm(
+                '确认采用当前正式分镜？模型质检失败结论会保留；这不会重新生图，之后仍会继续页面和整篇校对。',
+              )
+            )
+              action('panel-decision', {
+                panelKey,
+                expectedRevision: revision,
+                planHash: project.planHash,
+                artifactId: image.artifactId,
+                contentHash: image.contentHash,
+                decision: 'accept_current',
+                acknowledgedIssueIds: issueIds,
+                continueProduction: true,
+                idempotencyKey: `panel:${project.id}:${revision}:${image.artifactId}:accept_current`,
+              });
+          }}
+        >
+          <Check />
+          采用当前图片
+        </button>
+        <button className="secondary" disabled={disabled} onClick={onEdit}>
+          <Pencil />
+          修改这一张
+        </button>
+      </div>
+      {!ready && <small>当前图片版本信息尚未刷新，请重新打开这篇作品后再决定。</small>}
     </div>
   );
 }

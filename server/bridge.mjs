@@ -152,18 +152,30 @@ export function appServerSnapshot(timeoutMs=8000) {
 }
 export function extractRateLimits(value){
   const response=value?.rateLimits??value;
-  return response?.rateLimitsByLimitId?.codex||response?.rateLimits||((response?.primary||response?.secondary)?response:null);
+  if(response?.rateLimitsByLimitId?.codex)return response.rateLimitsByLimitId.codex;
+  if(response?.rateLimits)return response.rateLimits;
+  if(response?.primary||response?.secondary)return response;
+  return response&&typeof response==='object'&&Object.values(response).some(item=>item&&typeof item==='object'&&('usedPercent' in item||'windowDurationMins' in item))?response:null;
 }
 export function normalizeRateLimits(value){
   const raw=extractRateLimits(value)||{};
   const clean=window=>{
-    if(!window||!Number.isFinite(Number(window.usedPercent)))return null;
-    const used=Math.min(100,Math.max(0,Number(window.usedPercent)));
-    return {usedPercent:used,remainingPercent:Math.max(0,100-used),windowDurationMins:Number(window.windowDurationMins)||null,resetsAt:Number(window.resetsAt)||null};
+    if(!window||typeof window!=='object'||Array.isArray(window))return null;
+    const parseNumber=value=>{
+      if(typeof value==='number')return Number.isFinite(value)?value:null;
+      if(typeof value==='string'&&value.trim()!==''){const parsed=Number(value);return Number.isFinite(parsed)?parsed:null;}
+      return null;
+    };
+    const usedValue=parseNumber(window.usedPercent);if(usedValue===null)return null;
+    const used=Math.min(100,Math.max(0,usedValue)),durationValue=parseNumber(window.windowDurationMins),resetValue=parseNumber(window.resetsAt);
+    return {usedPercent:used,remainingPercent:Math.max(0,100-used),windowDurationMins:durationValue&&durationValue>0?durationValue:null,resetsAt:resetValue};
   };
-  const windows=Object.entries(raw).map(([key,value])=>({key,value:clean(value)})).filter(x=>x.value);
-  const primary=clean(raw.primary)||windows.find(x=>x.value.windowDurationMins&&x.value.windowDurationMins<=360)?.value||windows[0]?.value||null;
-  const secondary=clean(raw.secondary)||windows.find(x=>x.value!==primary&&x.value.windowDurationMins&&x.value.windowDurationMins>360)?.value||windows.find(x=>x.value!==primary)?.value||null;
+  const windows=Object.entries(raw).map(([key,source])=>({key,source,value:clean(source)})).filter(x=>x.value);
+  const explicitPrimary=windows.find(x=>x.key==='primary')||null,explicitSecondary=windows.find(x=>x.key==='secondary')||null;
+  const primaryEntry=explicitPrimary||(!explicitSecondary?windows.find(x=>x.value.windowDurationMins&&x.value.windowDurationMins<=360)||(!windows.some(x=>x.value.windowDurationMins&&x.value.windowDurationMins>360)?windows[0]||null:null):null);
+  const primary=primaryEntry?.value||null;
+  const secondaryEntry=(explicitSecondary&&explicitSecondary!==primaryEntry&&explicitSecondary.source!==primaryEntry?.source?explicitSecondary:null)||windows.find(x=>x!==primaryEntry&&x.source!==primaryEntry?.source&&x.value.windowDurationMins&&x.value.windowDurationMins>360)||(!primaryEntry?windows.find(x=>x.key!=='primary'&&x.source!==explicitPrimary?.source)||null:windows.find(x=>x!==primaryEntry&&x.source!==primaryEntry?.source)||null);
+  const secondary=secondaryEntry?.value||null;
   return {primary,secondary,planType:raw.planType||null,credits:raw.credits?{balance:raw.credits.balance,hasCredits:raw.credits.hasCredits}:null};
 }
 const rateLimitCache={value:null,observedAt:0,inFlight:null};
@@ -177,12 +189,12 @@ export function rateLimitSnapshot(timeoutMs=12000,{force=false}={}){
   const bin=findCodex();if(!bin)return Promise.resolve(null);
   if(process.env.WENDI_TEST_PLAN_FILE)return Promise.resolve({primary:{usedPercent:1,windowDurationMins:300},secondary:{usedPercent:2,windowDurationMins:10080}});
   const age=Date.now()-rateLimitCache.observedAt;
-  if(!force&&rateLimitCache.value&&age<60_000)return Promise.resolve(rateLimitCache.value);
+  if(!force&&rateLimitCache.value&&age<60_000)return Promise.resolve({...rateLimitCache.value,status:'cached',observedAt:rateLimitCache.observedAt});
   if(rateLimitCache.inFlight)return rateLimitCache.inFlight;
   rateLimitCache.inFlight=new Promise(resolve=>{
     const child=spawn(bin,['app-server','--stdio'],{stdio:['pipe','pipe','pipe'],env:{...process.env,NO_COLOR:'1'}});
     const rl=readline.createInterface({input:child.stdout});let settled=false;
-    const finish=value=>{if(settled)return;settled=true;clearTimeout(timer);rl.close();child.kill('SIGTERM');if(value){rateLimitCache.value=value;rateLimitCache.observedAt=Date.now();}resolve(value||rateLimitCache.value||null);};
+    const finish=value=>{if(settled)return;settled=true;clearTimeout(timer);rl.close();child.kill('SIGTERM');if(value){rateLimitCache.observedAt=Date.now();rateLimitCache.value={...value,status:'fresh',observedAt:rateLimitCache.observedAt};resolve(rateLimitCache.value);}else if(rateLimitCache.value)resolve({...rateLimitCache.value,status:'stale',observedAt:rateLimitCache.observedAt});else resolve(null);};
     const send=value=>child.stdin.write(JSON.stringify(value)+'\n');
     rl.on('line',line=>{try{const msg=JSON.parse(line);if(msg.id===0&&msg.result){send({method:'initialized',params:{}});send({method:'account/rateLimits/read',id:1});}else if(msg.id===1)finish(normalizeRateLimits(msg.result));}catch{}});
     child.on('error',()=>finish(null));child.on('close',()=>finish(null));const timer=setTimeout(()=>finish(null),timeoutMs);

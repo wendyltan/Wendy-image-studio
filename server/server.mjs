@@ -4,8 +4,8 @@ import path from 'node:path';
 import {execFile} from 'node:child_process';
 import {APP,ROOT,REFS,CHECKS,inside,digest} from './workflow.mjs';
 import {connectionStatus,appServerSnapshot,normalizeRateLimits} from './bridge.mjs';
-import {webWorkerStatus} from './chatgpt-web-provider.mjs';
-import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,resume,reviseImage,recoverImage,reviewImage,retryMissingImage,imageRetryState,accept,recover,projectDir,syncRunningProject,refreshQuotaPauses} from './engine.mjs';
+import {WEB_IMAGE_PROVIDER,readWebManifest,webWorkerStatus} from './chatgpt-web-provider.mjs';
+import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,decidePanel,resume,reviseImage,recoverImage,reviewImage,retryMissingImage,imageRetryState,accept,recover,projectDir,syncRunningProject,refreshQuotaPauses} from './engine.mjs';
 import {CATEGORIES,listDocuments,listAssets,discoverArchiveStories,archiveStory,stageUpload,readCandidate,inspectStagedCandidate,saveManualAsset,searchAssets,analyzeAsset,saveAssetProposal,applyAssetProposal,saveDocument,suggestDocument,deleteProjectFolder,deleteArchiveStory} from './library.mjs';
 const PORT=Number(process.env.PORT||4318);const HOST='127.0.0.1';
 const front=path.join(APP,'dist/client');
@@ -25,9 +25,10 @@ async function account(force=false){
     const raw=await appServerSnapshot();
     const models=(raw.models||[]).map(m=>({id:m.id||m.model,label:m.displayName||m.name||m.id||m.model,description:m.description||'',defaultReasoningEffort:m.defaultReasoningEffort||'medium',reasoningEfforts:(m.supportedReasoningEfforts||m.reasoningEfforts||[]).map(x=>typeof x==='string'?x:x.reasoningEffort||x.value).filter(Boolean),isDefault:m.isDefault===true}));
     const limits=normalizeRateLimits(raw.rateLimits);
-    const fresh=limits.primary||limits.secondary;
+    const observed=limits.primary||limits.secondary;
+    const fresh=Boolean(observed&&raw.status!=='stale');
     const previous=accountCache.value;
-    const clean={models:models.length?models:(previous?.models||fallbackModels),rateLimits:fresh?limits:(previous?.rateLimits||null),usage:raw.usage?{planType:raw.usage.planType||null,credits:raw.usage.credits?{balance:raw.usage.credits.balance}:null}:null,status:fresh?(raw.status||'fresh'):(previous?.rateLimits?'stale':'unavailable'),error:raw.error||(!fresh?'额度暂不可用。':'')||null,updatedAt:new Date().toISOString()};
+    const clean={models:models.length?models:(previous?.models||fallbackModels),rateLimits:fresh?limits:(previous?.rateLimits||null),usage:raw.usage?{planType:raw.usage.planType||null,credits:raw.usage.credits?{balance:raw.usage.credits.balance}:null}:null,status:fresh?(raw.status||'fresh'):(previous?.rateLimits?'stale':'unavailable'),error:raw.error||(!fresh?'额度暂不可用。':'')||null,updatedAt:fresh?new Date().toISOString():(previous?.updatedAt||null)};
     if(fresh&&!process.env.WENDI_TEST_PLAN_FILE){writeAccountCache(clean);refreshQuotaPauses(limits.primary?.remainingPercent);}
     accountCache={at:Date.now(),value:clean};return clean;
   })();
@@ -38,6 +39,17 @@ function publicAsset(asset){
   return {...asset,url:'/media/asset/'+asset.file.split('/').map(encodeURIComponent).join('/')};
 }
 function publicAssets(assets=listAssets()){return assets.map(publicAsset);}
+function readJson(file){try{return JSON.parse(fs.readFileSync(file,'utf8'));}catch{return null;}}
+function pendingWebEvidence(p,pending){
+  if(pending?.provider!==WEB_IMAGE_PROVIDER||!pending.dir)return null;
+  const manifest=readWebManifest(path.join(pending.dir,'web-generation.json'));if(!manifest)return null;
+  const request=readJson(path.join(pending.dir,'request.json')),workerRequest=readJson(path.join(pending.dir,'worker-request.json'));
+  const identityMatches=Boolean(
+    manifest.requestId&&request?.provider===WEB_IMAGE_PROVIDER&&request.taskId===pending.taskId&&request.projectId===p.id&&Number(request.projectVersion)===Number(pending.projectVersion??p.version)&&
+    workerRequest?.provider===WEB_IMAGE_PROVIDER&&workerRequest.requestId===manifest.requestId,
+  );
+  return {manifest,identityMatches};
+}
 function file(res,file,download=false){
   if(!fs.existsSync(file)||!fs.statSync(file).isFile())return send(res,{error:'文件不存在'},404);
   const headers={'Content-Type':mime[path.extname(file).toLowerCase()]||'application/octet-stream','Content-Length':fs.statSync(file).size,'Cache-Control':'no-cache'};
@@ -57,11 +69,15 @@ function publicProject(p){
     const isCurrentSample=Number.isInteger(sampleNumber)&&p.status==='samples_decision'&&p.samplesDecision?.sampleIndexes?.includes(sampleNumber)&&userDecision?.action!=='accept_current';
     return {...safe,url:media(displayFile),artifactId:artifact?.id||fallbackId,contentHash:digest({artifactId:artifact?.id||fallbackId,file,at:record.at||artifact?.at||null}),review:record.qa||null,decision:userDecision||null,availableActions:isCurrentSample?['accept_current','regenerate_current']:[]};
   };
-  const publicTask=task=>task?{id:task.id,kind:task.kind,target:task.target,status:task.status,attempt:task.attempt,providerInvocationLimit:task.providerInvocationLimit,providerInvocations:task.providerInvocations,startedAt:task.startedAt,lastProgressAt:task.lastProgressAt,completedAt:task.completedAt,qa:task.qa,errorCode:task.errorCode}:null;
-  const {pending,history=[],samples=[],panels={},pages=[],bundle,artifacts:ignoredArtifacts,tasks:ignoredTasks,currentTask,previewDecisionCommands:ignoredCommands,...safe}=p;
-  void ignoredArtifacts;void ignoredTasks;void ignoredCommands;
+  const publicTask=task=>task?{id:task.id,kind:task.kind,target:task.target,status:task.status,attempt:task.attempt,providerInvocationLimit:task.providerInvocationLimit,providerInvocations:task.providerInvocations,startedAt:task.startedAt,lastProgressAt:task.lastProgressAt,completedAt:task.completedAt,qa:task.qa,errorCode:task.errorCode,webState:task.webState}:null;
+  const {pending,history=[],samples=[],panels={},pages=[],bundle,artifacts:ignoredArtifacts,tasks:ignoredTasks,currentTask,previewDecisionCommands:ignoredCommands,panelDecisionCommands:ignoredPanelCommands,...safe}=p;
+  void ignoredArtifacts;void ignoredTasks;void ignoredCommands;void ignoredPanelCommands;
   const retryState=imageRetryState(p);
-  return {...safe,pending:pending?{key:pending.key,at:pending.at,taskId:pending.taskId}:null,currentTask:publicTask(currentTask),imageRetry:retryState?{certainty:retryState.certainty,target:retryState.target}:null,history:history.map(h=>({version:h.version,title:h.plan.title,at:h.approved?.at,plan:h.plan,pages:(h.pages||[]).map(q=>publicImage(q,`page:${q.number}`))})),
+  const webEvidence=pendingWebEvidence(p,pending),webManifest=webEvidence?.identityMatches?webEvidence.manifest:null;
+  const publicPending=pending?{key:pending.key,at:pending.at,taskId:pending.taskId,provider:pending.provider||null,webState:webManifest?.state||null,requestId:webManifest?.requestId||null,accepted:webManifest?.accepted===true,acceptedAt:webManifest?.acceptedAt||null,submitted:webManifest?.submitted===true,submittedAt:webManifest?.submittedAt||null,errorCode:webManifest?.errorCode||null}:null;
+  const baseTask=publicTask(currentTask),lateTerminal=Boolean(baseTask&&webEvidence?.identityMatches&&currentTask.id===pending?.taskId&&['failed','downloaded'].includes(webManifest?.state));
+  const effectiveTask=lateTerminal?{...baseTask,status:webManifest.state==='failed'?'failed':'artifact_saved',errorCode:webManifest.errorCode||baseTask.errorCode,webState:webManifest.state}:baseTask;
+  return {...safe,pending:publicPending,currentTask:effectiveTask,imageRetry:retryState?{certainty:retryState.certainty,target:retryState.target}:null,history:history.map(h=>({version:h.version,title:h.plan.title,at:h.approved?.at,plan:h.plan,pages:(h.pages||[]).map(q=>publicImage(q,`page:${q.number}`))})),
     planHash:p.plan?digest(p.plan):null,busy:active.has(p.id),
     samples:samples.map((sample,index)=>publicImage(sample,`image:样张-${index+1}`)),
     panels:Object.fromEntries(Object.entries(panels).map(([key,panel])=>[key,publicImage(panel,`image:第${key.split('-')[0]}页-第${key.split('-')[1]}格`)])),
@@ -108,6 +124,30 @@ function savedPreviewDecision(p,input){
   const existing=records.find(record=>record.key===input.idempotencyKey);
   if(existing){if(existing.fingerprint!==fingerprint)throw new Error('这次决定的防重复标识已经用于另一项操作，请刷新后重试。');return {existing,fingerprint};}
   return {existing:null,fingerprint};
+}
+function panelArtifactId(key){const match=/^(\d+)-(\d+)$/.exec(String(key));return match?`image:第${match[1]}页-第${match[2]}格`:null;}
+function panelDecisionFingerprint(input){return digest({planHash:input.planHash,panelKey:input.panelKey,artifactId:input.artifactId,contentHash:input.contentHash,decision:input.decision,acknowledgedIssueIds:input.acknowledgedIssueIds,continueProduction:input.continueProduction});}
+function duplicatePanelDecision(p,b){
+  const key=String(b.idempotencyKey||'').trim();if(!key)return null;
+  const existing=(Array.isArray(p.panelDecisionCommands)?p.panelDecisionCommands:[]).find(record=>record.key===key);if(!existing)return null;
+  const candidate=panelDecisionFingerprint({planHash:String(b.planHash||''),panelKey:String(b.panelKey||''),artifactId:String(b.artifactId||''),contentHash:String(b.contentHash||''),decision:String(b.decision||''),acknowledgedIssueIds:Array.isArray(b.acknowledgedIssueIds)?[...new Set(b.acknowledgedIssueIds.map(String).filter(Boolean))]:[],continueProduction:b.continueProduction===true});
+  if(existing.fingerprint!==candidate)throw new Error('这次决定的防重复标识已经用于另一项操作，请刷新后重试。');
+  return {key,existing};
+}
+function panelDecisionInput(p,b){
+  if(!Object.prototype.hasOwnProperty.call(b,'expectedRevision')||!Number.isInteger(Number(b.expectedRevision)))throw new Error('缺少当前作品版本，请刷新页面后再决定。');
+  const expectedRevision=Number(b.expectedRevision);if(expectedRevision!==Number(p.revision))throw revisionConflict(p,expectedRevision);
+  const planHash=String(b.planHash||'');if(!planHash||planHash!==p.approved?.hash)throw new Error('方案已更新，请重新查看当前分镜后再决定。');
+  if(!['attention','paused'].includes(p.status)||p.panelDecision?.state!=='required')throw new Error('当前没有等待你决定的正式分镜。');
+  const panelKey=String(b.panelKey||''),artifactId=panelArtifactId(panelKey),record=p.panels?.[panelKey];if(!artifactId||!record)throw new Error('对应正式分镜已经更新，请刷新后再决定。');
+  if(record.qa?.pass!==false||record.userDecision?.action==='accept_current'||p.panelDecision.panelKey!==panelKey)throw new Error('对应正式分镜已经更新，请刷新后再决定。');
+  if(String(b.artifactId||'')!==artifactId)throw new Error('当前图片已经过期，请重新查看后再决定。');
+  const artifact=(p.artifacts||[]).find(item=>item.id===artifactId);if(!artifact||artifact.file!==record.file||artifact.valid===false)throw new Error('当前图片已经过期，请重新查看后再决定。');
+  const actualContentHash=digest({artifactId,file:record.file,at:record.at||artifact.at||null});if(String(b.contentHash||'')!==actualContentHash)throw new Error('当前图片内容已经更新，请重新查看后再决定。');
+  const decision=String(b.decision||'');if(decision!=='accept_current')throw new Error('请选择采用当前图片或修改这一张。');
+  const acknowledgedIssueIds=Array.isArray(b.acknowledgedIssueIds)?[...new Set(b.acknowledgedIssueIds.map(String).filter(Boolean))]:[],requiredIssueIds=(record.qa.issueDetails||[]).filter(issue=>['blocking','review'].includes(issue.severity)).map(issue=>String(issue.id)).filter(Boolean);if(requiredIssueIds.some(id=>!acknowledgedIssueIds.includes(id)))throw new Error('请先确认正式分镜中列出的待注意问题，再采用当前图片。');
+  const idempotencyKey=String(b.idempotencyKey||'').trim();if(!idempotencyKey||idempotencyKey.length>200)throw new Error('缺少本次决定的防重复标识，请刷新后再试。');
+  return {expectedRevision,planHash,panelKey,artifactId,contentHash:actualContentHash,decision,acknowledgedIssueIds,continueProduction:b.continueProduction===true,idempotencyKey};
 }
 function retryCommand(p,b){
   const key=String(b.idempotencyKey||'').trim();
@@ -185,6 +225,12 @@ const server=http.createServer(async(req,res)=>{
         p.previewDecisionCommands=p.previewDecisionCommands.slice(-80);saveProject(p);
         try{decideSamples(p,{action:input.decision,sampleIndex:input.sampleIndex,hash:input.planHash});}
         catch(error){p.previewDecisionCommands=p.previewDecisionCommands.filter(record=>record.key!==input.idempotencyKey);saveProject(p);throw error;}
+        return send(res,{...publicProject(p),idempotent:false,command:{key:input.idempotencyKey,acceptedAt:new Date().toISOString(),continueProduction:input.continueProduction}});
+      }
+      if(action==='panel-decision'){
+        const duplicate=duplicatePanelDecision(p,b);if(duplicate)return send(res,{...publicProject(p),idempotent:true,command:{key:duplicate.key,acceptedAt:duplicate.existing.at}});
+        const input=panelDecisionInput(p,b),fingerprint=panelDecisionFingerprint(input);p.panelDecisionCommands=Array.isArray(p.panelDecisionCommands)?p.panelDecisionCommands:[];p.panelDecisionCommands.push({key:input.idempotencyKey,fingerprint,at:new Date().toISOString(),revision:p.revision,panelKey:input.panelKey,artifactId:input.artifactId,decision:input.decision,acknowledgedIssueIds:input.acknowledgedIssueIds,continueProduction:input.continueProduction});p.panelDecisionCommands=p.panelDecisionCommands.slice(-80);saveProject(p);
+        try{const {expectedRevision:_expectedRevision,...decisionInput}=input;void _expectedRevision;await decidePanel(p,{...decisionInput,key:input.panelKey,action:input.decision});}catch(error){const latest=readProject(p.id);latest.panelDecisionCommands=(latest.panelDecisionCommands||[]).filter(record=>record.key!==input.idempotencyKey);saveProject(latest);throw error;}
         return send(res,{...publicProject(p),idempotent:false,command:{key:input.idempotencyKey,acceptedAt:new Date().toISOString(),continueProduction:input.continueProduction}});
       }
       if(action==='retry-missing'){

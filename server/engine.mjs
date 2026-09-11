@@ -96,7 +96,7 @@ export function job(p,phase,fn){
       p.queueJob={id:queued.id,status:'running',phase,queuedAt:queued.queuedAt,startedAt:claimed.startedAt};p.status=phase;p.progress={...p.progress,phase,startedAt:claimed.startedAt,completedAt:null};saveProject(p);
       beat=setInterval(()=>jobStore.heartbeat(queued.id,queueOwner),5000);
       try{await fn(controller.signal);jobStore.finish(queued.id,queueOwner,'completed');}
-      catch(e){p.status=controller.signal.aborted||e.code==='LOW_QUOTA'?'paused':'attention';p.error=String(e.message||e).slice(0,2000);p.message=p.error;p.progress={...p.progress,completedAt:new Date().toISOString()};if(p.currentTask?.status==='running')finishTask(p,p.currentTask,p.status==='paused'?'paused':'failed',{error:p.error});saveProject(p);jobStore.finish(queued.id,queueOwner,controller.signal.aborted?'paused':'failed',{error:p.error});}
+      catch(e){const preserveWorkerState=e.code==='WEB_WORKER_NOT_ACCEPTED'&&p.currentTask?.status==='not_accepted'&&p.currentTask.errorCode==='WEB_WORKER_NOT_ACCEPTED';p.status=controller.signal.aborted||e.code==='LOW_QUOTA'?'paused':'attention';if(preserveWorkerState){p.error=p.message;}else{p.error=String(e.message||e).slice(0,2000);p.message=p.error;}p.progress={...p.progress,completedAt:new Date().toISOString()};if(p.currentTask?.status==='running')finishTask(p,p.currentTask,p.status==='paused'?'paused':'failed',{error:p.error});saveProject(p);jobStore.finish(queued.id,queueOwner,controller.signal.aborted?'paused':'failed',{error:p.error});}
     }finally{if(beat)clearInterval(beat);p.queueJob=null;try{saveProject(p);}finally{active.delete(p.id);runningProjects.delete(p.id);}}
   };
   queueTail=queueTail.catch(()=>{}).then(run);return p;
@@ -138,8 +138,8 @@ async function protectQuota(p){
   // cache. This keeps the guard conservative without paying an account-read
   // startup cost before every normal panel.
   if(Number.isFinite(remaining)&&remaining<=12){limits=await rateLimitSnapshot(12000,{force:true});remaining=Number(limits?.primary?.remainingPercent);}
-  if(!Number.isFinite(remaining)){p.lastQuotaCheck={remaining:null,checkedAt:new Date().toISOString(),status:'unavailable'};saveProject(p);return;}
-  p.lastQuotaCheck={remaining,resetsAt:limits.primary?.resetsAt,checkedAt:new Date().toISOString(),status:'fresh'};saveProject(p);
+  if(!Number.isFinite(remaining)){p.lastQuotaCheck={remaining:null,resetsAt:null,checkedAt:new Date().toISOString(),observedAt:limits?.observedAt||null,status:limits?.status||'unavailable'};saveProject(p);return;}
+  p.lastQuotaCheck={remaining,resetsAt:limits.primary?.resetsAt,checkedAt:new Date().toISOString(),observedAt:limits.observedAt||null,status:limits.status||'fresh'};saveProject(p);
   if(remaining<10){const when=limits.primary?.resetsAt?new Date(limits.primary.resetsAt*1000).toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'}):'下一次额度重置后';const error=new Error(`5小时创作额度只剩 ${Math.floor(remaining)}%。当前工作节点已经保存，并已暂停新的生图。建议在 ${when} 之后点击“继续制作”。`);error.code='LOW_QUOTA';throw error;}
 }
 export function refreshQuotaPauses(remaining){
@@ -163,11 +163,11 @@ function beginTask(p,kind,target,detail={}){
   // of the failed provider call.  Keeping this number makes the on-disk run
   // history useful after a restart without pretending it is a provider count.
   const attempt=p.tasks.filter(item=>item.kind===kind&&item.target===target).length+1;
-  const task={id:crypto.randomUUID(),kind,target,status:'running',attempt,startedAt:now,lastProgressAt:now,...detail};
+  const task={id:crypto.randomUUID(),kind,target,status:'running',attempt,startedAt:now,lastProgressAt:now,projectId:p.id,projectVersion:p.version,...detail};
   p.tasks.push(task);p.tasks=p.tasks.slice(-80);p.currentTask=task;saveProject(p);return task;
 }
 function finishTask(p,task,status,extra={}){if(!task)return;Object.assign(task,{status,completedAt:new Date().toISOString(),...extra});if(p.currentTask?.id===task.id)p.currentTask=task;saveProject(p);}
-function recordArtifact(p,id,kind,file,dependsOn=[]){p.artifacts=Array.isArray(p.artifacts)?p.artifacts:[];p.artifacts=p.artifacts.filter(x=>x.id!==id);p.artifacts.push({id,kind,file,dependsOn,valid:true,at:new Date().toISOString()});p.artifacts=p.artifacts.slice(-200);}
+function recordArtifact(p,id,kind,file,dependsOn=[],extra={}){p.artifacts=Array.isArray(p.artifacts)?p.artifacts:[];p.artifacts=p.artifacts.filter(x=>x.id!==id);p.artifacts.push({id,kind,file,dependsOn,valid:true,at:new Date().toISOString(),...extra});p.artifacts=p.artifacts.slice(-200);}
 function invalidateArtifacts(p,ids){
   // A panel can feed a page, which in turn feeds the story audit and export.
   // Walk the graph until it stops changing so a later export can never look valid
@@ -192,9 +192,20 @@ function runEvidence(dir){
   }
   return {text,eventText,usage};
 }
+function matchingPendingManifest(pending){
+  try{
+    const request=JSON.parse(fs.readFileSync(path.join(pending.dir,'request.json'),'utf8'));
+    const worker=JSON.parse(fs.readFileSync(path.join(pending.dir,'worker-request.json'),'utf8'));
+    const manifest=readWebManifest(path.join(pending.dir,'web-generation.json'));
+    if(request.provider!==WEB_IMAGE_PROVIDER||worker.provider!==WEB_IMAGE_PROVIDER||manifest?.provider!==WEB_IMAGE_PROVIDER||!manifest.requestId||worker.requestId!==manifest.requestId)return null;
+    if(request.taskId!==pending.taskId||!pending.projectId||request.projectId!==pending.projectId||Number(request.projectVersion)!==Number(pending.projectVersion)||request.target!==pending.key)return null;
+    return manifest;
+  }catch{return null;}
+}
 function definiteImageFailure(pending,extra=''){
   if(!pending?.dir)return null;const evidence=runEvidence(pending.dir),classified=readGenerationEvidence(pending.dir),combined=[extra,evidence.text,evidence.eventText].filter(Boolean).join('\n');
-  const manifest=readWebManifest(path.join(pending.dir,'web-generation.json'));
+  const manifest=pending.provider===WEB_IMAGE_PROVIDER?matchingPendingManifest(pending):readWebManifest(path.join(pending.dir,'web-generation.json'));
+  if(pending.provider===WEB_IMAGE_PROVIDER&&!manifest&&(fs.existsSync(path.join(pending.dir,'web-generation.json'))||fs.existsSync(path.join(pending.dir,'worker-request.json'))))return null;
   // Once the chat message was sent, absence of a local file is never proof
   // that the provider produced no image. Preserve it for recovery instead.
   if(manifest?.submitted)return null;
@@ -210,6 +221,7 @@ function definiteImageFailure(pending,extra=''){
   return {kind:'no-output',definiteNoOutput:true,key:pending.key,attempts,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString()};
 }
 function failureMessage(failure){const usage=failure.inputTokens?`本次后台处理记录约 ${failure.inputTokens.toLocaleString('zh-CN')} 输入 tokens；`:'';const action=String(failure.key||'').includes('样张')?'重试当前样张':'重试当前图片';if(failure.kind==='browser-unavailable')return `Codex 网页后台暂不可用，没有打开你的浏览器，也没有提交图片请求。${usage}当前节点已经保存；Codex 内嵌浏览器可用后点击“${action}”，只会重试这一张。`;return `${failure.kind==='network'?'生图服务连接失败':'本次生图未完成'}：已发起 ${failure.attempts} 次图片请求，但没有取得图片。${usage}自动重试已停止，上一张样张和当前节点都已保存。实际订阅余额以页面顶部为准；网络稳定后点击“${action}”，只会重试这一张。`;}
+function workerNotAcceptedMessage(){return 'Codex CLI 已排队，但网页生图后台尚未确认接单。本机等待已停止，当前请求记录和原图找回入口均保留；不会自动重复提交，也不能据此确认没有生图。';}
 function sampleRepairCount(p,index){
   p.sampleRepairCounts=Array.isArray(p.sampleRepairCounts)?p.sampleRepairCounts:[0,0];
   const parsed=Number(/自动修订(\d+)/.exec(p.samples[index]?.key||'')?.[1])||0;
@@ -218,6 +230,10 @@ function sampleRepairCount(p,index){
 function normalizeQA(result){const details=Array.isArray(result.issueDetails)?result.issueDetails:[];if(!details.length&&Array.isArray(result.issues))result.issueDetails=result.issues.map((description,i)=>({id:`legacy-${i+1}`,category:/(?:画幅|比例|竖图)/.test(description)?'aspect_ratio':'uncertain',severity:'review',location:'待确认',description,repairAction:'review'}));return result;}
 function materialSampleIssues(issues=[],details=[]){if(details.length)return details.filter(x=>x.category!=='aspect_ratio').map(x=>x.description);return issues.filter(x=>!/(?:2\s*[:：]\s*3|3\s*[:：]\s*4).*(?:画幅|比例|竖图)|(?:画幅|比例|竖图).*(?:2\s*[:：]\s*3|3\s*[:：]\s*4)/i.test(x));}
 function sampleAccepted(sample){return Boolean(sample?.qa?.pass||sample?.userDecision?.action==='accept_current');}
+function panelAccepted(panel){return Boolean(panel?.qa?.pass||panel?.userDecision?.action==='accept_current');}
+function requirePanelDecision(p,key,record=p.panels?.[key]){
+  p.panelDecision={state:'required',panelKey:key,artifactId:artifactIdForImageKey(key),projectVersion:p.version,at:new Date().toISOString(),issueIds:(record?.qa?.issueDetails||[]).filter(issue=>['blocking','review'].includes(issue.severity)).map(issue=>String(issue.id)).filter(Boolean)};
+}
 function sampleIndexFromKey(key=''){
   const match=/(?:样张-|sample-)([12])/.exec(key);
   return match?Number(match[1])-1:null;
@@ -227,6 +243,22 @@ function panelKeyFromImageKey(key=''){
   if(chinese)return `${chinese[1]}-${chinese[2]}`;
   const legacy=/^(\d+)-(\d+)(?:-|$)/.exec(key);
   return legacy?`${legacy[1]}-${legacy[2]}`:null;
+}
+function artifactIdForImageKey(key=''){
+  const panelKey=panelKeyFromImageKey(key);
+  if(panelKey){const [page,panel]=panelKey.split('-');return `image:第${page}页-第${panel}格`;}
+  const sample=/^(?:样张|sample)-(\d+)/.exec(key);
+  return sample?`image:样张-${sample[1]}`:`image:${key}`;
+}
+function invalidatePanelDownstream(p,panelKey){
+  const [pageNumber]=String(panelKey).split('-').map(Number),oldPage=p.pages?.find(page=>Number(page.number)===pageNumber);
+  if(oldPage){
+    p.invalidatedPages=Array.isArray(p.invalidatedPages)?p.invalidatedPages:[];
+    p.invalidatedPages.push({page:structuredClone(oldPage),panelKey,reason:'panel-replaced',at:new Date().toISOString()});p.invalidatedPages=p.invalidatedPages.slice(-40);
+  }
+  p.pages=(p.pages||[]).filter(page=>Number(page.number)!==pageNumber);
+  invalidateArtifacts(p,[`page:${pageNumber}`,'story:audit','export:bundle']);
+  p.storyQA=null;p.bundle=null;p.accepted=false;p.acceptance=null;p.panelDecision=null;
 }
 function attachImageRecord(p,record){
   const sampleIndex=sampleIndexFromKey(record.key);
@@ -251,6 +283,21 @@ function requireSampleDecision(p,indexes=blockedSampleIndexes(p)){
   p.message=`样张已停止自动修订。请查看第 ${blocked.map(index=>index+1).join('、')} 张样张，并明确选择“采用当前样张”或“重新生成当前样张”。在你决定前不会开始正式画稿。`;
   saveProject(p);return true;
 }
+function archivePlanRevisionState(p){
+  const pending=p.pending,now=new Date().toISOString();
+  if(pending){
+    p.supersededPending=Array.isArray(p.supersededPending)?p.supersededPending:[];
+    p.supersededPending.push({...structuredClone(pending),supersededAt:now,reason:'plan_revision',supersededFromVersion:p.version});p.supersededPending=p.supersededPending.slice(-40);
+    const task=(p.tasks||[]).find(item=>item.id===pending.taskId);if(task)Object.assign(task,{status:'superseded',completedAt:now,supersededAt:now,reason:'plan_revision'});
+    p.pending=null;
+  }
+  if(p.currentTask){
+    const task=(p.tasks||[]).find(item=>item.id===p.currentTask.id);
+    if(task&&['failed','failed_no_output','unknown_result','paused','review_failed','running'].includes(task.status))Object.assign(task,{status:'superseded',completedAt:now,supersededAt:now,reason:'plan_revision'});
+    p.currentTask=null;
+  }
+  p.lastFailure=null;p.error=null;p.panelDecision=null;p.samplesDecision=null;p.previewDecisionCommands=[];p.retryCommands=[];
+}
 export function planProject(p,revision=''){
   if(revision && !p.plan)throw new Error('请先生成完整方案。');
   if(revision && revision.length>6000)throw new Error('修改说明过长。');
@@ -258,8 +305,8 @@ export function planProject(p,revision=''){
     activity(p,revision?'正在把修改同步到逐页方案和连续性台账…':'正在构思故事、逐页分镜和文案…');
     const plan=await runCodex({prompt:plannerPrompt(p.brief,p.plan,revision),schema:PLAN_SCHEMA,dir:runDir(p,'故事方案'),images:FACE.map(x=>path.join(REFS,x)),signal,...modelArgs(p)});addUsage(p,plan.__usage);
     checkpoint(signal);validatePlan(plan,p.brief);
-    if(p.plan)p.history.push({version:p.version,plan:p.plan,approved:p.approved,samples:p.samples,pages:p.pages,panels:p.panels,revisionNotes:p.revisionNotes});
-    p.version++;p.plan=plan;if(!p.titleLocked)p.title=plan.title;p.approved=null;p.samplesApproved=false;p.samples=[];p.sampleRepairCounts=[0,0];p.lastFailure=null;p.panels={};p.pages=[];p.artifacts=[];p.revisionNotes=[];p.storyQA=null;p.accepted=false;p.bundle=null;
+    if(p.plan)p.history.push({version:p.version,plan:p.plan,approved:p.approved,samples:p.samples,pages:p.pages,panels:p.panels,revisionNotes:p.revisionNotes,pending:p.pending?structuredClone(p.pending):null,currentTask:p.currentTask?structuredClone(p.currentTask):null,lastFailure:p.lastFailure?structuredClone(p.lastFailure):null,artifacts:structuredClone(p.artifacts||[])});
+    archivePlanRevisionState(p);p.version++;p.plan=plan;if(!p.titleLocked)p.title=plan.title;p.approved=null;p.samplesApproved=false;p.samples=[];p.sampleRepairCounts=[0,0];p.lastFailure=null;p.panels={};p.pages=[];p.artifacts=[];p.revisionNotes=[];p.storyQA=null;p.accepted=false;p.bundle=null;
     p.status='review';activity(p,'逐页方案已备好。看过并确认后，才会开始生图。');
     fs.writeFileSync(path.join(projectDir(p.id),`方案-v${p.version}.md`),planMarkdown(plan,p.brief,p.version));
   });
@@ -334,7 +381,7 @@ async function persistImage(source,target){
 function writeRunResult(dir,result){if(dir)jsonWrite(path.join(dir,'result.json'),result);}
 function writeRunRequest(dir,p,task,pending){
   const summarize=file=>{try{return {name:path.basename(file),sizeBytes:fs.statSync(file).size,sha256:checksum(file)};}catch{return {name:path.basename(file),missing:true};}};
-  jsonWrite(path.join(dir,'request.json'),{schemaVersion:2,provider:pending.provider||'legacy',taskId:task.id,attempt:task.attempt,target:pending.key,createdAt:pending.at,
+  jsonWrite(path.join(dir,'request.json'),{schemaVersion:2,provider:pending.provider||'legacy',taskId:task.id,attempt:task.attempt,target:pending.key,createdAt:pending.at,projectId:p.id,
     projectVersion:p.version,expectedOutput:path.relative(projectDir(p.id),pending.file),model:p.brief.model||null,reasoningEffort:p.brief.reasoningEffort,
     promptSha256:pending.telemetry.promptSha256,promptCharacters:pending.telemetry.promptCharacters,referenceNames:pending.refs,referenceFiles:pending.inputFiles.map(summarize),editTarget:pending.prior?summarize(pending.prior):null,source:task.source});
 }
@@ -356,7 +403,7 @@ function attributableCandidates(pending){
 async function generate(p,key,prompt,refnames,signal,prior=null,verify=true,qaKind='原始分镜',attempt=1){
   checkpoint(signal);await protectQuota(p);checkpoint(signal);const refs=imageRefs(p,refnames);const folder=path.join(versionDir(p),'素材');fs.mkdirSync(folder,{recursive:true});
   if(p.pending)throw new Error('当前图片任务尚未结束，请先检查已有原图。');
-  let file=path.join(folder,`${key}-${Date.now()}.png`);const dir=runDir(p,key);const inputFiles=prior?[prior,...refs]:refs;const telemetry=promptTelemetry(prompt,refs,{requestedReferenceCount:refnames.length,source:prior?'edit':'generate'});const task=beginTask(p,'image',key,{attempt,provider:WEB_IMAGE_PROVIDER,providerInvocationLimit:1,providerInvocations:0,source:prior?'edit':'generate',telemetry});const pending={key,file,dir,prompt,refs:refnames,inputFiles,prior,provider:WEB_IMAGE_PROVIDER,taskId:task.id,telemetry,at:new Date().toISOString()};
+  let file=path.join(folder,`${key}-${Date.now()}.png`);const dir=runDir(p,key);const inputFiles=prior?[prior,...refs]:refs;const telemetry=promptTelemetry(prompt,refs,{requestedReferenceCount:refnames.length,source:prior?'edit':'generate'});const task=beginTask(p,'image',key,{attempt,provider:WEB_IMAGE_PROVIDER,providerInvocationLimit:1,providerInvocations:0,source:prior?'edit':'generate',telemetry});const pending={key,file,dir,prompt,refs:refnames,inputFiles,prior,provider:WEB_IMAGE_PROVIDER,taskId:task.id,projectId:p.id,projectVersion:p.version,telemetry,at:new Date().toISOString()};
   writeRunRequest(dir,p,task,pending);p.pending=pending;p.lastFailure=null;saveProject(p);
   let failure,made=null;const manifestFile=path.join(dir,'web-generation.json'),conversationUrl=previousConversation(prior),capsule=fs.readFileSync(path.join(versionDir(p),'制作提示词胶囊.txt'),'utf8');
   try{
@@ -381,6 +428,11 @@ async function generate(p,key,prompt,refnames,signal,prior=null,verify=true,qaKi
   else if(candidates.length===1)persisted=await persistImage(candidates[0],file);
   if(!persisted){
     const candidateNames=candidates.map(candidate=>path.basename(candidate));
+    if(failure?.code==='WEB_WORKER_NOT_ACCEPTED'&&webManifest?.submitted!==true){
+      writeRunResult(dir,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:task.id,attempt:task.attempt,endedAt:new Date().toISOString(),outcome:'worker_not_accepted',acceptanceState:webManifest?.state||'queued',requestId:webManifest?.requestId||null,diagnostics:generationDiagnosticSummary(evidence),candidateCount:candidateNames.length,candidateNames,error:String(failure.message||failure).slice(0,500)});
+      task.providerInvocations=0;p.status='attention';p.message=workerNotAcceptedMessage();p.error=p.message;
+      finishTask(p,task,'not_accepted',{errorCode:'WEB_WORKER_NOT_ACCEPTED',webState:webManifest?.state||'queued'});saveProject(p);throw failure;
+    }
     writeRunResult(dir,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:task.id,attempt:task.attempt,endedAt:new Date().toISOString(),outcome:'artifact_not_located',diagnostics:generationDiagnosticSummary(evidence),candidateCount:candidateNames.length,candidateNames,error:failure?String(failure.message||failure).slice(0,500):null});
     const known=definiteImageFailure(pending,[made?.text,failure?.message,webManifest?.errorCode,webManifest?.error].filter(Boolean).join('\n'));
     if(known){if(known.kind==='browser-unavailable')task.providerInvocations=0;p.pending=null;p.lastFailure={...known,taskId:task.id};finishTask(p,task,'failed_no_output',{errorCode:known.kind});saveProject(p);const error=new Error(failureMessage(known));error.code='IMAGE_NO_OUTPUT';throw error;}
@@ -393,7 +445,7 @@ async function generate(p,key,prompt,refnames,signal,prior=null,verify=true,qaKi
   // timeout is never evidence that the image did not exist, and must not make
   // the next click repeat a paid image request.
   const record={key,file:path.relative(projectDir(p.id),file),provider:WEB_IMAGE_PROVIDER,conversationUrl:webManifest?.conversationUrl||conversationUrl||null,prompt,refs:refnames,telemetry,integrity:persisted.integrity,qa:verify?{pass:null,status:'pending',summary:'原图已保存，等待画面校对。',issues:[],repairPrompt:''}:{pass:true,status:'deferred',summary:'已完成本地文件检查；将在整页成稿中统一校对。',issues:[],repairPrompt:''},at:new Date().toISOString()};
-  jsonWrite(file+'.json',record);recordArtifact(p,`image:${key}`,'image',record.file,prior?[`image:${key.replace(/-局部修订$/,'')}`]:[]);attachImageRecord(p,record);p.pending=null;p.lastFailure=null;finishTask(p,task,'artifact_saved',{artifact:file,qa:verify?'pending':'deferred'});saveProject(p);
+  jsonWrite(file+'.json',record);const panelKey=panelKeyFromImageKey(key);if(panelKey)invalidatePanelDownstream(p,panelKey);recordArtifact(p,artifactIdForImageKey(key),'image',record.file,[],{integrity:persisted.integrity});attachImageRecord(p,record);p.pending=null;p.lastFailure=null;finishTask(p,task,'artifact_saved',{artifact:file,qa:verify?'pending':'deferred'});saveProject(p);
   if(!verify)return record;
   try{
     checkpoint(signal);
@@ -454,6 +506,40 @@ export function decideSamples(p,decision={}){
   p.samples[index]=null;p.sampleRepairCounts=Array.isArray(p.sampleRepairCounts)?p.sampleRepairCounts:[0,0];p.sampleRepairCounts[index]=0;p.samplesApproved=false;p.samplesDecision=null;p.status='paused';p.error=null;p.message=`将重新生成第 ${index+1} 张样张；旧图仍保留在作品文件中。`;saveProject(p);
   return sampleProject(p);
 }
+function panelImagePath(p,record){
+  if(typeof record?.file!=='string'||!record.file||path.isAbsolute(record.file))throw new Error('当前图片文件路径无效，不能采用。');
+  let file;try{file=inside(projectDir(p.id),record.file);}catch{throw new Error('当前图片文件不属于这篇作品，不能采用。');}
+  if(!fs.existsSync(file))throw new Error('当前图片文件不存在，不能采用。');
+  return file;
+}
+async function verifyPanelImage(p,record,artifact){
+  const file=panelImagePath(p,record);let integrity;
+  try{integrity=await verifyImage(file);}catch{throw new Error('当前图片不存在或无法解码，不能采用。');}
+  const expected=record.integrity?.sha256||artifact?.integrity?.sha256;
+  if(typeof expected!=='string'||!expected)throw new Error('当前图片没有可信的完整性记录，请重新校对后再决定。');
+  if(integrity.sha256!==expected)throw new Error('当前图片内容已经更新，请重新查看后再决定。');
+  return {file,integrity};
+}
+export async function decidePanel(p,decision={}){
+  verifyApproval(p);if(active.has(p.id))throw new Error('分镜仍在制作中，请等待当前任务结束。');
+  const key=String(decision.key||decision.panelKey||''),record=p.panels?.[key],action=String(decision.action||'');
+  if(!/^\d+-\d+$/.test(key)||!record)throw new Error('没有可供决定的正式分镜。');
+  if(action!=='accept_current')throw new Error('正式分镜只能采用当前图片或修改这一张。');
+  if(record.qa?.pass!==false||record.userDecision?.action==='accept_current')throw new Error('当前正式分镜没有等待人工采用的失败质检。');
+  if(Object.prototype.hasOwnProperty.call(decision,'expectedRevision')&&Number(decision.expectedRevision)!==Number(p.revision))throw new Error('作品已更新，请刷新后再提交这次决定。');
+  if(decision.planHash&&decision.planHash!==p.approved?.hash)throw new Error('方案已更新，请重新查看当前分镜后再决定。');
+  const artifactId=artifactIdForImageKey(key),artifact=(p.artifacts||[]).find(item=>item.id===artifactId);
+  if(decision.artifactId&&(artifact?.file!==record.file||artifact?.valid===false))throw new Error('当前图片已经过期，请刷新后再决定。');
+  if(decision.artifactId&&decision.artifactId!==artifactId)throw new Error('当前图片已经过期，请刷新后再决定。');
+  const contentHash=digest({artifactId,file:artifact?.file||record.file,at:record.at||artifact?.at||null});
+  if(decision.contentHash&&decision.contentHash!==contentHash)throw new Error('当前图片内容已经更新，请重新查看后再决定。');
+  const acknowledgedIssueIds=[...new Set((Array.isArray(decision.acknowledgedIssueIds)?decision.acknowledgedIssueIds:[]).map(String).filter(Boolean))],requiredIssueIds=(record.qa.issueDetails||[]).filter(issue=>['blocking','review'].includes(issue.severity)).map(issue=>String(issue.id)).filter(Boolean);
+  if(requiredIssueIds.some(id=>!acknowledgedIssueIds.includes(id)))throw new Error('请先确认正式分镜中列出的待注意问题，再采用当前图片。');
+  const expectedRevision=Number(p.revision),expectedVersion=Number(p.version),expectedPlanHash=p.approved.hash,verified=await verifyPanelImage(p,record,artifact),latest=readProject(p.id),latestRecord=latest.panels?.[key],latestArtifact=(latest.artifacts||[]).find(item=>item.id===artifactId);
+  if(active.has(p.id)||Number(latest.revision)!==expectedRevision||Number(latest.version)!==expectedVersion||latest.approved?.hash!==expectedPlanHash||!['attention','paused'].includes(latest.status)||latest.panelDecision?.state!=='required'||latest.panelDecision.panelKey!==key||latestRecord?.file!==record.file||latestRecord?.at!==record.at||latestRecord?.qa?.pass!==false||latestRecord?.userDecision?.action==='accept_current'||latestArtifact?.file!==record.file||latestArtifact?.valid===false||latestRecord.integrity?.sha256&&latestRecord.integrity.sha256!==verified.integrity.sha256||latestArtifact.integrity?.sha256&&latestArtifact.integrity.sha256!==verified.integrity.sha256)throw new Error('作品或当前图片已更新，请刷新后再提交这次决定。');
+  Object.assign(p,latest);const current=p.panels[key],currentArtifact=(p.artifacts||[]).find(item=>item.id===artifactId);current.integrity=verified.integrity;currentArtifact.integrity=verified.integrity;const decidedAt=new Date().toISOString();current.userDecision={action:'accept_current',at:decidedAt,projectVersion:p.version,artifactId,contentHash,integritySha256:verified.integrity.sha256,acknowledgedIssueIds,issues:current.qa.issues||[]};p.panelDecision={state:'accepted',panelKey:key,artifactId,projectVersion:p.version,at:decidedAt};p.error=null;p.status='paused';p.message=`已明确采用第 ${key.split('-')[0]} 页第 ${key.split('-')[1]} 格当前图片。模型质检结论仍保留；接下来会继续排版和整篇检查。`;saveProject(p);
+  return decision.continueProduction===false?p:generatePages(p);
+}
 async function composePage(p,page,signal){
   const dir=runDir(p,`第${page.number}页排版`);const output=path.join(versionDir(p),'候选成稿',`${String(page.number).padStart(2,'0')}-${Date.now()}.png`);
   const images=page.panels.map((_,i)=>inside(projectDir(p.id),p.panels[`${page.number}-${i+1}`].file));
@@ -461,7 +547,7 @@ async function composePage(p,page,signal){
   await pythonRun(['compose',path.join(dir,'排版.json')]);checkpoint(signal);
   activity(p,`正在核对第 ${page.number} 页的文字、画面和连续性…`);
   const report=await qa(p,output,JSON.stringify(page),imageRefs(p,[...new Set(page.panels.flatMap(q=>q.references))]),signal,'1080×1440最终漫画页');
-  const result={number:page.number,file:path.relative(projectDir(p.id),output),qa:report,at:new Date().toISOString(),dependsOn:page.panels.map((_,i)=>`image:第${page.number}页-第${i+1}格`)};
+  const result={number:page.number,file:path.relative(projectDir(p.id),output),qa:report,at:new Date().toISOString(),dependsOn:page.panels.map((_,i)=>artifactIdForImageKey(`${page.number}-${i+1}`))};
   p.pages=p.pages.filter(q=>q.number!==page.number);p.pages.push(result);p.pages.sort((a,b)=>a.number-b.number);recordArtifact(p,`page:${page.number}`,'page',result.file,result.dependsOn);saveProject(p);
   if(!report.pass){
     const actions=[...repairActions(report)],onlyLayout=actions.length>0&&actions.every(action=>['reletter','recompose','review'].includes(action));
@@ -478,25 +564,38 @@ async function addScreen(p,key,panel,signal){
   const composed=await runCodex({dir,signal,image:true,images:[input],...modelArgs(p,'low'),
     prompt:`执行已经授权的确定性漫画中文后期排版。这不是生图任务，不触发任何新的图片生成，不调用浏览器，不覆盖原图。原图 ${input} 已附上，请视觉检查原始尺寸，识别手机或车机的玻璃内屏四角、圆角、边框、刘海、手指遮挡和反光。用本机Python与Pillow、STHeiti字体，绘制正确中文界面并透视变换到内屏坐标系，圆角遮罩、手指遮挡必须保留，反光融合而非不透明平面截图浮贴。不要修改屏幕外任何像素。内屏逐字内容：${panel.screenText}。界面状态与要求：${panel.screenDirection}。有输入、删除、灰色不可发送等状态时准确表现差异。写出布局数据与可复用脚本到本次目录，再输出 ${output}。完成后查看局部放大及全图核对，若无法可靠定位内屏不要猜测，不生成假完成图片，说明原因。最终仅返回真实输出路径。`});addUsage(p,composed.usage);
   checkpoint(signal);if(!fs.existsSync(output))throw new Error('这张内屏的透视位置还需调整，原图已保留，请补充修改要求。');
-  await pythonRun(['info',output]);
+  const integrity=await verifyImage(output);
   const report=await qa(p,output,JSON.stringify(panel),[input,...imageRefs(p,panel.references)],signal,'已添加内屏中文的单分镜；必须核对内屏逐字文案、透视、手指遮挡及屏幕外保持不变');
   if(!report.pass)throw new Error('内屏文字需要调整：'+report.issues.join('；'));
-  record.rawFile=record.rawFile||record.file;record.file=path.relative(projectDir(p.id),output);record.screenApplied=true;record.screenQA=report;saveProject(p);
+  const rawFile=record.rawFile||record.file;invalidatePanelDownstream(p,key);record.rawFile=rawFile;record.file=path.relative(projectDir(p.id),output);record.integrity=integrity;record.at=new Date().toISOString();record.screenApplied=true;record.screenQA=report;recordArtifact(p,artifactIdForImageKey(key),'image',record.file,[],{integrity});jsonWrite(output+'.json',record);saveProject(p);
+}
+function currentImageArtifact(p,key){
+  const record=p.panels?.[key],id=artifactIdForImageKey(key);
+  return record?.file?(p.artifacts||[]).find(artifact=>artifact.id===id&&artifact.file===record.file&&artifact.valid!==false):null;
+}
+function pageIsCurrent(p,page){
+  if(!page?.qa?.pass)return false;
+  const pageArtifact=(p.artifacts||[]).find(artifact=>artifact.id===`page:${page.number}`&&artifact.file===page.file&&artifact.valid!==false);
+  const definition=p.plan?.pages?.find(item=>Number(item.number)===Number(page.number));
+  if(!pageArtifact||!definition||!Array.isArray(page.dependsOn))return false;
+  const expected=definition.panels.map((_,index)=>artifactIdForImageKey(`${page.number}-${index+1}`));
+  return expected.every(id=>page.dependsOn.includes(id)&&currentImageArtifact(p,`${page.number}-${expected.indexOf(id)+1}`)?.id===id);
 }
 export function generatePages(p){verifyApproval(p);if(!p.samplesApproved)throw new Error('请先确认人物和场景样张。');return job(p,'generating',async signal=>{
   const totalPanels=p.plan.pages.reduce((n,page)=>n+page.panels.length,0),verifyPanels=p.brief.workflowPreset==='careful';let completed=Object.keys(p.panels).length;
   for(const page of p.plan.pages){
-    if(p.pages.find(q=>q.number===page.number)?.qa.pass)continue;
+    if(pageIsCurrent(p,p.pages.find(q=>q.number===page.number)))continue;
     const geoFile=path.join(runDir(p,'分镜比例'),'page.json');jsonWrite(geoFile,page);
     const geometry=JSON.parse(await pythonRun(['geometry',geoFile]));
     for(const [i,q] of page.panels.entries()){
       const key=`${page.number}-${i+1}`;
       const existing=p.panels[key];
-      if(existing?.qa?.pass){await addScreen(p,key,q,signal);continue;}
+      if(panelAccepted(existing)){await addScreen(p,key,q,signal);continue;}
       // This may be a file recovered after an interrupted local copy or a QA
       // outage. It is a real retained image, not a signal to spend another
       // generation request when the creator presses Continue.
       if(existing?.file){
+        if(existing.qa?.pass===false&&!existing.userDecision){requirePanelDecision(p,key,existing);p.status='attention';p.message=`第 ${page.number} 页第 ${i+1} 格的画面检查未通过，请查看列出的问题后选择“采用当前图片”或“修改这一张”。系统不会自动重画。`;saveProject(p);return;}
         p.status='attention';p.message=`第 ${page.number} 页第 ${i+1} 格的原图已保存，但${existing.qa?.status==='recovered_pending_review'?'尚未自动校对':'需要人工查看'}。请在网页中查看后决定修改或继续；继续制作不会自动重生这张图。`;saveProject(p);return;
       }
       checkpoint(signal);activity(p,`正在绘制第 ${page.number}/${p.plan.pages.length} 页 · 第 ${i+1}/${page.panels.length} 格…`,completed,totalPanels,'分镜');
@@ -506,7 +605,7 @@ export function generatePages(p){verifyApproval(p);if(!p.samplesApproved)throw n
       if(verifyPanels&&!result.qa.pass){
         // Quality review is advisory. The single source image remains attached
         // and the next paid image request must come from an explicit user edit.
-        p.status='attention';p.message=`第 ${page.number} 页第 ${i+1} 格的原图已保存，画面检查建议：${(result.qa.issues||[]).join('；')||'请人工查看'}。系统不会自动重画；请查看后选择“修改这张图”，或确认采用当前图再继续。`;saveProject(p);return;
+        requirePanelDecision(p,key,result);p.status='attention';p.message=`第 ${page.number} 页第 ${i+1} 格的原图已保存，画面检查建议：${(result.qa.issues||[]).join('；')||'请人工查看'}。系统不会自动重画；请查看后选择“修改这张图”，或确认采用当前图再继续。`;saveProject(p);return;
       }
       await addScreen(p,key,q,signal);completed++;activity(p,`已完成 ${completed}/${totalPanels} 个分镜`,completed,totalPanels,'分镜');
     }
@@ -536,7 +635,7 @@ export function reviseImage(p,key,note){
     p.revisionNotes.push({key,note,at:new Date().toISOString()});
     const result=await generate(p,key+'-局部修订',prompt+'\n用户已确认本次修改：'+note+'\n只改指定内容，其余保持。',refs,signal,inside(projectDir(p.id),old.file));
     if(sample){p.samples[+sample[1]-1]=result;p.samplesApproved=false;p.status=p.samples.length===2&&p.samples.every(q=>q.qa.pass)?'samples_review':'attention';}
-    else {p.panels[key]=result;const pageId=+panel[1];p.pages=p.pages.filter(q=>q.number!==pageId);invalidateArtifacts(p,[`image:${key}`,`page:${pageId}`]);p.storyQA=null;p.bundle=null;if(result.qa.pass)await addScreen(p,key,p.plan.pages[pageId-1].panels[+panel[2]-1],signal);if(result.qa.pass)await composePage(p,p.plan.pages[pageId-1],signal);p.status='paused';}
+    else {p.panels[key]=result;const pageId=+panel[1];if(result.qa.pass)await addScreen(p,key,p.plan.pages[pageId-1].panels[+panel[2]-1],signal);if(result.qa.pass)await composePage(p,p.plan.pages[pageId-1],signal);p.status='paused';}
     saveProject(p);if(!result.qa.pass)throw new Error(result.qa.issues.join('；'));activity(p,sample?'样张已更新，请重新确认。':'这一格已修好并更新页面，可以继续制作与整篇校对。');
   });
 }
@@ -591,29 +690,38 @@ export function retryMissingImage(p,target,{allowUnknownResult=false}={}){
     const geoFile=path.join(runDir(p,'分镜比例'),'page.json');jsonWrite(geoFile,page);const geometry=JSON.parse(await pythonRun(['geometry',geoFile]))[panelNumber-1];
     const prompt=compilePanelPrompt(pageNumber,panelNumber,panel,geometry,p.revisionNotes.filter(x=>x.key===panelKey||x.key===target));
     const result=await generate(p,`第${pageNumber}页-第${panelNumber}格`,prompt,panel.references,signal,null,p.brief.workflowPreset==='careful','原始分镜',Math.max(1,Number(failure.attempts||0)+1));
-    p.panels[panelKey]=result;p.pages=p.pages.filter(item=>item.number!==pageNumber);invalidateArtifacts(p,[`image:${panelKey}`,`page:${pageNumber}`]);p.storyQA=null;p.bundle=null;p.accepted=false;p.status='paused';const totalPanels=p.plan.pages.reduce((total,item)=>total+item.panels.length,0);activity(p,`${target} 已重新生成并保存；本次不会继续生成其他分镜。`,Object.keys(p.panels).length,totalPanels,'分镜');
+    p.panels[panelKey]=result;p.accepted=false;p.status='paused';const totalPanels=p.plan.pages.reduce((total,item)=>total+item.panels.length,0);activity(p,`${target} 已重新生成并保存；本次不会继续生成其他分镜。`,Object.keys(p.panels).length,totalPanels,'分镜');
   });
 }
+function assertCurrentPending(p,pending){
+  let request={};try{request=JSON.parse(fs.readFileSync(path.join(pending.dir||'','request.json'),'utf8'));}catch{}
+  const projectId=pending.projectId||request.projectId||null,version=Number(pending.projectVersion??request.projectVersion);
+  if(!Number.isInteger(version))throw new Error('待恢复任务缺少可信的方案版本归属，请人工处理；原图和记录已保留。');
+  if(projectId&&projectId!==p.id)throw new Error('待恢复任务不属于当前作品，原图和记录已保留，请人工处理。');
+  if(!projectId){const root=path.resolve(projectDir(p.id)),dir=path.resolve(pending.dir||'');if(!dir.startsWith(root+path.sep))throw new Error('待恢复任务缺少可信的作品归属，请人工处理；原图和记录已保留。');}
+  if(version!==Number(p.version))throw new Error(`待恢复任务属于方案 v${version}，当前是方案 v${p.version}；原图和记录已保留，请先查看历史方案。`);
+}
 export function recoverImage(p){verifyApproval(p);if(!p.pending)throw new Error('没有待找回的图片');return job(p,'revising',async()=>{
-  const pending=p.pending;
+  const pending=p.pending;assertCurrentPending(p,pending);const webManifest=pending.provider===WEB_IMAGE_PROVIDER?matchingPendingManifest(pending):null;
+  const recoveryIdentity={projectId:p.id,projectVersion:p.version,target:pending.key,...(webManifest?{requestId:webManifest.requestId||null,acceptanceState:webManifest.state,accepted:webManifest.accepted===true,acceptedAt:webManifest.acceptedAt||null,submitted:webManifest.submitted===true,submittedAt:webManifest.submittedAt||null}: {})};
   let file=pending.file;
   const {evidence,candidates}=attributableCandidates(pending);
   let persisted=null;
   if(fs.existsSync(file))persisted=await persistImage(file,file);
   else if(candidates.length===1)persisted=await persistImage(candidates[0],file);
   if(!persisted){
-    writeRunResult(pending.dir,{schemaVersion:2,provider:pending.provider||'legacy',taskId:pending.taskId||null,endedAt:new Date().toISOString(),outcome:'artifact_still_unknown',diagnostics:generationDiagnosticSummary(evidence),candidateCount:candidates.length,candidateNames:candidates.map(candidate=>path.basename(candidate))});
+    writeRunResult(pending.dir,{schemaVersion:2,provider:pending.provider||'legacy',taskId:pending.taskId||null,endedAt:new Date().toISOString(),outcome:'artifact_still_unknown',...recoveryIdentity,diagnostics:generationDiagnosticSummary(evidence),candidateCount:candidates.length,candidateNames:candidates.map(candidate=>path.basename(candidate))});
     const known=definiteImageFailure(pending);
-    if(known){p.pending=null;p.lastFailure=known;const task=(p.tasks||[]).find(item=>item.id===pending.taskId);finishTask(p,task,'failed_no_output',{errorCode:known.kind});saveProject(p);throw new Error(failureMessage(known));}
+    if(known){p.pending=null;p.lastFailure=known;const task=(p.tasks||[]).find(item=>item.id===pending.taskId);finishTask(p,task,'failed_no_output',{errorCode:known.kind,webState:webManifest?.state||task?.webState||null});saveProject(p);throw new Error(failureMessage(known));}
     throw new Error('连接在保存结果前中断，系统仍无法确认是否已经生成。稍后可再次检查已有原图；检查本身不会重新生图。');
   }
   file=persisted.file;pending.file=file;
-  writeRunResult(pending.dir,{schemaVersion:2,provider:pending.provider||'legacy',taskId:pending.taskId||null,endedAt:new Date().toISOString(),outcome:'artifact_recovered',artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,diagnostics:generationDiagnosticSummary(evidence)});
+  writeRunResult(pending.dir,{schemaVersion:2,provider:pending.provider||'legacy',taskId:pending.taskId||null,endedAt:new Date().toISOString(),outcome:'artifact_recovered',...recoveryIdentity,artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,diagnostics:generationDiagnosticSummary(evidence)});
   // Recovery is deliberately local-only. It attaches a verified file to the
   // project but does not run the model QA again and therefore never consumes a
   // new model call or image opportunity.
   const record={key:pending.key,file:path.relative(projectDir(p.id),file),provider:pending.provider||'legacy',prompt:pending.prompt,refs:pending.refs,integrity:persisted.integrity,qa:{pass:null,status:'recovered_pending_review',summary:'原图已找回，尚未自动校对。请查看图片后选择继续或修改。',issues:[],repairPrompt:''},at:new Date().toISOString()};
-  jsonWrite(file+'.json',record);recordArtifact(p,`image:${pending.key}`,'image',record.file);attachImageRecord(p,record);
+  jsonWrite(file+'.json',record);const recoveredPanelKey=panelKeyFromImageKey(pending.key);if(recoveredPanelKey)invalidatePanelDownstream(p,recoveredPanelKey);recordArtifact(p,artifactIdForImageKey(pending.key),'image',record.file,[],{integrity:persisted.integrity});attachImageRecord(p,record);
   const sampleIndex=sampleIndexFromKey(pending.key);if(sampleIndex!==null)sampleRepairCount(p,sampleIndex);
   p.pending=null;p.lastFailure=null;p.status='paused';const task=(p.tasks||[]).find(item=>item.id===pending.taskId);finishTask(p,task,'recovered_local',{artifact:file,qa:'not_run'});activity(p,'原图已找回并挂接到作品。未重新生图，也没有再次自动校对。');
 });}
@@ -629,7 +737,7 @@ export function reviewImage(p,key){
     const task=beginTask(p,'review',record.key||key,{artifact:record.file,source:'manual_review'});
     record.integrity=integrity;record.qa={pass:null,status:'pending',summary:'原图已保存，正在重新校对。',issues:[],repairPrompt:''};saveProject(p);
     try{
-      const report=await qa(p,file,prompt,imageRefs(p,refs),signal,kind);record.qa=report;
+      const report=await qa(p,file,prompt,imageRefs(p,refs),signal,kind);record.qa=report;if(panel&&!report.pass){invalidatePanelDownstream(p,key);requirePanelDecision(p,key,record);}else if(panel)p.panelDecision=null;
       jsonWrite(file+'.json',record);finishTask(p,task,'completed',{artifact:file,qa:report.pass?'passed':'needs_review'});
       p.status='paused';p.error=null;p.message=report.pass?'原图已重新校对，可以继续下一步。':'原图已重新校对，请查看建议后决定是否修改。';saveProject(p);return record;
     }catch(error){
@@ -639,7 +747,7 @@ export function reviewImage(p,key){
   });
 }
 export async function accept(p,checks){
-  if(active.has(p.id)||p.status!=='ready'||p.pages.length!==p.plan.pages.length||p.pages.some(q=>!q.qa.pass)||!p.storyQA?.pass)throw new Error('请先完成全篇制作和校对。');
+  if(active.has(p.id)||p.status!=='ready'||p.pages.length!==p.plan.pages.length||p.pages.some(q=>!pageIsCurrent(p,q))||!p.storyQA?.pass||(p.artifacts||[]).find(artifact=>artifact.id==='story:audit')?.valid!==true)throw new Error('请先完成全篇制作和校对。');
   if(!Array.isArray(checks)||!CHECKS.every(c=>checks.includes(c)))throw new Error('请先完成成稿验收。');
   const finalDir=path.join(versionDir(p),'成品');fs.mkdirSync(finalDir,{recursive:true});
   for(const q of p.pages){const file=path.join(finalDir,`${String(q.number).padStart(2,'0')}.png`);fs.copyFileSync(inside(projectDir(p.id),q.file),file);q.finalFile=path.relative(projectDir(p.id),file);}
