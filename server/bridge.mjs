@@ -202,16 +202,13 @@ export function rateLimitSnapshot(timeoutMs=12000,{force=false}={}){
   });
   return rateLimitCache.inFlight.finally(()=>{rateLimitCache.inFlight=null;});
 }
-export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},image=false,browserMode=null,writableDirs=[],model=null,reasoningEffort='low',timeoutMs=900000}) {
-  const bin=findCodex();if(!bin)throw new Error('请先打开 Codex 并登录。');
-  if(browserMode==='iab'&&!process.env.WENDI_TEST_PLAN_FILE&&process.env.WENDI_CHATGPT_WEB_IAB_READY!=='1'){
-    const error=new Error('Browser is not available: iab。后台网页会话尚未通过宿主能力验证；没有打开用户浏览器，也没有提交图片请求。');error.code='IAB_UNAVAILABLE';throw error;
-  }
+export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},image=false,browserMode=null,writableDirs=[],model=null,reasoningEffort='low',timeoutMs=900000,codexBin=null}) {
+  const bin=codexBin||findCodex();if(!bin)throw new Error('请先打开 Codex 并登录。');
   fs.mkdirSync(dir,{recursive:true});
   const resultPath=path.join(dir,'response.txt');
   const runId=path.basename(dir),startedAt=new Date().toISOString();
   const args=['exec','--ephemeral','--skip-git-repo-check'];
-  if(browserMode==='iab')args.push('--disable','apps','--disable','multi_agent','--disable','image_generation','--disable','browser_use_external');
+  if(browserMode==='chrome')args.push('--disable','image_generation');
   else args.push('--ignore-user-config','--disable','plugins','--disable','apps','--disable','multi_agent');
   args.push('-c',`model_reasoning_effort="${reasoningEffort}"`,'-s',image?'workspace-write':'read-only','--json','-o',resultPath);
   if(model)args.push('-m',model);
@@ -222,7 +219,7 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
   fs.writeFileSync(path.join(dir,'prompt.txt'),prompt,{mode:0o600});
   return new Promise((resolve,reject)=>{
     // Never copy account secrets or call private endpoints: the official CLI owns authentication.
-    const browserEnv=browserMode==='iab'?{BROWSER_USE_AVAILABLE_BACKENDS:'iab',CUA_REPL_ENABLED_SURFACES:'browser'}:{};
+    const browserEnv=browserMode==='chrome'?{BROWSER_USE_AVAILABLE_BACKENDS:'chrome',CUA_REPL_ENABLED_SURFACES:'browser'}:{};
     const child=spawn(bin,args,{cwd:dir,env:{...process.env,...browserEnv,NO_COLOR:'1'},detached:true,stdio:['pipe','pipe','pipe']});
     const log=fs.createWriteStream(path.join(dir,'events.jsonl'),{mode:0o600});
     let buf='',last='',error='',settled=false,timedOut=false,usage=null;

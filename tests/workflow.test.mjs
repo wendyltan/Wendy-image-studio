@@ -55,66 +55,32 @@ test('input validation and restricted references',()=>{
   const bad=structuredClone(plan);bad.pages[0].panels[0].references=['02-小林人设/小林人设1.png'];assert.throws(()=>W.validatePlan(bad,brief),/未获准/);
   bad.pages[0].panels[0].references=[];bad.pages[0].panels[0].caption='小林发来消息';assert.throws(()=>W.validatePlan(bad,brief),/小林/);
 });
-test('web image provider is Codex-IAB only and records exact artifacts',()=>{
+test('web image provider uses dedicated Chrome and records exact artifacts',()=>{
   const text=G.chatGptWebImagePrompt({outputFile:'/tmp/result.png',manifestFile:'/tmp/web-generation.json',prompt:'单格测试',referenceFiles:['/tmp/wendi-1.png','/tmp/wendi-2.png']});
   assert.equal(G.WEB_IMAGE_PROVIDER,'chatgpt-web-iab');
-  assert.match(text,/只能使用本任务的 Codex 内嵌浏览器 IAB/);
+  assert.match(text,/只能新建本次任务的专用 Chrome 会话/);
   assert.match(text,/https:\/\/chatgpt\.com\//);
   assert.match(text,/复制到准确路径 \/tmp\/result\.png/);
   assert.match(text,/web-generation\.json/);
   assert.match(text,/禁止调用 image_gen/);
-  assert.match(text,/禁止使用 Chrome、Edge、Safari/);
+  assert.match(text,/禁止接管用户已有标签页/);
   assert.match(text,/不得重复提交/);
   assert.match(text,/authorization 是该操作发生后的持久证据/);
   assert.match(text,/当前同一个回合完成/);
 });
-test('web worker state accepts only a configured thread and durable manifest states',()=>{
-  const config=path.join(temp,'worker.json'),manifest=path.join(temp,'manifest.json');
-  process.env.WENDI_CHATGPT_WEB_WORKER_CONFIG=config;
-  fs.writeFileSync(config,JSON.stringify({threadId:'01a085cd-21a2-7553-b2e3-4acdafd55e55',hostId:'local'}));
-  assert.equal(G.readWebWorkerConfig().threadId,'01a085cd-21a2-7553-b2e3-4acdafd55e55');
-  assert.equal(G.webWorkerStatus().ready,true);
-  fs.writeFileSync(manifest,JSON.stringify({state:'submitted',submitted:true,conversationUrl:'https://chatgpt.com/c/example'}));
-  assert.deepEqual(G.readWebManifest(manifest),{state:'submitted',submitted:true,conversationUrl:'https://chatgpt.com/c/example'});
-  fs.writeFileSync(manifest,JSON.stringify({state:'downloaded',submitted:true,conversationUrl:'https://evil.example/c/example'}));
-  assert.equal(G.readWebManifest(manifest).conversationUrl,null);
-  delete process.env.WENDI_CHATGPT_WEB_WORKER_CONFIG;
-});
-test('web worker queue has a hard timeout and writes termination evidence',async()=>{
-  const logFile=path.join(temp,'queue-timeout.jsonl');
-  await assert.rejects(
-    G.queueOnce(process.execPath,['--input-type=module','-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{cwd:temp,logFile,timeoutMs:40,killGraceMs:20}),
-    error=>error.code==='WEB_WORKER_QUEUE_TIMEOUT',
-  );
-  const event=JSON.parse(fs.readFileSync(logFile,'utf8').trim());
-  assert.equal(event.termination.kind,'timeout');
-});
-test('web worker queue honors cancellation before spawning',async()=>{
-  const controller=new AbortController();controller.abort();
-  await assert.rejects(
-    G.queueOnce(process.execPath,['--version'],{cwd:temp,logFile:path.join(temp,'queue-abort.jsonl'),signal:controller.signal}),
-    error=>error.code==='WEB_WORKER_QUEUE_ABORTED',
-  );
-  assert.equal(fs.existsSync(path.join(temp,'queue-abort.jsonl')),false);
-});
-test('an invalid web worker is rejected before image production starts',async()=>{
-  let project=E.createProject({...brief,idea:'失效网页后台确认测试'});E.planProject(project);project=await done(project.id);
-  const previous=process.env.WENDI_CHATGPT_WEB_WORKER_CONFIG;
-  process.env.WENDI_CHATGPT_WEB_WORKER_CONFIG=path.join(temp,'missing-worker.json');
-  try{assert.throws(()=>E.approvePlan(project,W.digest(project.plan)),/尚未初始化/);}
-  finally{if(previous)process.env.WENDI_CHATGPT_WEB_WORKER_CONFIG=previous;else delete process.env.WENDI_CHATGPT_WEB_WORKER_CONFIG;}
-  project=E.readProject(project.id);assert.equal(project.status,'review');assert.equal(project.samples.length,0);
+test('web executor availability does not depend on an old worker probe',()=>{
+  assert.equal(G.webWorkerStatus().transport,'direct-chrome');assert.equal(G.webWorkerStatus().ready,true);
 });
 test('missing hidden IAB is definite pre-submission no-output evidence',()=>{
   const evidence=B.classifyGenerationEvidence({responseText:'Browser is not available: iab',exitCode:0});
   assert.equal(evidence.outcome,'no_image');
   assert.equal(evidence.connectionRelated,false);
 });
-test('browser generation disables the image API and external browsers at the CLI boundary',async()=>{
+test('browser generation enables Chrome while disabling image API',async()=>{
   const argvFile=path.join(temp,'browser-argv.json'),dir=path.join(temp,'browser-run');process.env.WENDI_TEST_ARGV=argvFile;
-  const output=path.join(temp,'browser-result.png');await B.runCodex({dir,image:true,browserMode:'iab',prompt:`复制到准确路径 ${output}`});delete process.env.WENDI_TEST_ARGV;
+  const output=path.join(temp,'browser-result.png');await B.runCodex({dir,image:true,browserMode:'chrome',prompt:`复制到准确路径 ${output}`});delete process.env.WENDI_TEST_ARGV;
   const argv=JSON.parse(fs.readFileSync(argvFile,'utf8'));
-  assert(argv.includes('image_generation'));assert(argv.includes('browser_use_external'));
+  assert(argv.includes('image_generation'));assert(!argv.includes('browser_use_external'));
   assert.equal(argv.includes('--ignore-user-config'),false);
 });
 test('manual title is retained when a later plan is saved',async()=>{
@@ -276,7 +242,7 @@ test('an unavailable hidden IAB stops before any provider submission',async()=>{
   const marker=path.join(temp,'iab-unavailable');process.env.WENDI_TEST_NO_IMAGE_ONCE=marker;process.env.WENDI_TEST_NO_IMAGE_TEXT='Browser is not available: iab';
   let failed=E.createProject({...brief,idea:'隐藏网页不可用测试'});E.planProject(failed);failed=await done(failed.id);E.approvePlan(failed,W.digest(failed.plan));failed=await done(failed.id);
   assert.equal(failed.pending,null);assert.equal(failed.lastFailure.kind,'browser-unavailable');assert.equal(failed.lastFailure.attempts,0);
-  assert.equal(failed.currentTask.providerInvocations,0);assert.equal(failed.currentTask.status,'failed_no_output');assert.match(failed.message,/没有打开你的浏览器/);
+  assert.equal(failed.currentTask.providerInvocations,0);assert.equal(failed.currentTask.status,'failed_no_output');assert.match(failed.message,/未提交图片请求/);
   delete process.env.WENDI_TEST_NO_IMAGE_ONCE;delete process.env.WENDI_TEST_NO_IMAGE_TEXT;
   E.retryMissingImage(failed,'样张-1');failed=await done(failed.id);assert.equal(failed.currentTask.attempt,1);assert.equal(failed.progress.current,1);assert.equal(failed.progress.total,2);
 });
@@ -434,8 +400,8 @@ test('HTTP service serves built app and blocks foreign writes and unlisted files
     let ready=false;for(let i=0;i<100;i++){try{const r=await fetch(`http://127.0.0.1:${port}/api/health`);if(r.ok){ready=true;break;}}catch{}await new Promise(r=>setTimeout(r,50));}
     assert(ready,output);const base=`http://127.0.0.1:${port}`;
     const boot=await (await fetch(base+'/api/bootstrap')).json();assert(boot.connection.ready);assert(boot.references.length>=20);
-    assert.equal(boot.connection.imageWorker.probe.source,'test-fixture');assert.equal(boot.connection.imageWorker.probe.action,'test-fixture');assert.equal(boot.connection.imageWorker.probe.executionAvailable,false);
-    const refreshed=await (await fetch(base+'/api/connection',{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:'{}'})).json();assert.equal(refreshed.imageWorker.state,'verified-ready');assert.equal(refreshed.imageWorker.probe.executionAvailable,false);
+    assert.equal(boot.connection.imageWorker.transport,'direct-chrome');
+    const refreshed=await (await fetch(base+'/api/connection',{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:'{}'})).json();assert.equal(refreshed.imageWorker.state,'available');assert.equal(refreshed.imageWorker.transport,'direct-chrome');
     const terminalProject=E.createProject({...brief,idea:'HTTP 迟到接单终态一致性测试'});terminalProject.plan=structuredClone(plan);terminalProject.version=2;terminalProject.approved={version:2,hash:W.digest(terminalProject.plan)};terminalProject.samplesApproved=true;terminalProject.status='attention';
     const terminalDir=path.join(E.projectDir(terminalProject.id),'.制作记录','迟到终态'),terminalFile=path.join(E.projectDir(terminalProject.id),'v2','素材','终态占位.png'),terminalTaskId='http-late-terminal-task',terminalRequestId=crypto.randomUUID(),terminalAcceptedAt='2026-09-11T09:36:41+08:00';fs.mkdirSync(terminalDir,{recursive:true});fs.mkdirSync(path.dirname(terminalFile),{recursive:true});fs.writeFileSync(terminalFile,'fixture placeholder');
     fs.writeFileSync(path.join(terminalDir,'request.json'),JSON.stringify({schemaVersion:2,provider:G.WEB_IMAGE_PROVIDER,taskId:terminalTaskId,projectId:terminalProject.id,projectVersion:2,target:'第1页-第1格'}));fs.writeFileSync(path.join(terminalDir,'worker-request.json'),JSON.stringify({schemaVersion:2,provider:G.WEB_IMAGE_PROVIDER,requestId:terminalRequestId,projectId:terminalProject.id,projectVersion:2}));fs.writeFileSync(path.join(terminalDir,'web-generation.json'),JSON.stringify({provider:G.WEB_IMAGE_PROVIDER,state:'failed',accepted:true,requestId:terminalRequestId,acceptedAt:terminalAcceptedAt,submitted:false,errorCode:'IAB_UNAVAILABLE',error:'Codex IAB unavailable'}));

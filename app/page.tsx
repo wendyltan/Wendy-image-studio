@@ -363,7 +363,6 @@ export default function Studio() {
     [effort, setEffort] = useState('medium'),
     [preset, setPreset] = useState('balanced');
   const [waiting, setWaiting] = useState(false),
-    [workerRefreshing, setWorkerRefreshing] = useState(false),
     [error, setError] = useState(''),
     [toast, setToast] = useState(''),
     [note, setNote] = useState(''),
@@ -436,24 +435,6 @@ export default function Studio() {
       setError('');
     } catch (e) {
       setError((e as Error).message);
-    }
-  }, []);
-  const refreshWorker = useCallback(async () => {
-    setWorkerRefreshing(true);
-    try {
-      const connection = await request<Bootstrap['connection']>(
-        '/api/connection',
-        {},
-      );
-      setData((currentData) =>
-        currentData ? { ...currentData, connection } : currentData,
-      );
-      setError('');
-      setToast('已刷新已保存的网页生图后台状态；没有执行新的隔离探针。');
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setWorkerRefreshing(false);
     }
   }, []);
   useEffect(() => {
@@ -1010,43 +991,7 @@ export default function Studio() {
             </button>
           ))}
         </div>
-        <div className="sidebar-foot">
-          <span
-            className={
-              'connection-dot ' +
-              (data?.connection.ready && data.connection.imageWorker?.ready
-                ? 'on'
-                : '')
-            }
-          />
-          <span>
-            {!data?.connection.ready
-              ? '连接需要查看'
-              : data.connection.imageWorker?.ready
-                ? '创作连接已就绪'
-                : '生图后台需要查看'}
-            <small>
-              {data?.connection.imageWorker?.message || '作品只保存在这台电脑'}
-            </small>
-          </span>
-          <button
-            title="刷新已保存的网页生图后台状态（不执行新探针）"
-            aria-label="刷新已保存的网页生图后台状态（不执行新探针）"
-            disabled={workerRefreshing}
-            onClick={() => void refreshWorker()}
-          >
-            {workerRefreshing ? (
-              <LoaderCircle className="spin" size={14} />
-            ) : (
-              <RotateCcw size={14} />
-            )}
-          </button>
-          <small>
-            {data?.connection.imageWorker?.probe?.executionAvailable
-              ? '可执行新探针'
-              : '此按钮只刷新已保存状态；新探针需由隔离后台实际写入'}
-          </small>
-        </div>
+        <div className="sidebar-foot"><small>作品保存在这台电脑</small></div>
       </aside>
       <main>
         <header className="topbar">

@@ -96,7 +96,7 @@ export function job(p,phase,fn){
       p.queueJob={id:queued.id,status:'running',phase,queuedAt:queued.queuedAt,startedAt:claimed.startedAt};p.status=phase;p.progress={...p.progress,phase,startedAt:claimed.startedAt,completedAt:null};saveProject(p);
       beat=setInterval(()=>jobStore.heartbeat(queued.id,queueOwner),5000);
       try{await fn(controller.signal);jobStore.finish(queued.id,queueOwner,'completed');}
-      catch(e){const preserveWorkerState=e.code==='WEB_WORKER_NOT_ACCEPTED'&&p.currentTask?.status==='not_accepted'&&p.currentTask.errorCode==='WEB_WORKER_NOT_ACCEPTED';p.status=controller.signal.aborted||e.code==='LOW_QUOTA'?'paused':'attention';if(preserveWorkerState){p.error=p.message;}else{p.error=String(e.message||e).slice(0,2000);p.message=p.error;}p.progress={...p.progress,completedAt:new Date().toISOString()};if(p.currentTask?.status==='running')finishTask(p,p.currentTask,p.status==='paused'?'paused':'failed',{error:p.error});saveProject(p);jobStore.finish(queued.id,queueOwner,controller.signal.aborted?'paused':'failed',{error:p.error});}
+      catch(e){p.status=controller.signal.aborted||e.code==='LOW_QUOTA'?'paused':'attention';p.error=String(e.message||e).slice(0,2000);p.message=p.error;p.progress={...p.progress,completedAt:new Date().toISOString()};if(p.currentTask?.status==='running')finishTask(p,p.currentTask,p.status==='paused'?'paused':'failed',{error:p.error});saveProject(p);jobStore.finish(queued.id,queueOwner,controller.signal.aborted?'paused':'failed',{error:p.error});}
     }finally{if(beat)clearInterval(beat);p.queueJob=null;try{saveProject(p);}finally{active.delete(p.id);runningProjects.delete(p.id);}}
   };
   queueTail=queueTail.catch(()=>{}).then(run);return p;
@@ -210,8 +210,8 @@ function definiteImageFailure(pending,extra=''){
   // that the provider produced no image. Preserve it for recovery instead.
   if(manifest?.submitted)return null;
   if(manifest?.state==='failed'){
-    const unavailable=/(?:IAB|Browser is not available)/i.test(String(manifest.errorCode||manifest.error||''));
-    return {kind:unavailable?'browser-unavailable':'no-output',definiteNoOutput:true,key:pending.key,attempts:0,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString()};
+    const unavailable=/(?:IAB|WEB_WORKER_ARCHIVED|BROWSER_UNAVAILABLE|CHATGPT_LOGIN_REQUIRED|Browser is not available)/i.test(String(manifest.errorCode||manifest.error||''));
+    return {kind:unavailable?'browser-unavailable':'no-output',definiteNoOutput:true,key:pending.key,attempts:0,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString(),...(manifest.error?{message:manifest.error}: {})};
   }
   if(NETWORK_FAILURE.test(combined)||classified.connectionRelated)return null;
   const manifestError=[manifest?.errorCode,manifest?.error].filter(Boolean).join(' ');
@@ -220,8 +220,7 @@ function definiteImageFailure(pending,extra=''){
   const attempts=Math.max(1,(evidence.eventText.match(/image generation failed/gi)||[]).length);
   return {kind:'no-output',definiteNoOutput:true,key:pending.key,attempts,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString()};
 }
-function failureMessage(failure){const usage=failure.inputTokens?`本次后台处理记录约 ${failure.inputTokens.toLocaleString('zh-CN')} 输入 tokens；`:'';const action=String(failure.key||'').includes('样张')?'重试当前样张':'重试当前图片';if(failure.kind==='browser-unavailable')return `Codex 网页后台暂不可用，没有打开你的浏览器，也没有提交图片请求。${usage}当前节点已经保存；Codex 内嵌浏览器可用后点击“${action}”，只会重试这一张。`;return `${failure.kind==='network'?'生图服务连接失败':'本次生图未完成'}：已发起 ${failure.attempts} 次图片请求，但没有取得图片。${usage}自动重试已停止，上一张样张和当前节点都已保存。实际订阅余额以页面顶部为准；网络稳定后点击“${action}”，只会重试这一张。`;}
-function workerNotAcceptedMessage(){return 'Codex CLI 已排队，但网页生图后台尚未确认接单。本机等待已停止，当前请求记录和原图找回入口均保留；不会自动重复提交，也不能据此确认没有生图。';}
+function failureMessage(failure){if(failure.message)return failure.message;const usage=failure.inputTokens?`本次后台处理记录约 ${failure.inputTokens.toLocaleString('zh-CN')} 输入 tokens；`:'';const action=String(failure.key||'').includes('样张')?'重试当前样张':'重试当前图片';if(failure.kind==='browser-unavailable')return `专用生图页面暂不可用，本次未提交图片请求。${usage}当前节点已经保存；Chrome 已连接且 ChatGPT 登录后点击“${action}”，只会重试这一张。`;return `${failure.kind==='network'?'生图服务连接失败':'本次生图未完成'}：已发起 ${failure.attempts} 次图片请求，但没有取得图片。${usage}自动重试已停止，上一张样张和当前节点都已保存。实际订阅余额以页面顶部为准；网络稳定后点击“${action}”，只会重试这一张。`;}
 function sampleRepairCount(p,index){
   p.sampleRepairCounts=Array.isArray(p.sampleRepairCounts)?p.sampleRepairCounts:[0,0];
   const parsed=Number(/自动修订(\d+)/.exec(p.samples[index]?.key||'')?.[1])||0;
@@ -409,14 +408,15 @@ async function generate(p,key,prompt,refnames,signal,prior=null,verify=true,qaKi
   try{
     if(process.env.WENDI_TEST_PLAN_FILE){
       task.providerInvocations=1;saveProject(p);
-      made=await runCodex({dir,signal,image:true,browserMode:'iab',writableDirs:[projectDir(p.id)],...modelArgs(p),
+      made=await runCodex({dir,signal,image:true,browserMode:'chrome',writableDirs:[projectDir(p.id)],...modelArgs(p),
         prompt:chatGptWebImagePrompt({outputFile:file,manifestFile,prompt,referenceFiles:inputFiles,editTarget:prior,conversationUrl,capsule})});
     }else{
-      made=await dispatchChatGptWebJob({codexBin:findCodex(),dir,outputFile:file,prompt,referenceFiles:inputFiles,editTarget:prior,conversationUrl,capsule,signal});
+      made=await dispatchChatGptWebJob({codexBin:findCodex(),dir,outputFile:file,prompt,referenceFiles:inputFiles,editTarget:prior,conversationUrl,capsule,signal,...modelArgs(p)});
     }
     addUsage(p,made.usage);
   }catch(e){failure=e;}
   const webManifest=readWebManifest(manifestFile)||failure?.webManifest||made?.manifest||null;
+  if(!process.env.WENDI_TEST_PLAN_FILE&&!matchingPendingManifest(pending)){finishTask(p,task,'unknown_result',{errorCode:'REQUEST_IDENTITY_MISMATCH'});saveProject(p);throw new Error('执行记录与本次图片请求不匹配，原文件已保留，不能自动采用或重试。');}
   task.providerInvocations=webManifest?.submitted?1:(process.env.WENDI_TEST_PLAN_FILE?task.providerInvocations:0);saveProject(p);
   // A transport error after download must not trigger a second image request.
   // Prefer the explicit output path, then a path explicitly reported by this
@@ -428,11 +428,6 @@ async function generate(p,key,prompt,refnames,signal,prior=null,verify=true,qaKi
   else if(candidates.length===1)persisted=await persistImage(candidates[0],file);
   if(!persisted){
     const candidateNames=candidates.map(candidate=>path.basename(candidate));
-    if(failure?.code==='WEB_WORKER_NOT_ACCEPTED'&&webManifest?.submitted!==true){
-      writeRunResult(dir,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:task.id,attempt:task.attempt,endedAt:new Date().toISOString(),outcome:'worker_not_accepted',acceptanceState:webManifest?.state||'queued',requestId:webManifest?.requestId||null,diagnostics:generationDiagnosticSummary(evidence),candidateCount:candidateNames.length,candidateNames,error:String(failure.message||failure).slice(0,500)});
-      task.providerInvocations=0;p.status='attention';p.message=workerNotAcceptedMessage();p.error=p.message;
-      finishTask(p,task,'not_accepted',{errorCode:'WEB_WORKER_NOT_ACCEPTED',webState:webManifest?.state||'queued'});saveProject(p);throw failure;
-    }
     writeRunResult(dir,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:task.id,attempt:task.attempt,endedAt:new Date().toISOString(),outcome:'artifact_not_located',diagnostics:generationDiagnosticSummary(evidence),candidateCount:candidateNames.length,candidateNames,error:failure?String(failure.message||failure).slice(0,500):null});
     const known=definiteImageFailure(pending,[made?.text,failure?.message,webManifest?.errorCode,webManifest?.error].filter(Boolean).join('\n'));
     if(known){if(known.kind==='browser-unavailable')task.providerInvocations=0;p.pending=null;p.lastFailure={...known,taskId:task.id};finishTask(p,task,'failed_no_output',{errorCode:known.kind});saveProject(p);const error=new Error(failureMessage(known));error.code='IMAGE_NO_OUTPUT';throw error;}
