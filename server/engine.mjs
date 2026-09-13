@@ -11,6 +11,7 @@ fs.mkdirSync(DATA,{recursive:true});
 const jobStore=new JobStore(DATA),queueOwner=`${process.pid}:${crypto.randomUUID()}`;let queueTail=Promise.resolve();
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 const ID=/^[a-f0-9-]{36}$/;
+const SCREEN_LOCATION_SCHEMA={type:'object',additionalProperties:false,required:['corners','confidence','screenType'],properties:{corners:{type:'array',minItems:4,maxItems:4,items:{type:'object',additionalProperties:false,required:['x','y'],properties:{x:{type:'number'},y:{type:'number'}}}},confidence:{type:'number',minimum:0,maximum:1},screenType:{type:'string',enum:['phone','computer','car','other']}}};
 // Only phrases that explicitly say there was no usable image belong here. A
 // connection error by itself is ambiguous: the provider can finish an image
 // before the local copy step fails, so it must remain recoverable.
@@ -18,7 +19,30 @@ const DEFINITE_NO_IMAGE=/(?:未能生成(?:任何)?(?:替代品|图片)?|没有�
 const NETWORK_FAILURE=/(?:network|connection|连接|网络|websocket)/i;
 const IAB_UNAVAILABLE=/(?:Browser is not available:\s*iab|隐藏\s*IAB.*不可用)/i;
 export function projectDir(id){if(!ID.test(id))throw new Error('作品不存在');return inside(DATA,id);}
-export function readProject(id){const p=path.join(projectDir(id),'project.json');if(!fs.existsSync(p))throw new Error('作品不存在');return JSON.parse(fs.readFileSync(p,'utf8'));}
+function inferredModelAt(p,at){
+  const history=(p.modelHistory||[]).filter(item=>Date.parse(item.at)<=at).sort((a,b)=>Date.parse(a.at)-Date.parse(b.at));
+  if(history.length)return history.at(-1).to||{};
+  const first=(p.modelHistory||[]).slice().sort((a,b)=>Date.parse(a.at)-Date.parse(b.at))[0]?.from;
+  return first?.model?first:{model:'历史模型未记录',reasoningEffort:'unknown'};
+}
+function hydrateMetricBreakdown(p){
+  p.metrics=p.metrics||{inputTokens:0,cachedInputTokens:0,outputTokens:0,reasoningOutputTokens:0,totalRuns:0};
+  if(Array.isArray(p.metrics.byModel))return p;
+  const groups=new Map(),records=path.join(projectDir(p.id),'.制作记录'),runs=[];
+  if(fs.existsSync(records))for(const name of fs.readdirSync(records)){
+    const dir=path.join(records,name),events=path.join(dir,'events.jsonl');if(!fs.existsSync(events))continue;
+    let usage=null;for(const line of fs.readFileSync(events,'utf8').split('\n')){try{const event=JSON.parse(line);if(event.type==='turn.completed'&&event.usage)usage=event.usage;}catch{}}
+    if(!usage)continue;let request=null;try{request=JSON.parse(fs.readFileSync(path.join(dir,'request.json'),'utf8'));}catch{}
+    const started=Number(name.split('-')[0])||fs.statSync(dir).birthtimeMs||fs.statSync(dir).mtimeMs,selected=request?.model?{model:request.model,reasoningEffort:request.reasoningEffort}:inferredModelAt(p,started);runs.push({started,usage,selected});
+  }
+  runs.sort((a,b)=>a.started-b.started);const total=Number(p.metrics.totalRuns)||0,selectedRuns=total&&runs.length>total?runs.slice(-total):runs;let attributed=0;
+  for(const {usage,selected} of selectedRuns){
+    const model=selected.model||'历史模型未记录',effort=selected.reasoningEffort||'unknown',key=`${model}\u0000${effort}`,current=groups.get(key)||{model,reasoningEffort:effort,runs:0,inputTokens:0,cachedInputTokens:0,outputTokens:0,reasoningOutputTokens:0};
+    current.runs++;current.inputTokens+=Number(usage.input_tokens)||0;current.cachedInputTokens+=Number(usage.cached_input_tokens)||0;current.outputTokens+=Number(usage.output_tokens)||0;current.reasoningOutputTokens+=Number(usage.reasoning_output_tokens)||0;groups.set(key,current);attributed++;
+  }
+  p.metrics.byModel=[...groups.values()].sort((a,b)=>b.runs-a.runs);p.metrics.unattributedRuns=Math.max(0,(Number(p.metrics.totalRuns)||0)-attributed);return p;
+}
+export function readProject(id){const file=path.join(projectDir(id),'project.json');if(!fs.existsSync(file))throw new Error('作品不存在');return hydrateMetricBreakdown(JSON.parse(fs.readFileSync(file,'utf8')));}
 export function syncRunningProject(id,patch){const running=runningProjects.get(id);if(!running)return;const brief=patch.brief?{...running.brief,...patch.brief}:running.brief;Object.assign(running,patch);running.brief=brief;}
 export function saveProject(p){
   const file=path.join(projectDir(p.id),'project.json');
@@ -82,7 +106,7 @@ export function createProject(brief){
   if(typeof brief.idea!=='string'||brief.idea.trim().length<4||brief.idea.length>12000)throw new Error('请用至少四个字描述想画的故事。');
   if(!Number.isInteger(brief.pageCount)||brief.pageCount<1||brief.pageCount>12)throw new Error('每篇请选择1—12页。');
   const clean={idea:brief.idea.trim(),pageCount:brief.pageCount,special:String(brief.special||'').slice(0,6000),allowXiaolin:brief.allowXiaolin===true,tangyuan:['按剧情','自然出现','不出现'].includes(brief.tangyuan)?brief.tangyuan:'按剧情',model:String(brief.model||''),reasoningEffort:String(brief.reasoningEffort||'medium'),workflowPreset:['quick','balanced','careful'].includes(brief.workflowPreset)?brief.workflowPreset:'balanced'};
-  const p={id:crypto.randomUUID(),schemaVersion:3,revision:0,title:clean.idea.slice(0,20),titleLocked:false,brief:clean,status:'draft',message:'需求已保存',createdAt:new Date().toISOString(),version:0,plan:null,approved:null,samplesApproved:false,samples:[],sampleRepairCounts:[0,0],lastFailure:null,currentTask:null,tasks:[],panels:{},pages:[],history:[],revisionNotes:[],accepted:false,progress:{phase:'draft',current:0,total:1,unit:'步骤',startedAt:null,completedAt:null},metrics:{inputTokens:0,cachedInputTokens:0,outputTokens:0,reasoningOutputTokens:0,totalRuns:0}};saveProject(p);return p;
+  const p={id:crypto.randomUUID(),schemaVersion:3,revision:0,title:clean.idea.slice(0,20),titleLocked:false,brief:clean,status:'draft',message:'需求已保存',createdAt:new Date().toISOString(),version:0,plan:null,approved:null,samplesApproved:false,samples:[],sampleRepairCounts:[0,0],lastFailure:null,currentTask:null,tasks:[],panels:{},pages:[],history:[],revisionNotes:[],accepted:false,progress:{phase:'draft',current:0,total:1,unit:'步骤',startedAt:null,completedAt:null,stages:[],stageSerial:0},metrics:{inputTokens:0,cachedInputTokens:0,outputTokens:0,reasoningOutputTokens:0,totalRuns:0,byModel:[],unattributedRuns:0,refreshSerial:0}};saveProject(p);return p;
 }
 export function job(p,phase,fn){
   if(active.has(p.id))throw new Error('这篇正在制作，请等待或先暂停。');
@@ -95,15 +119,28 @@ export function job(p,phase,fn){
       if(!claimed){jobStore.cancel(queued.id,'paused',{reason:'cancelled_before_start'});p.status='paused';p.message='已暂停，尚未开始这一步。';p.progress={...p.progress,completedAt:new Date().toISOString()};return;}
       p.queueJob={id:queued.id,status:'running',phase,queuedAt:queued.queuedAt,startedAt:claimed.startedAt};p.status=phase;p.progress={...p.progress,phase,startedAt:claimed.startedAt,completedAt:null};saveProject(p);
       beat=setInterval(()=>jobStore.heartbeat(queued.id,queueOwner),5000);
-      try{await fn(controller.signal);jobStore.finish(queued.id,queueOwner,'completed');}
-      catch(e){p.status=controller.signal.aborted||e.code==='LOW_QUOTA'?'paused':'attention';p.error=String(e.message||e).slice(0,2000);p.message=p.error;p.progress={...p.progress,completedAt:new Date().toISOString()};if(p.currentTask?.status==='running')finishTask(p,p.currentTask,p.status==='paused'?'paused':'failed',{error:p.error});saveProject(p);jobStore.finish(queued.id,queueOwner,controller.signal.aborted?'paused':'failed',{error:p.error});}
+      try{await fn(controller.signal);finishProgressStage(p,'completed');jobStore.finish(queued.id,queueOwner,'completed');}
+      catch(e){p.status=controller.signal.aborted||e.code==='LOW_QUOTA'?'paused':'attention';p.error=String(e.message||e).slice(0,2000);p.message=p.error;p.progress={...p.progress,completedAt:new Date().toISOString()};finishProgressStage(p,p.status==='paused'?'paused':'failed');if(p.currentTask?.status==='running')finishTask(p,p.currentTask,p.status==='paused'?'paused':'failed',{error:p.error});saveProject(p);jobStore.finish(queued.id,queueOwner,controller.signal.aborted?'paused':'failed',{error:p.error});}
     }finally{if(beat)clearInterval(beat);p.queueJob=null;try{saveProject(p);}finally{active.delete(p.id);runningProjects.delete(p.id);}}
   };
   queueTail=queueTail.catch(()=>{}).then(run);return p;
 }
 function checkpoint(signal){if(signal.aborted)throw new Error('已暂停');}
-function activity(p,message,current=null,total=null,unit=null){p.message=message;p.progress={...p.progress,phase:p.status,current:current??p.progress?.current??0,total:total??p.progress?.total??1,unit:unit??p.progress?.unit??'步骤'};if(p.currentTask?.status==='running')p.currentTask.lastProgressAt=new Date().toISOString();saveProject(p);}
-function addUsage(p,usage){if(!usage)return;p.metrics=p.metrics||{};for(const key of ['input_tokens','cached_input_tokens','output_tokens','reasoning_output_tokens'])p.metrics[{input_tokens:'inputTokens',cached_input_tokens:'cachedInputTokens',output_tokens:'outputTokens',reasoning_output_tokens:'reasoningOutputTokens'}[key]]=(p.metrics[{input_tokens:'inputTokens',cached_input_tokens:'cachedInputTokens',output_tokens:'outputTokens',reasoning_output_tokens:'reasoningOutputTokens'}[key]]||0)+(Number(usage[key])||0);p.metrics.totalRuns=(p.metrics.totalRuns||0)+1;}
+function stageTone(message){if(/失败|中断|需要调整|没有取得/.test(message))return 'error';if(/暂停|等待|准备/.test(message))return 'waiting';if(/绘制|生成|上传|提交/.test(message))return 'creating';if(/排版|文字|合成/.test(message))return 'composing';if(/核对|校对|复核|检查/.test(message))return 'reviewing';if(/完成|备好|保存|恢复/.test(message))return 'complete';return 'working';}
+function finishProgressStage(p,state='completed'){
+  const progress=p.progress||{};const current=progress.activeStage;if(!current)return;
+  const endedAt=new Date().toISOString(),stage={...current,state,completedAt:endedAt,durationMs:Math.max(0,Date.parse(endedAt)-Date.parse(current.startedAt))};
+  progress.stages=[...(progress.stages||[]),stage].slice(-24);progress.stageSerial=(Number(progress.stageSerial)||0)+1;progress.activeStage=null;p.progress=progress;
+}
+function activity(p,message,current=null,total=null,unit=null){
+  const now=new Date().toISOString(),progress=p.progress||{};
+  if(progress.activeStage?.label!==message){finishProgressStage(p,'completed');progress.activeStage={id:crypto.randomUUID(),label:message,tone:stageTone(message),state:'running',startedAt:now};}
+  p.message=message;p.progress={...progress,phase:p.status,current:current??progress.current??0,total:total??progress.total??1,unit:unit??progress.unit??'步骤'};if(p.currentTask?.status==='running')p.currentTask.lastProgressAt=now;saveProject(p);
+}
+function addUsage(p,usage,{model=p.brief?.model||'默认模型',reasoningEffort=p.brief?.reasoningEffort||'unknown'}={}){
+  if(!usage)return;hydrateMetricBreakdown(p);p.metrics=p.metrics||{};for(const key of ['input_tokens','cached_input_tokens','output_tokens','reasoning_output_tokens'])p.metrics[{input_tokens:'inputTokens',cached_input_tokens:'cachedInputTokens',output_tokens:'outputTokens',reasoning_output_tokens:'reasoningOutputTokens'}[key]]=(p.metrics[{input_tokens:'inputTokens',cached_input_tokens:'cachedInputTokens',output_tokens:'outputTokens',reasoning_output_tokens:'reasoningOutputTokens'}[key]]||0)+(Number(usage[key])||0);p.metrics.totalRuns=(p.metrics.totalRuns||0)+1;
+  p.metrics.byModel=Array.isArray(p.metrics.byModel)?p.metrics.byModel:[];let row=p.metrics.byModel.find(item=>item.model===model&&item.reasoningEffort===reasoningEffort);if(!row){row={model,reasoningEffort,runs:0,inputTokens:0,cachedInputTokens:0,outputTokens:0,reasoningOutputTokens:0};p.metrics.byModel.push(row);}row.runs++;row.inputTokens+=Number(usage.input_tokens)||0;row.cachedInputTokens+=Number(usage.cached_input_tokens)||0;row.outputTokens+=Number(usage.output_tokens)||0;row.reasoningOutputTokens+=Number(usage.reasoning_output_tokens)||0;p.metrics.refreshSerial=(Number(p.metrics.refreshSerial)||0)+1;
+}
 function modelArgs(p,effort=p.brief.reasoningEffort){return {model:p.brief.model||null,reasoningEffort:effort};}
 function promptHash(value){return crypto.createHash('sha256').update(String(value),'utf8').digest('hex');}
 // Panel plans are authored for a whole comic page, while this call produces one
@@ -302,7 +339,7 @@ export function planProject(p,revision=''){
   if(revision && revision.length>6000)throw new Error('修改说明过长。');
   return job(p,'planning',async signal=>{
     activity(p,revision?'正在把修改同步到逐页方案和连续性台账…':'正在构思故事、逐页分镜和文案…');
-    const plan=await runCodex({prompt:plannerPrompt(p.brief,p.plan,revision),schema:PLAN_SCHEMA,dir:runDir(p,'故事方案'),images:FACE.map(x=>path.join(REFS,x)),signal,...modelArgs(p)});addUsage(p,plan.__usage);
+    const plan=await runCodex({prompt:plannerPrompt(p.brief,p.plan,revision),schema:PLAN_SCHEMA,dir:runDir(p,'故事方案'),images:FACE.map(x=>path.join(REFS,x)),signal,...modelArgs(p)});addUsage(p,plan.__usage,modelArgs(p));
     checkpoint(signal);validatePlan(plan,p.brief);
     if(p.plan)p.history.push({version:p.version,plan:p.plan,approved:p.approved,samples:p.samples,pages:p.pages,panels:p.panels,revisionNotes:p.revisionNotes,pending:p.pending?structuredClone(p.pending):null,currentTask:p.currentTask?structuredClone(p.currentTask):null,lastFailure:p.lastFailure?structuredClone(p.lastFailure):null,artifacts:structuredClone(p.artifacts||[])});
     archivePlanRevisionState(p);p.version++;p.plan=plan;if(!p.titleLocked)p.title=plan.title;p.approved=null;p.samplesApproved=false;p.samples=[];p.sampleRepairCounts=[0,0];p.lastFailure=null;p.panels={};p.pages=[];p.artifacts=[];p.revisionNotes=[];p.storyQA=null;p.accepted=false;p.bundle=null;
@@ -344,7 +381,7 @@ function imageRefs(p,refnames){ensureVersionFiles(p);return [...new Set([...FACE
 async function qa(p,file,prompt,refs,signal,kind='原始分镜'){
   const sampleRule=kind==='方向样张'?'本次只是锁定人物与场景方向的样张，标准2:3或3:4竖幅都可接受；不要仅因它是2:3竖幅而判失败或要求再次生图。正式漫画页才要求统一3:4。':'';
   const result=await runCodex({dir:runDir(p,'画面校对'),schema:QA_SCHEMA,images:[file,...refs],signal,...modelArgs(p,'low'),
-    prompt:`你是漫画验收编辑。只看附件检查，不使用工具，不修改文件。${kind.startsWith('全套')?'附件是按页码顺序排列的全套成稿，后面才是两张固定人设参考。检查整套跨页连续性，不把不同页的合理动作差异当成人设变化。':'第一张是待检'+kind+'，其他是固定身份或环境参考。'}逐项检查：${CHECKS.join('；')}；身份以两张温蒂人设为准，检查五官发髻、双肩两臂两手每手五指(只检查可见部分，合理遮挡不算缺失)、两腿两脚；不能无故正视镜头，禁止错误角色；没有明显颗粒彩噪或脏污。${kind==='原始分镜'?'原始分镜不能有中文或字幕，后期会加。':'检查所有中文完整准确、无乱码、紧凑文字框不挡主体、页码一致。'}检查比例构图、头发四肢安全区。不要把合理的风格差别或被遮挡的肢体当成问题。${sampleRule}每个问题必须返回issueDetails：category只能是 identity/anatomy/text/layout/aspect_ratio/safe_area/noise/continuity/uncertain；severity为 blocking/review/suggestion；repairAction为 regenerate/reletter/recompose/review。冻结要求：${prompt}\n返回pass、summary、issues、issueDetails及精准的repairPrompt。`});addUsage(p,result.__usage);return normalizeQA(result);
+    prompt:`你是漫画验收编辑。只看附件检查，不使用工具，不修改文件。${kind.startsWith('全套')?'附件是按页码顺序排列的全套成稿，后面才是两张固定人设参考。检查整套跨页连续性，不把不同页的合理动作差异当成人设变化。':'第一张是待检'+kind+'，其他是固定身份或环境参考。'}逐项检查：${CHECKS.join('；')}；身份以两张温蒂人设为准，检查五官发髻、双肩两臂两手每手五指(只检查可见部分，合理遮挡不算缺失)、两腿两脚；不能无故正视镜头，禁止错误角色；没有明显颗粒彩噪或脏污。${kind==='原始分镜'?'原始分镜不能有中文或字幕，后期会加。':'检查所有中文完整准确、无乱码、紧凑文字框不挡主体、页码一致。'}检查比例构图、头发四肢安全区。不要把合理的风格差别或被遮挡的肢体当成问题。${sampleRule}每个问题必须返回issueDetails：category只能是 identity/anatomy/text/layout/aspect_ratio/safe_area/noise/continuity/uncertain；severity为 blocking/review/suggestion；repairAction为 regenerate/reletter/recompose/review。冻结要求：${prompt}\n返回pass、summary、issues、issueDetails及精准的repairPrompt。`});addUsage(p,result.__usage,modelArgs(p,'low'));return normalizeQA(result);
 }
 function generatedCandidates(dir,after){
   if(!dir)return [];
@@ -402,8 +439,12 @@ function attributableCandidates(pending){
 async function generate(p,key,prompt,refnames,signal,prior=null,verify=true,qaKind='原始分镜',attempt=1){
   checkpoint(signal);await protectQuota(p);checkpoint(signal);const refs=imageRefs(p,refnames);const folder=path.join(versionDir(p),'素材');fs.mkdirSync(folder,{recursive:true});
   if(p.pending)throw new Error('当前图片任务尚未结束，请先检查已有原图。');
-  let file=path.join(folder,`${key}-${Date.now()}.png`);const dir=runDir(p,key);const inputFiles=prior?[prior,...refs]:refs;const telemetry=promptTelemetry(prompt,refs,{requestedReferenceCount:refnames.length,source:prior?'edit':'generate'});const task=beginTask(p,'image',key,{attempt,provider:WEB_IMAGE_PROVIDER,providerInvocationLimit:1,providerInvocations:0,source:prior?'edit':'generate',telemetry});const pending={key,file,dir,prompt,refs:refnames,inputFiles,prior,provider:WEB_IMAGE_PROVIDER,taskId:task.id,projectId:p.id,projectVersion:p.version,telemetry,at:new Date().toISOString()};
+  let file=path.join(folder,`${key}-${Date.now()}.png`);const dir=runDir(p,key),sourceFiles=prior?[prior,...refs]:refs,uploadSpec=path.join(dir,'上传素材.json');fs.mkdirSync(dir,{recursive:true});
+  activity(p,`正在整理并压缩${sourceFiles.length}个上传素材…`);jsonWrite(uploadSpec,{files:sourceFiles,outputDir:path.join(dir,'上传素材')});
+  const prepared=JSON.parse(await pythonRun(['prepare-web',uploadSpec])),inputFiles=prepared.map(item=>item.file);checkpoint(signal);
+  const telemetry=promptTelemetry(prompt,refs,{requestedReferenceCount:refnames.length,source:prior?'edit':'generate',uploadOriginalBytes:sourceFiles.reduce((n,item)=>n+fs.statSync(item).size,0),uploadPreparedBytes:prepared.reduce((n,item)=>n+Number(item.sizeBytes||0),0),optimizedAttachmentCount:prepared.filter(item=>item.optimized).length});const task=beginTask(p,'image',key,{attempt,provider:WEB_IMAGE_PROVIDER,providerInvocationLimit:1,providerInvocations:0,source:prior?'edit':'generate',telemetry});const pending={key,file,dir,prompt,refs:refnames,inputFiles,sourceFiles,prior,provider:WEB_IMAGE_PROVIDER,taskId:task.id,projectId:p.id,projectVersion:p.version,telemetry,at:new Date().toISOString()};
   writeRunRequest(dir,p,task,pending);p.pending=pending;p.lastFailure=null;saveProject(p);
+  activity(p,`正在打开专用生图页面并上传${inputFiles.length}个素材…`);
   let failure,made=null;const manifestFile=path.join(dir,'web-generation.json'),conversationUrl=previousConversation(prior),capsule=fs.readFileSync(path.join(versionDir(p),'制作提示词胶囊.txt'),'utf8');
   try{
     if(process.env.WENDI_TEST_PLAN_FILE){
@@ -412,12 +453,13 @@ async function generate(p,key,prompt,refnames,signal,prior=null,verify=true,qaKi
         prompt:chatGptWebImagePrompt({outputFile:file,manifestFile,prompt,referenceFiles:inputFiles,editTarget:prior,conversationUrl,capsule})});
     }else{
       made=await dispatchChatGptWebJob({codexBin:findCodex(),dir,outputFile:file,prompt,referenceFiles:inputFiles,editTarget:prior,conversationUrl,capsule,signal,...modelArgs(p)});
-    }
-    addUsage(p,made.usage);
+  }
+  addUsage(p,made.usage,modelArgs(p));
   }catch(e){failure=e;}
   const webManifest=readWebManifest(manifestFile)||failure?.webManifest||made?.manifest||null;
+  activity(p,'正在核对网页执行结果并保存原图…');
   if(!process.env.WENDI_TEST_PLAN_FILE&&!matchingPendingManifest(pending)){finishTask(p,task,'unknown_result',{errorCode:'REQUEST_IDENTITY_MISMATCH'});saveProject(p);throw new Error('执行记录与本次图片请求不匹配，原文件已保留，不能自动采用或重试。');}
-  task.providerInvocations=webManifest?.submitted?1:(process.env.WENDI_TEST_PLAN_FILE?task.providerInvocations:0);saveProject(p);
+  task.providerInvocations=webManifest?.submitted?1:(process.env.WENDI_TEST_PLAN_FILE?task.providerInvocations:0);task.webTimings=webManifest?{createdAt:webManifest.createdAt||null,acceptedAt:webManifest.acceptedAt||null,readyAt:webManifest.readyAt||null,submittedAt:webManifest.submittedAt||null,downloadedAt:webManifest.downloadedAt||null}:null;saveProject(p);
   // A transport error after download must not trigger a second image request.
   // Prefer the explicit output path, then a path explicitly reported by this
   // browser run. Legacy tasks alone retain the old generated_images fallback.
@@ -555,13 +597,16 @@ async function addScreen(p,key,panel,signal){
   if(!panel.screenText || p.panels[key].screenApplied)return;
   const record=p.panels[key];const input=inside(projectDir(p.id),record.rawFile||record.file);
   const dir=runDir(p,'内屏文字排版');const output=path.join(dir,'内屏排版.png');
-  activity(p,`正在把第 ${key.split('-')[0]} 页的文字排进玻璃内屏…`);
-  const composed=await runCodex({dir,signal,image:true,images:[input],...modelArgs(p,'low'),
-    prompt:`执行已经授权的确定性漫画中文后期排版。这不是生图任务，不触发任何新的图片生成，不调用浏览器，不覆盖原图。原图 ${input} 已附上，请视觉检查原始尺寸，识别手机或车机的玻璃内屏四角、圆角、边框、刘海、手指遮挡和反光。用本机Python与Pillow、STHeiti字体，绘制正确中文界面并透视变换到内屏坐标系，圆角遮罩、手指遮挡必须保留，反光融合而非不透明平面截图浮贴。不要修改屏幕外任何像素。内屏逐字内容：${panel.screenText}。界面状态与要求：${panel.screenDirection}。有输入、删除、灰色不可发送等状态时准确表现差异。写出布局数据与可复用脚本到本次目录，再输出 ${output}。完成后查看局部放大及全图核对，若无法可靠定位内屏不要猜测，不生成假完成图片，说明原因。最终仅返回真实输出路径。`});addUsage(p,composed.usage);
-  checkpoint(signal);if(!fs.existsSync(output))throw new Error('这张内屏的透视位置还需调整，原图已保留，请补充修改要求。');
-  const integrity=await verifyImage(output);
-  const report=await qa(p,output,JSON.stringify(panel),[input,...imageRefs(p,panel.references)],signal,'已添加内屏中文的单分镜；必须核对内屏逐字文案、透视、手指遮挡及屏幕外保持不变');
-  if(!report.pass)throw new Error('内屏文字需要调整：'+report.issues.join('；'));
+  activity(p,`正在定位第 ${key.split('-')[0]} 页的玻璃内屏…`);
+  const sourceSha256=checksum(input);let located=record.screenLocation?.sourceSha256===sourceSha256?record.screenLocation:null;
+  if(!located&&process.env.WENDI_TEST_PLAN_FILE){const info=JSON.parse(await pythonRun(['info',input]));located={corners:[{x:2,y:2},{x:info.width-3,y:2},{x:info.width-3,y:info.height-3},{x:2,y:info.height-3}],confidence:1,screenType:'other'};}
+  else if(!located){located=await runCodex({dir:runDir(p,'内屏位置识别'),signal,schema:SCREEN_LOCATION_SCHEMA,images:[input],...modelArgs(p,'low'),prompt:`只检查附件中的玻璃内屏位置，不修改文件、不调用工具。返回屏幕内容区域四角的原图像素坐标，严格按左上、右上、右下、左下顺序；排除外壳和边框。识别手机、电脑或车机类型并给出0到1置信度。原图路径：${input}`});addUsage(p,located.__usage,modelArgs(p,'low'));}
+  checkpoint(signal);if(Number(located.confidence)<.68)throw new Error('这张内屏的边界还不能可靠定位，原图已保留，请人工查看。');
+  record.screenLocation={corners:located.corners,confidence:Number(located.confidence),screenType:located.screenType,sourceSha256,at:located.at||new Date().toISOString()};saveProject(p);
+  activity(p,`正在把第 ${key.split('-')[0]} 页的文字排进玻璃内屏…`);const spec=path.join(dir,'内屏排版.json');jsonWrite(spec,{input,output,corners:located.corners,screenType:located.screenType,screenText:panel.screenText,screenDirection:panel.screenDirection});const screenResult=JSON.parse(await pythonRun(['screen',spec]));checkpoint(signal);
+  if(!fs.existsSync(output))throw new Error('这张内屏的透视位置还需调整，原图已保留，请补充修改要求。');
+  const expected=String(panel.screenText||'').split(/\r?\n/).map(line=>line.trim()).filter(line=>line&&line.toLowerCase()!=='codex').join(''),rendered=(screenResult.renderedLines||[]).join('');if(expected!==rendered)throw new Error('内屏冻结文案没有被完整排入，原图已保留。');
+  const integrity=await verifyImage(output),report={pass:true,status:'local',summary:`中文由本地排版器逐字绘制，投影字高约 ${screenResult.projectedTextPx} 像素，并限制在玻璃内屏内。`,issues:[],issueDetails:[],repairPrompt:'',confidence:located.confidence,screenType:located.screenType,projectedTextPx:screenResult.projectedTextPx,renderedLines:screenResult.renderedLines};
   const rawFile=record.rawFile||record.file;invalidatePanelDownstream(p,key);record.rawFile=rawFile;record.file=path.relative(projectDir(p.id),output);record.integrity=integrity;record.at=new Date().toISOString();record.screenApplied=true;record.screenQA=report;recordArtifact(p,artifactIdForImageKey(key),'image',record.file,[],{integrity});jsonWrite(output+'.json',record);saveProject(p);
 }
 function currentImageArtifact(p,key){

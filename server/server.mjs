@@ -1,13 +1,14 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import {execFile} from 'node:child_process';
+import {execFile,spawn} from 'node:child_process';
 import {APP,ROOT,REFS,CHECKS,inside,digest} from './workflow.mjs';
 import {connectionStatus,appServerSnapshot,normalizeRateLimits} from './bridge.mjs';
 import {WEB_IMAGE_PROVIDER,readWebManifest,webWorkerStatus} from './chatgpt-web-provider.mjs';
 import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,decidePanel,resume,reviseImage,recoverImage,reviewImage,retryMissingImage,imageRetryState,accept,recover,projectDir,syncRunningProject,refreshQuotaPauses} from './engine.mjs';
 import {CATEGORIES,listDocuments,listAssets,discoverArchiveStories,archiveStory,stageUpload,readCandidate,inspectStagedCandidate,saveManualAsset,searchAssets,analyzeAsset,saveAssetProposal,applyAssetProposal,saveDocument,suggestDocument,deleteProjectFolder,deleteArchiveStory} from './library.mjs';
 const PORT=Number(process.env.PORT||4318);const HOST='127.0.0.1';
+const INSTANCE_ID=`${process.pid}-${Date.now()}`;let restartRequested=false;
 const front=path.join(APP,'dist/client');
 const mime={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.json':'application/json; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.webp':'image/webp','.ico':'image/x-icon','.woff2':'font/woff2','.zip':'application/zip','.md':'text/plain; charset=utf-8','.txt':'text/plain; charset=utf-8'};
 let connection=await connectionStatus();
@@ -69,12 +70,12 @@ function publicProject(p){
     const isCurrentSample=Number.isInteger(sampleNumber)&&p.status==='samples_decision'&&p.samplesDecision?.sampleIndexes?.includes(sampleNumber)&&userDecision?.action!=='accept_current';
     return {...safe,url:media(displayFile),artifactId:artifact?.id||fallbackId,contentHash:digest({artifactId:artifact?.id||fallbackId,file,at:record.at||artifact?.at||null}),review:record.qa||null,decision:userDecision||null,availableActions:isCurrentSample?['accept_current','regenerate_current']:[]};
   };
-  const publicTask=task=>task?{id:task.id,kind:task.kind,target:task.target,status:task.status,attempt:task.attempt,providerInvocationLimit:task.providerInvocationLimit,providerInvocations:task.providerInvocations,startedAt:task.startedAt,lastProgressAt:task.lastProgressAt,completedAt:task.completedAt,qa:task.qa,errorCode:task.errorCode,webState:task.webState}:null;
+  const publicTask=task=>task?{id:task.id,kind:task.kind,target:task.target,status:task.status,attempt:task.attempt,providerInvocationLimit:task.providerInvocationLimit,providerInvocations:task.providerInvocations,startedAt:task.startedAt,lastProgressAt:task.lastProgressAt,completedAt:task.completedAt,qa:task.qa,errorCode:task.errorCode,webState:task.webState,webTimings:task.webTimings||null}:null;
   const {pending,history=[],samples=[],panels={},pages=[],bundle,artifacts:ignoredArtifacts,tasks:ignoredTasks,currentTask,previewDecisionCommands:ignoredCommands,panelDecisionCommands:ignoredPanelCommands,...safe}=p;
   void ignoredArtifacts;void ignoredTasks;void ignoredCommands;void ignoredPanelCommands;
   const retryState=imageRetryState(p);
   const webEvidence=pendingWebEvidence(p,pending),webManifest=webEvidence?.identityMatches?webEvidence.manifest:null;
-  const publicPending=pending?{key:pending.key,at:pending.at,taskId:pending.taskId,provider:pending.provider||null,webState:webManifest?.state||null,requestId:webManifest?.requestId||null,accepted:webManifest?.accepted===true,acceptedAt:webManifest?.acceptedAt||null,submitted:webManifest?.submitted===true,submittedAt:webManifest?.submittedAt||null,errorCode:webManifest?.errorCode||null}:null;
+  const publicPending=pending?{key:pending.key,at:pending.at,taskId:pending.taskId,provider:pending.provider||null,webState:webManifest?.state||null,requestId:webManifest?.requestId||null,accepted:webManifest?.accepted===true,acceptedAt:webManifest?.acceptedAt||null,readyAt:webManifest?.readyAt||null,submitted:webManifest?.submitted===true,submittedAt:webManifest?.submittedAt||null,downloadedAt:webManifest?.downloadedAt||null,errorCode:webManifest?.errorCode||null}:null;
   const baseTask=publicTask(currentTask),lateTerminal=Boolean(baseTask&&webEvidence?.identityMatches&&currentTask.id===pending?.taskId&&['failed','downloaded'].includes(webManifest?.state));
   const effectiveTask=lateTerminal?{...baseTask,status:webManifest.state==='failed'?'failed':'artifact_saved',errorCode:webManifest.errorCode||baseTask.errorCode,webState:webManifest.state}:baseTask;
   return {...safe,pending:publicPending,currentTask:effectiveTask,imageRetry:retryState?{certainty:retryState.certainty,target:retryState.target}:null,history:history.map(h=>({version:h.version,title:h.plan.title,at:h.approved?.at,plan:h.plan,pages:(h.pages||[]).map(q=>publicImage(q,`page:${q.number}`))})),
@@ -170,7 +171,16 @@ const server=http.createServer(async(req,res)=>{
       const origin=req.headers.origin;const allowed=[`http://127.0.0.1:${PORT}`,`http://localhost:${PORT}`,'http://127.0.0.1:5173','http://localhost:5173'];
       if(req.headers['x-wendi-request']!=='studio'||!String(req.headers['content-type']).startsWith('application/json')||(origin&&!allowed.includes(origin)))return send(res,{error:'请从本地创作室提交'},403);
     }
-    if(url.pathname==='/api/health')return send(res,{app:'wendi-studio',ready:true,connection:connectionSnapshot(),version:'2.2.0'});
+    if(url.pathname==='/api/health')return send(res,{app:'wendi-studio',ready:true,connection:connectionSnapshot(),version:'2.2.0',instanceId:INSTANCE_ID});
+    if(url.pathname==='/api/restart'&&req.method==='POST'){
+      if(restartRequested){const error=new Error('创作室已经在重启，请稍候。');error.statusCode=409;throw error;}
+      if(active.size){const error=new Error('还有制作任务正在运行，请先暂停并等待当前步骤保存完成。');error.statusCode=409;throw error;}
+      restartRequested=true;send(res,{ok:true,status:'restarting',previousInstanceId:INSTANCE_ID,retryAfterMs:700},202);
+      if(process.env.WENDI_TEST_RESTART_NOOP!=='1')setTimeout(()=>{
+        const child=spawn(process.execPath,[path.join(APP,'launch.mjs')],{cwd:APP,env:{...process.env,WENDI_PORT:String(PORT),WENDI_NO_OPEN:'1'},stdio:'ignore',detached:true});child.unref();
+      },120).unref();
+      return;
+    }
     if(url.pathname==='/api/bootstrap'){
       const snapshot=await account();const assets=publicAssets();const stories=discoverArchiveStories().map(s=>({...s,coverUrl:`/media/archive-story/${s.id}/0`,pages:s.pages.map((_,i)=>({index:i,url:`/media/archive-story/${s.id}/${i}`}))}));
       return send(res,{connection:connectionSnapshot(),checks:CHECKS,projects:listProjects().map(publicProject),account:snapshot,categories:CATEGORIES,documents:listDocuments(),assets,references:assets.filter(x=>!x.file.startsWith('02-')),archiveStories:stories,hero:stories[0]?.coverUrl||assets[0]?.url});

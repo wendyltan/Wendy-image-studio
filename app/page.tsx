@@ -19,6 +19,7 @@ import {
   Pause,
   Pencil,
   Plus,
+  Power,
   RotateCcw,
   Save,
   Sparkles,
@@ -86,6 +87,7 @@ type Task = {
   providerInvocations?: number;
   errorCode?: string;
   webState?: string | null;
+  webTimings?: Record<string, string | null> | null;
 };
 type Pending = {
   key: string;
@@ -96,8 +98,10 @@ type Pending = {
   requestId?: string | null;
   accepted?: boolean;
   acceptedAt?: string | null;
+  readyAt?: string | null;
   submitted?: boolean;
   submittedAt?: string | null;
+  downloadedAt?: string | null;
   errorCode?: string | null;
 };
 type Project = {
@@ -159,8 +163,38 @@ type Project = {
     unit: string;
     startedAt: string;
     completedAt?: string;
+    stageSerial?: number;
+    activeStage?: ProgressStage | null;
+    stages?: ProgressStage[];
   };
-  metrics?: { inputTokens: number; outputTokens: number; totalRuns: number };
+  metrics?: {
+    inputTokens: number;
+    cachedInputTokens?: number;
+    outputTokens: number;
+    reasoningOutputTokens?: number;
+    totalRuns: number;
+    refreshSerial?: number;
+    unattributedRuns?: number;
+    byModel?: ModelUsage[];
+  };
+};
+type ProgressStage = {
+  id: string;
+  label: string;
+  tone: string;
+  state: string;
+  startedAt: string;
+  completedAt?: string;
+  durationMs?: number;
+};
+type ModelUsage = {
+  model: string;
+  reasoningEffort: string;
+  runs: number;
+  inputTokens: number;
+  cachedInputTokens?: number;
+  outputTokens: number;
+  reasoningOutputTokens?: number;
 };
 type Asset = {
   file: string;
@@ -363,6 +397,7 @@ export default function Studio() {
     [effort, setEffort] = useState('medium'),
     [preset, setPreset] = useState('balanced');
   const [waiting, setWaiting] = useState(false),
+    [restarting, setRestarting] = useState(false),
     [error, setError] = useState(''),
     [toast, setToast] = useState(''),
     [note, setNote] = useState(''),
@@ -408,6 +443,9 @@ export default function Studio() {
     [assetUsageFilter, setAssetUsageFilter] = useState(''),
     [assetResults, setAssetResults] = useState<Asset[] | null>(null);
   const lastMessage = useRef(''),
+    quotaStageSeen = useRef(0),
+    quotaRefreshInFlight = useRef(false),
+    quotaRefreshPending = useRef(false),
     modelInitialized = useRef(false),
     models = data?.account.models || [],
     selectedModel = models.find((m) => m.id === model) || models[0],
@@ -435,6 +473,22 @@ export default function Studio() {
       setError('');
     } catch (e) {
       setError((e as Error).message);
+    }
+  }, []);
+  const refreshAccount = useCallback(async () => {
+    if (quotaRefreshInFlight.current) {
+      quotaRefreshPending.current = true;
+      return;
+    }
+    quotaRefreshInFlight.current = true;
+    try {
+      do {
+        quotaRefreshPending.current = false;
+        const account = await request<Bootstrap['account']>('/api/account', {});
+        setData((value) => (value ? { ...value, account } : value));
+      } while (quotaRefreshPending.current);
+    } finally {
+      quotaRefreshInFlight.current = false;
     }
   }, []);
   useEffect(() => {
@@ -526,11 +580,22 @@ export default function Studio() {
     };
   }, [current]);
   useEffect(() => {
+    if (!project) return;
+    const serial =
+      (project.progress?.stageSerial || 0) +
+      (project.metrics?.refreshSerial || 0);
+    if (serial <= quotaStageSeen.current) return;
+    quotaStageSeen.current = serial;
+    void refreshAccount().catch((e) => setError((e as Error).message));
+  }, [project, refreshAccount]);
+  useEffect(() => {
     if (!toast) return;
     const t = setTimeout(() => setToast(''), 4500);
     return () => clearTimeout(t);
   }, [toast]);
   function select(p: Project) {
+    quotaStageSeen.current =
+      (p.progress?.stageSerial || 0) + (p.metrics?.refreshSerial || 0);
     setCurrent(p.id);
     setProject(p);
     setSection('create');
@@ -560,6 +625,46 @@ export default function Studio() {
       setError((e as Error).message);
     } finally {
       setWaiting(false);
+    }
+  }
+  async function restartStudio() {
+    if (restarting) return;
+    if (
+      !window.confirm(
+        '确定重启创作室后台吗？不会自动继续制作或重新生图；正在运行的任务必须先暂停。',
+      )
+    )
+      return;
+    setRestarting(true);
+    setError('');
+    try {
+      const accepted = await request<{
+        previousInstanceId: string;
+        retryAfterMs?: number;
+      }>('/api/restart', {});
+      setToast('正在安全重启创作室…');
+      await new Promise((resolve) =>
+        window.setTimeout(resolve, accepted.retryAfterMs || 700),
+      );
+      for (let attempt = 0; attempt < 40; attempt++) {
+        try {
+          const health = await request<{ ready: boolean; instanceId: string }>(
+            '/api/health',
+          );
+          if (
+            health.ready &&
+            health.instanceId !== accepted.previousInstanceId
+          ) {
+            window.location.reload();
+            return;
+          }
+        } catch {}
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
+      }
+      throw new Error('后台重启等待超时，请再点一次桌面快捷方式。');
+    } catch (e) {
+      setError((e as Error).message);
+      setRestarting(false);
     }
   }
   async function action(name: string, body: unknown = {}) {
@@ -996,43 +1101,60 @@ export default function Studio() {
       <main>
         <header className="topbar">
           <span>一间只属于你的漫画创作室</span>
-          <div
-            className={
-              'quota-mini ' +
-              (remaining !== null && remaining < 10 ? 'low' : '')
-            }
-          >
-            <span>订阅实际剩余</span>
-            <b>5小时 {remaining === null ? '暂不可用' : `${remaining}%`}</b>
-            {remaining !== null && (
-              <i>
-                <em style={{ width: `${remaining}%` }} />
-              </i>
-            )}
-            <b>
-              1周{' '}
-              {weeklyRemaining === null ? '暂不可用' : `${weeklyRemaining}%`}
-            </b>
-            {data?.account.status === 'stale' && (
-              <small>
-                上次成功读取 {observedAccountText(data.account.updatedAt)}
-              </small>
-            )}
-            <button
-              title="刷新实际额度"
-              onClick={async () => {
-                try {
-                  const a = await request<Bootstrap['account']>(
-                    '/api/account',
-                    {},
-                  );
-                  setData((d) => (d ? { ...d, account: a } : d));
-                } catch (e) {
-                  setError((e as Error).message);
-                }
-              }}
+          <div className="topbar-actions">
+            <div
+              className={
+                'quota-mini ' +
+                (remaining !== null && remaining < 10 ? 'low' : '')
+              }
             >
-              <RotateCcw size={13} />
+              <span>订阅实际剩余</span>
+              <b>5小时 {remaining === null ? '暂不可用' : `${remaining}%`}</b>
+              {remaining !== null && (
+                <i>
+                  <em style={{ width: `${remaining}%` }} />
+                </i>
+              )}
+              <b>
+                1周{' '}
+                {weeklyRemaining === null
+                  ? '暂不可用'
+                  : `${weeklyRemaining}%`}
+              </b>
+              {data?.account.updatedAt && (
+                <small>
+                  {data.account.status === 'stale' ? '上次读取' : '更新于'}{' '}
+                  {observedAccountText(data.account.updatedAt)}
+                </small>
+              )}
+              <button
+                title="刷新实际额度"
+                onClick={() =>
+                  void refreshAccount().catch((e) =>
+                    setError((e as Error).message),
+                  )
+                }
+              >
+                <RotateCcw size={13} />
+              </button>
+            </div>
+            <button
+              className="restart-studio"
+              disabled={
+                restarting ||
+                waiting ||
+                project?.busy === true ||
+                data?.projects.some((item) => item.busy) === true
+              }
+              title={
+                project?.busy || data?.projects.some((item) => item.busy)
+                  ? '请先暂停当前制作任务'
+                  : '安全重启后台服务'
+              }
+              onClick={() => void restartStudio()}
+            >
+              {restarting ? <LoaderCircle className="spin" /> : <Power />}
+              <span>{restarting ? '重启中…' : '重启创作室'}</span>
             </button>
           </div>
         </header>
@@ -2022,7 +2144,6 @@ function ProjectView({
   analyze: (kind: 'page' | 'panel' | 'sample', key: string | number) => void;
   now: number;
 }) {
-  void now;
   const progress = project.progress;
   const task = project.currentTask;
   const percent = progress?.total
@@ -2097,6 +2218,7 @@ function ProjectView({
         action={action}
         noOutput={noOutput}
         recoveryPending={Boolean(project.imageRetry)}
+        now={now}
       />
       {project.pending && !project.busy && !noOutput && (
         <RecoveryCard action={action} />
@@ -2131,20 +2253,7 @@ function ProjectView({
             }
           />
         )}
-      {project.metrics && (
-        <div className="metrics-strip">
-          <span>本篇调用 {project.metrics.totalRuns || 0} 次</span>
-          <span>
-            输入约 {(project.metrics.inputTokens || 0).toLocaleString()} tokens
-          </span>
-          <span>
-            输出约 {(project.metrics.outputTokens || 0).toLocaleString()} tokens
-          </span>
-          <span>
-            {presets[project.brief.workflowPreset]?.name || '均衡'}流程
-          </span>
-        </div>
-      )}
+      {project.metrics && <ModelUsagePanel project={project} />}
       <div className="tabs">
         <button
           className={view === 'plan' ? 'chosen' : ''}
@@ -2531,6 +2640,52 @@ function ProjectView({
     </>
   );
 }
+function ModelUsagePanel({ project }: { project: Project }) {
+  const metrics = project.metrics!;
+  const rows = metrics.byModel || [];
+  return (
+    <section className="metrics-panel" aria-label="本篇模型与 token 用量">
+      <header>
+        <b>本篇模型用量</b>
+        <span>
+          {metrics.totalRuns || 0} 次调用 · 输入{' '}
+          {(metrics.inputTokens || 0).toLocaleString()} · 输出{' '}
+          {(metrics.outputTokens || 0).toLocaleString()} tokens
+        </span>
+      </header>
+      <div className="model-usage-rows">
+        {rows.map((row) => (
+          <div key={`${row.model}:${row.reasoningEffort}`}>
+            <span>
+              <b>{row.model}</b>
+              <small>
+                {effortLabels[row.reasoningEffort] || row.reasoningEffort}思考
+              </small>
+            </span>
+            <strong>{row.runs} 次</strong>
+            <span>
+              输入 {row.inputTokens.toLocaleString()}
+              {!!row.cachedInputTokens && (
+                <small>其中缓存 {row.cachedInputTokens.toLocaleString()}</small>
+              )}
+            </span>
+            <span>
+              输出 {row.outputTokens.toLocaleString()}
+              {!!row.reasoningOutputTokens && (
+                <small>
+                  其中思考 {row.reasoningOutputTokens.toLocaleString()}
+                </small>
+              )}
+            </span>
+          </div>
+        ))}
+        {!!metrics.unattributedRuns && (
+          <p>另有 {metrics.unattributedRuns} 次旧记录缺少可核对的模型明细。</p>
+        )}
+      </div>
+    </section>
+  );
+}
 function WorkflowStatus({
   project,
   progress,
@@ -2540,6 +2695,7 @@ function WorkflowStatus({
   action,
   noOutput,
   recoveryPending,
+  now,
 }: {
   project: Project;
   progress: Project['progress'];
@@ -2549,6 +2705,7 @@ function WorkflowStatus({
   action: (name: string, body?: unknown) => void;
   noOutput: boolean;
   recoveryPending: boolean;
+  now: number;
 }) {
   const taskLabels: Record<string, string> = {
     unknown_result: '结果尚未确认',
@@ -2595,13 +2752,107 @@ function WorkflowStatus({
     !project.pending &&
     !recoveryPending &&
     ['attention', 'paused', 'draft'].includes(project.status);
-  return (
-    <div
-      className={
-        'status-banner ' + (project.error || recoveryPending ? 'warn' : '')
+  const liveTone =
+    project.error || recoveryPending
+      ? 'error'
+      : project.pending?.webState === 'submitted'
+        ? 'creating'
+        : project.pending?.webState === 'ready'
+          ? 'composing'
+          : progress?.activeStage?.tone || (project.busy ? 'working' : 'complete');
+  const browserClock = project.pending
+    ? {
+        createdAt: project.pending.at,
+        acceptedAt: project.pending.acceptedAt,
+        readyAt: project.pending.readyAt,
+        submittedAt: project.pending.submittedAt,
+        downloadedAt: project.pending.downloadedAt,
       }
-    >
-      <div>
+    : task?.webTimings
+      ? {
+          createdAt: task.webTimings.createdAt || task.startedAt,
+          acceptedAt: task.webTimings.acceptedAt,
+          readyAt: task.webTimings.readyAt,
+          submittedAt: task.webTimings.submittedAt,
+          downloadedAt: task.webTimings.downloadedAt,
+        }
+      : null;
+  const browserStages: ProgressStage[] = [];
+  const addBrowserStage = (
+    id: string,
+    label: string,
+    tone: string,
+    startedAt?: string | null,
+    completedAt?: string | null,
+  ) => {
+    if (!startedAt) return;
+    browserStages.push({
+      id,
+      label,
+      tone,
+      state: completedAt ? 'completed' : 'running',
+      startedAt,
+      ...(completedAt
+        ? {
+            completedAt,
+            durationMs: Math.max(
+              0,
+              Date.parse(completedAt) - Date.parse(startedAt),
+            ),
+          }
+        : {}),
+    });
+  };
+  if (browserClock) {
+    addBrowserStage(
+      'browser-accepted',
+      '打开页面并接单',
+      'waiting',
+      browserClock.createdAt,
+      browserClock.acceptedAt,
+    );
+    addBrowserStage(
+      'browser-ready',
+      '上传并核对附件',
+      'working',
+      browserClock.acceptedAt,
+      browserClock.readyAt ||
+        (!browserClock.readyAt ? browserClock.submittedAt : null),
+    );
+    if (browserClock.readyAt) {
+      addBrowserStage(
+        'browser-submitted',
+        '发送生图请求',
+        'creating',
+        browserClock.readyAt,
+        browserClock.submittedAt,
+      );
+    }
+    addBrowserStage(
+      'browser-downloaded',
+      '等待生成并下载原图',
+      'creating',
+      browserClock.submittedAt,
+      browserClock.downloadedAt,
+    );
+  }
+  const timingStages = [
+    ...(progress?.stages || []).slice(browserStages.length ? -3 : -4),
+    ...browserStages.slice(-4),
+    ...(progress?.activeStage ? [progress.activeStage] : []),
+  ];
+  const maxDuration = Math.max(
+    1,
+    ...timingStages.map((stage) =>
+      stage.durationMs !== undefined
+        ? stage.durationMs
+        : Math.max(0, now - Date.parse(stage.startedAt)),
+    ),
+  );
+  return (
+    <>
+      <div className={`status-banner tone-${liveTone}`}>
+        <div>
         {project.busy ? (
           <LoaderCircle className="spin" />
         ) : project.error || recoveryPending ? (
@@ -2621,8 +2872,8 @@ function WorkflowStatus({
             思考{taskText && ` · ${taskText}`}
           </small>
         </span>
-      </div>
-      {project.busy ? (
+        </div>
+        {project.busy ? (
         <button className="text-button" onClick={() => action('pause')}>
           <Pause />
           暂停
@@ -2637,11 +2888,35 @@ function WorkflowStatus({
             继续制作
           </button>
         )
-      )}
-      <div className="progress-line">
-        <i style={{ width: `${percent}%` }} />
+        )}
+        <div className="progress-line">
+          <i style={{ width: `${percent}%` }} />
+        </div>
       </div>
-    </div>
+      {!!timingStages.length && (
+        <div className="stage-timings" aria-label="步骤耗时">
+          {timingStages.map((stage) => {
+            const duration =
+              stage.durationMs !== undefined
+                ? stage.durationMs
+                : Math.max(0, now - Date.parse(stage.startedAt));
+            return (
+              <div key={stage.id} className={`tone-${stage.tone}`}>
+                <span title={stage.label}>{stage.label}</span>
+                <i>
+                  <em
+                    style={{
+                      width: `${Math.max(8, Math.round((duration / maxDuration) * 100))}%`,
+                    }}
+                  />
+                </i>
+                <b>{elapsed(stage.startedAt, stage.completedAt)}</b>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </>
   );
 }
 function RecoveryCard({
