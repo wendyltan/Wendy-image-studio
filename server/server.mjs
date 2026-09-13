@@ -5,7 +5,7 @@ import {execFile,spawn} from 'node:child_process';
 import {APP,ROOT,REFS,CHECKS,inside,digest} from './workflow.mjs';
 import {connectionStatus,appServerSnapshot,normalizeRateLimits} from './bridge.mjs';
 import {WEB_IMAGE_PROVIDER,readWebManifest,webWorkerStatus} from './chatgpt-web-provider.mjs';
-import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,decidePanel,resume,reviseImage,recoverImage,reviewImage,retryMissingImage,imageRetryState,accept,recover,projectDir,syncRunningProject,refreshQuotaPauses} from './engine.mjs';
+import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,decidePanel,resume,reviseImage,repairPageLayout,unifyPageLayouts,recoverImage,reviewImage,retryMissingImage,imageRetryState,accept,recover,projectDir,syncRunningProject,refreshQuotaPauses} from './engine.mjs';
 import {CATEGORIES,listDocuments,listAssets,discoverArchiveStories,archiveStory,stageUpload,readCandidate,inspectStagedCandidate,saveManualAsset,searchAssets,analyzeAsset,saveAssetProposal,applyAssetProposal,saveDocument,suggestDocument,deleteProjectFolder,deleteArchiveStory} from './library.mjs';
 const PORT=Number(process.env.PORT||4318);const HOST='127.0.0.1';
 const INSTANCE_ID=`${process.pid}-${Date.now()}`;let restartRequested=false;
@@ -264,6 +264,8 @@ const server=http.createServer(async(req,res)=>{
       else if(action==='approve-samples')approveSamples(p,b.hash);
       else if(action==='resume')resume(p);
       else if(action==='revise-image')reviseImage(p,b.key,b.note);
+      else if(action==='repair-page-layout')repairPageLayout(p,b.pageNumber);
+      else if(action==='unify-page-layouts')unifyPageLayouts(p);
       else if(action==='recover-image')recoverImage(p);
       else if(action==='review-image')reviewImage(p,b.key);
       else if(action==='accept')await accept(p,b.checks);

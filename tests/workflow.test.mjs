@@ -64,6 +64,12 @@ test('web image provider uses dedicated Chrome and records exact artifacts',()=>
   assert.match(text,/web-generation\.json/);
   assert.match(text,/禁止调用 image_gen/);
   assert.match(text,/禁止接管用户已有标签页/);
+  assert.match(text,/visible:false/);
+  assert.match(text,/后台隐藏/);
+  assert.match(text,/tab\.close\(\)/);
+  assert.match(text,/waitForEvent\("filechooser"\)/);
+  assert.match(text,/chooser\.setFiles\(\)/);
+  assert.match(text,/禁止调用 cua\.getApp/);
   assert.match(text,/不得重复提交/);
   assert.match(text,/authorization 是该操作发生后的持久证据/);
   assert.match(text,/当前同一个回合完成/);
@@ -145,6 +151,15 @@ test('planning, frozen approval, samples gate and production',async()=>{
   assert.equal(p.artifacts.find(x=>x.id==='story:audit')?.valid,true);
   assert.equal(p.artifacts.find(x=>x.id==='export:bundle')?.valid,true);
   execFileSync('/usr/bin/unzip',['-t',W.inside(E.projectDir(p.id),p.bundle)]);
+});
+test('page layout repair and whole-story unification never regenerate source images',async()=>{
+  let layout=E.createProject({...brief,idea:'本地排版修复不重新生图'});layout.plan=structuredClone(plan);layout.version=1;layout.approved={version:1,hash:W.digest(layout.plan)};layout.samplesApproved=true;layout.status='paused';E.saveProject(layout);
+  E.generatePages(layout);layout=await done(layout.id);assert.equal(layout.status,'ready');
+  const originalPage=layout.pages[0],originalPageFile=W.inside(E.projectDir(layout.id),originalPage.file),imageTasks=layout.tasks.filter(task=>task.kind==='image').length;
+  originalPage.qa={pass:false,summary:'文字框遮挡主体',issues:['第1格文字框遮挡人物'],issueDetails:[{id:'layout-1',category:'layout',severity:'blocking',location:'第1格下方文字框',description:'第1格文字框遮挡人物',repairAction:'recompose'}],repairPrompt:'把文字框移到对侧'};originalPage.nextStep='重新排版';layout.status='attention';E.saveProject(layout);
+  E.repairPageLayout(layout,1);layout=await done(layout.id);assert.equal(layout.status,'paused');assert.equal(layout.pages[0].qa.pass,true);assert.deepEqual(layout.pageLayouts[1].captionAnchors,['top-right']);assert.equal(layout.tasks.filter(task=>task.kind==='image').length,imageTasks);assert(fs.existsSync(originalPageFile));assert.notEqual(layout.pages[0].file,originalPage.file);
+  const secondPlan={...structuredClone(layout.plan.pages[0]),number:2,title:'第二页'};layout.plan.pages.push(secondPlan);layout.brief.pageCount=2;layout.approved.hash=W.digest(layout.plan);layout.panels['2-1']={...structuredClone(layout.panels['1-1']),key:'第2页-第1格'};layout.pages.push({...structuredClone(layout.pages[0]),number:2});layout.artifacts.push({...structuredClone(layout.artifacts.find(item=>item.id==='page:1')),id:'page:2'});E.saveProject(layout);
+  E.unifyPageLayouts(layout);layout=await done(layout.id);assert.equal(layout.status,'paused');assert.equal(layout.pages.length,2);assert(layout.pages.every(page=>page.qa.pass&&page.layoutHints.style==='floating-v2'));assert.equal(layout.tasks.filter(task=>task.kind==='image').length,imageTasks);
 });
 test('panel revision invalidates stale page before QA resume and export',async()=>{
   let revised=E.createProject({...brief,idea:'正式分镜修订失效边界测试',workflowPreset:'careful'});E.planProject(revised);revised=await done(revised.id);E.approvePlan(revised,W.digest(revised.plan));revised=await done(revised.id);E.approveSamples(revised,revised.approved.hash);revised=await done(revised.id);

@@ -38,3 +38,11 @@ test('submission survives executor failure without a new execution',async()=>{co
 test('saved matching download survives an executor exit error',async()=>{assert.equal((await dispatchChatGptWebJob(setup('crash-after-download'))).manifest.state,'downloaded');});
 test('direct execution has a bounded timeout',async()=>{const args=setup('hang');await assert.rejects(dispatchChatGptWebJob({...args,timeoutMs:100}),/等待时间较长/);});
 test('cancelled request never spawns or creates a request',async()=>{const args=setup('success'),controller=new AbortController();controller.abort();await assert.rejects(dispatchChatGptWebJob({...args,signal:controller.signal}),/已暂停/);assert(!fs.existsSync(path.join(args.dir,'worker-request.json')));});
+test('worker timestamps are normalized before reaching the timing UI',()=>{
+ const dir=fs.mkdtempSync(path.join(root,'timestamps-')),file=path.join(dir,'web-generation.json');
+ fs.writeFileSync(file,JSON.stringify({state:'downloaded',requestId:'11111111-1111-4111-8111-111111111111',accepted:true,submitted:true,createdAt:'2026-09-13T02:00:50.032Z',acceptedAt:'2026-09-13T02:02:03.3NZ',readyAt:'not-a-date',submittedAt:'2026-09-13T02:08:22.300Z'}));
+ const manifest=readWebManifest(file);
+ assert.equal(manifest.acceptedAt,'2026-09-13T02:02:03.300Z');
+ assert.equal(manifest.readyAt,null);
+ assert.equal(manifest.submittedAt,'2026-09-13T02:08:22.300Z');
+});

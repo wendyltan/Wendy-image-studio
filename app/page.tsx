@@ -54,12 +54,19 @@ type Plan = {
 };
 type Picture = {
   url: string;
+  nextStep?: string;
+  layoutHints?: { style?: string; captionAnchors?: string[] };
   qa: {
     pass: boolean | null;
     status?: string;
     summary: string;
     issues: string[];
-    issueDetails?: { id?: string; description?: string; severity?: string }[];
+    issueDetails?: {
+      id?: string;
+      description?: string;
+      severity?: string;
+      repairAction?: string;
+    }[];
   };
   number?: number;
   artifactId?: string;
@@ -351,14 +358,29 @@ async function request<T>(url: string, body?: unknown): Promise<T> {
   if (!r.ok) throw new Error(data.error || '暂时无法连接创作室');
   return data;
 }
-function elapsed(start?: string, end?: string) {
+function timestampMs(value?: string | null) {
+  if (!value) return null;
+  const direct = Date.parse(value);
+  if (Number.isFinite(direct)) return direct;
+  const repaired = value.replace(/(\.\d{1,3})N(?=Z$)/, '$1');
+  const parsed = Date.parse(repaired);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+function stageElapsedMs(
+  start?: string | null,
+  end?: string | null,
+  fallbackEnd = Date.now(),
+) {
+  const from = timestampMs(start);
+  const to = end ? timestampMs(end) : fallbackEnd;
+  if (from === null || to === null || to < from) return null;
+  return to - from;
+}
+function elapsed(start?: string | null, end?: string | null) {
   if (!start) return '尚未开始';
-  const n = Math.max(
-    0,
-    Math.floor(
-      (Date.parse(end || new Date().toISOString()) - Date.parse(start)) / 1000,
-    ),
-  );
+  const measured = stageElapsedMs(start, end);
+  if (measured === null) return '时间待校准';
+  const n = Math.floor(measured / 1000);
   return n < 60 ? `${n} 秒` : `${Math.floor(n / 60)} 分 ${n % 60} 秒`;
 }
 function resetText(timestamp?: number) {
@@ -680,9 +702,14 @@ export default function Studio() {
         setView('samples');
       if (name === 'approve-samples') setView('pictures');
       if (
-        ['retry-missing', 'recover-image', 'review-image', 'resume'].includes(
-          name,
-        )
+        [
+          'retry-missing',
+          'recover-image',
+          'review-image',
+          'resume',
+          'repair-page-layout',
+          'unify-page-layouts',
+        ].includes(name)
       )
         setView(p.samplesApproved ? 'pictures' : 'samples');
       if (name === 'revise-image') {
@@ -2498,13 +2525,25 @@ function ProjectView({
       )}
       {view === 'pictures' && (
         <>
-          <div className="section-intro">
-            <h2>
-              {project.accepted
-                ? '这一篇，可以好好收起来了。'
-                : '一页一页，故事正在发生。'}
-            </h2>
-            <p>任何一页都可以提炼成长期参考素材。</p>
+          <div className="section-intro section-intro-actions">
+            <div>
+              <h2>
+                {project.accepted
+                  ? '这一篇，可以好好收起来了。'
+                  : '一页一页，故事正在发生。'}
+              </h2>
+              <p>任何一页都可以提炼成长期参考素材。</p>
+            </div>
+            {!project.accepted && project.pages.length >= 2 && (
+              <button
+                className="secondary"
+                disabled={disabled}
+                onClick={() => action('unify-page-layouts')}
+              >
+                <RotateCcw />
+                统一已有页面排版
+              </button>
+            )}
           </div>
           {project.pages.length ? (
             <div className="finished-grid">
@@ -2537,6 +2576,20 @@ function ProjectView({
                         <Leaf />
                         提炼为素材
                       </button>
+                      {!p.qa.pass &&
+                        ['重新排版', '重新排字'].includes(p.nextStep || '') && (
+                          <button
+                            disabled={disabled}
+                            onClick={() =>
+                              action('repair-page-layout', {
+                                pageNumber: p.number,
+                              })
+                            }
+                          >
+                            <RotateCcw />
+                            修复本页排版
+                          </button>
+                        )}
                     </div>
                   </div>
                 </div>
@@ -2748,9 +2801,15 @@ function WorkflowStatus({
     (task?.status === 'not_accepted'
       ? '后台尚未确认接单，已停止本机等待；请求已保留，不会自动重试。'
       : webText || project.message);
+  const layoutPage = project.pages.find(
+    (page) =>
+      !page.qa.pass &&
+      ['重新排版', '重新排字'].includes(page.nextStep || ''),
+  );
   const canResume =
     !project.pending &&
     !recoveryPending &&
+    !layoutPage &&
     ['attention', 'paused', 'draft'].includes(project.status);
   const liveTone =
     project.error || recoveryPending
@@ -2786,6 +2845,9 @@ function WorkflowStatus({
     completedAt?: string | null,
   ) => {
     if (!startedAt) return;
+    const measured = completedAt
+      ? stageElapsedMs(startedAt, completedAt)
+      : null;
     browserStages.push({
       id,
       label,
@@ -2795,10 +2857,7 @@ function WorkflowStatus({
       ...(completedAt
         ? {
             completedAt,
-            durationMs: Math.max(
-              0,
-              Date.parse(completedAt) - Date.parse(startedAt),
-            ),
+            ...(measured === null ? {} : { durationMs: measured }),
           }
         : {}),
     });
@@ -2841,14 +2900,14 @@ function WorkflowStatus({
     ...browserStages.slice(-4),
     ...(progress?.activeStage ? [progress.activeStage] : []),
   ];
-  const maxDuration = Math.max(
-    1,
-    ...timingStages.map((stage) =>
-      stage.durationMs !== undefined
-        ? stage.durationMs
-        : Math.max(0, now - Date.parse(stage.startedAt)),
-    ),
-  );
+  const stageDurations = timingStages
+    .map((stage) =>
+      stage.durationMs !== undefined && Number.isFinite(stage.durationMs)
+        ? Math.max(0, stage.durationMs)
+        : stageElapsedMs(stage.startedAt, stage.completedAt, now),
+    )
+    .filter((duration): duration is number => duration !== null);
+  const maxDuration = Math.max(1, ...stageDurations);
   return (
     <>
       <div className={`status-banner tone-${liveTone}`}>
@@ -2878,6 +2937,17 @@ function WorkflowStatus({
           <Pause />
           暂停
         </button>
+      ) : layoutPage ? (
+        <button
+          className="primary"
+          disabled={disabled}
+          onClick={() =>
+            action('repair-page-layout', { pageNumber: layoutPage.number })
+          }
+        >
+          <RotateCcw />
+          修复第 {layoutPage.number} 页排版
+        </button>
       ) : (
         canResume && (
           <button
@@ -2897,16 +2967,16 @@ function WorkflowStatus({
         <div className="stage-timings" aria-label="步骤耗时">
           {timingStages.map((stage) => {
             const duration =
-              stage.durationMs !== undefined
-                ? stage.durationMs
-                : Math.max(0, now - Date.parse(stage.startedAt));
+              stage.durationMs !== undefined && Number.isFinite(stage.durationMs)
+                ? Math.max(0, stage.durationMs)
+                : stageElapsedMs(stage.startedAt, stage.completedAt, now);
             return (
               <div key={stage.id} className={`tone-${stage.tone}`}>
                 <span title={stage.label}>{stage.label}</span>
                 <i>
                   <em
                     style={{
-                      width: `${Math.max(8, Math.round((duration / maxDuration) * 100))}%`,
+                      width: `${duration === null ? 8 : Math.max(8, Math.round((duration / maxDuration) * 100))}%`,
                     }}
                   />
                 </i>

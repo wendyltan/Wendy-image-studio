@@ -32,10 +32,11 @@ def boxes(page):
         n=2 if mode=='trio' else 3; a=round((h-g)*.58);b=h-a-g;cw=(w-(n-1)*g)//n
         return [(x,y,w,a)]+[(x+i*(cw+g),y+a+g,cw if i<n-1 else w-i*(cw+g),b) for i in range(n)]
     raise ValueError('不支持的分镜版式')
-def geometry(page):
+def geometry(page,hints=None):
+    hints=hints or {};width_ratios=hints.get('captionWidthRatios') or []
     out=[]
-    for panel,box in zip(page['panels'],boxes(page)):
-        x,y,w,h=box;max_text_width=max(180,min(w-56,round(w*.62)));lines=wrap(panel['caption'],max_text_width-34)
+    for index,(panel,box) in enumerate(zip(page['panels'],boxes(page))):
+        x,y,w,h=box;ratio=width_ratios[index] if index<len(width_ratios) else .62;ratio=max(.28,min(.62,float(ratio)));max_text_width=max(180,min(w-56,round(w*ratio)));lines=wrap(panel['caption'],max_text_width-34)
         if len(lines)>6: raise ValueError('文案过长，请减少文字或改用更大的分镜。')
         out.append({'box':list(box),'width':w-2,'height':h-2,'lines':lines,'ratio':round((w-2)/(h-2),4)})
     return out
@@ -43,15 +44,18 @@ def rounded_paste(canvas,im,box,radius=23):
     x,y,w,h=box;im=ImageOps.fit(im,(w-2,h-2),method=Image.Resampling.LANCZOS)
     mask=Image.new('L',(w-2,h-2),0);ImageDraw.Draw(mask).rounded_rectangle((0,0,w-3,h-3),radius=max(3,radius-1),fill=255)
     canvas.paste(im,(x+1,y+1),mask)
-def caption_box(canvas,panel,lines,box,index):
+def caption_anchor(panel,index,override=None):
+    if override in {'top-left','top-right','bottom-left','bottom-right'}: return override
+    kind=panel.get('captionKind','narration')
+    if kind in {'time','dialogue'}: return 'top-right'
+    return 'top-left' if index%2 else 'bottom-left'
+def caption_box(canvas,panel,lines,box,index,anchor=None):
     if not lines:return
     x,y,w,h=box;size=24;f=font(size);line_h=33
     text_w=max(f.getlength(line) for line in lines);bw=min(w-28,math.ceil(text_w)+36);bh=len(lines)*line_h+22
-    kind=panel.get('captionKind','narration')
-    if kind=='time': bx=x+w-bw-16;by=y+16
-    elif kind=='dialogue': bx=x+w-bw-16;by=y+18
-    elif index%2: bx=x+16;by=y+18
-    else: bx=x+16;by=y+h-bh-18
+    kind=panel.get('captionKind','narration');anchor=caption_anchor(panel,index,anchor)
+    bx=x+16 if anchor.endswith('left') else x+w-bw-16
+    by=y+18 if anchor.startswith('top') else y+h-bh-18
     layer=Image.new('RGBA',canvas.size,(0,0,0,0));ld=ImageDraw.Draw(layer,'RGBA')
     ld.rounded_rectangle((bx+3,by+5,bx+bw+3,by+bh+5),radius=16,fill=(65,46,34,34))
     fill=(250,247,239,238) if kind!='time' else (242,238,226,235)
@@ -68,14 +72,14 @@ def page_title(canvas,page):
     d.rounded_rectangle((x+16,y+16,x+16+bw,y+16+bh),radius=15,fill=(250,247,239,236),outline=(105,82,66,145),width=1)
     d.text((x+33,y+24),title,font=f,fill=(65,49,40,255));canvas.paste(layer,(0,0),layer)
 def compose(spec):
-    page=spec['page'];canvas=Image.new('RGB',(1080,1440),BG);d=ImageDraw.Draw(canvas)
-    for index,(p,g,file) in enumerate(zip(page['panels'],geometry(page),spec['images'])):
+    page=spec['page'];hints=spec.get('layoutHints') or {};anchors=hints.get('captionAnchors') or [];canvas=Image.new('RGB',(1080,1440),BG);d=ImageDraw.Draw(canvas)
+    for index,(p,g,file) in enumerate(zip(page['panels'],geometry(page,hints),spec['images'])):
         im=ImageOps.exif_transpose(Image.open(file)).convert('RGB');w,h=g['width'],g['height']
         discrepancy=abs((im.width/im.height)/(w/h)-1)
         # Small edge trimming is covered by the prompt's 8% safe area. Never distort or pad.
         if discrepancy>.18:raise ValueError(f'原图比例不适合分镜（目标 {w}:{h}），请重新生成合适比例的画面。')
         x,y,bw,bh=g['box'];rounded_paste(canvas,im,(x,y,bw,bh));d.rounded_rectangle((x,y,x+bw,y+bh),radius=23,outline=BORDER,width=2)
-        caption_box(canvas,p,g['lines'],(x,y,bw,bh),index)
+        caption_box(canvas,p,g['lines'],(x,y,bw,bh),index,anchors[index] if index<len(anchors) else None)
     page_title(canvas,page)
     d=ImageDraw.Draw(canvas);num=f"{page['number']:02d}";nf=font(16)
     d.rounded_rectangle((1004,1389,1058,1427),radius=16,fill='#f7f1e7',outline='#a58c78',width=1)

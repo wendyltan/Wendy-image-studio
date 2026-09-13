@@ -577,14 +577,36 @@ export async function decidePanel(p,decision={}){
   Object.assign(p,latest);const current=p.panels[key],currentArtifact=(p.artifacts||[]).find(item=>item.id===artifactId);current.integrity=verified.integrity;currentArtifact.integrity=verified.integrity;const decidedAt=new Date().toISOString();current.userDecision={action:'accept_current',at:decidedAt,projectVersion:p.version,artifactId,contentHash,integritySha256:verified.integrity.sha256,acknowledgedIssueIds,issues:current.qa.issues||[]};p.panelDecision={state:'accepted',panelKey:key,artifactId,projectVersion:p.version,at:decidedAt};p.error=null;p.status='paused';p.message=`已明确采用第 ${key.split('-')[0]} 页第 ${key.split('-')[1]} 格当前图片。模型质检结论仍保留；接下来会继续排版和整篇检查。`;saveProject(p);
   return decision.continueProduction===false?p:generatePages(p);
 }
+function defaultCaptionAnchor(panel,index){return ['time','dialogue'].includes(panel?.captionKind)?'top-right':index%2?'top-left':'bottom-left';}
+function nextCaptionAnchor(anchor){return {'bottom-left':'top-right','top-left':'bottom-right','top-right':'bottom-left','bottom-right':'top-left'}[anchor]||'top-right';}
+function repairedLayoutHints(page,report,current={}){
+  const anchors=page.panels.map((panel,index)=>current.captionAnchors?.[index]||defaultCaptionAnchor(panel,index));
+  const widths=page.panels.map((_,index)=>Number(current.captionWidthRatios?.[index])||.62);
+  const affected=new Set();
+  for(const issue of report?.issueDetails||[]){
+    if(!['recompose','reletter'].includes(issue.repairAction)||!/(?:文字|文案|字幕|排字|遮挡)/.test(`${issue.location||''} ${issue.description||''}`))continue;
+    const match=/第\s*(\d+)\s*格/.exec(`${issue.location||''} ${issue.description||''}`);if(match)affected.add(Number(match[1])-1);
+  }
+  for(const index of affected)if(index>=0&&index<anchors.length){if(!current.captionAnchors?.[index]||widths[index]<=.38)anchors[index]=nextCaptionAnchor(anchors[index]);widths[index]=.36;}
+  return {style:'floating-v2',captionAnchors:anchors,captionWidthRatios:widths,source:'qa-repair',repairPrompt:report?.repairPrompt||'',at:new Date().toISOString()};
+}
+function pageQaDefinition(page){
+  return {...page,panels:page.panels.map(({prompt:_legacyPrompt,...panel})=>panel),layoutAuthority:'页面实际分格与本地排版器输出为唯一标准；旧生图提示中的比例措辞不参与成稿验收。'};
+}
+function invalidatePagePresentation(p,pageNumber,reason){
+  const oldPage=p.pages?.find(page=>Number(page.number)===Number(pageNumber));
+  if(oldPage){p.invalidatedPages=Array.isArray(p.invalidatedPages)?p.invalidatedPages:[];p.invalidatedPages.push({page:structuredClone(oldPage),reason,at:new Date().toISOString()});p.invalidatedPages=p.invalidatedPages.slice(-40);}
+  invalidateArtifacts(p,['story:audit','export:bundle']);p.storyQA=null;p.bundle=null;p.accepted=false;p.acceptance=null;
+}
 async function composePage(p,page,signal){
   const dir=runDir(p,`第${page.number}页排版`);const output=path.join(versionDir(p),'候选成稿',`${String(page.number).padStart(2,'0')}-${Date.now()}.png`);
   const images=page.panels.map((_,i)=>inside(projectDir(p.id),p.panels[`${page.number}-${i+1}`].file));
-  jsonWrite(path.join(dir,'排版.json'),{page,total:p.plan.pages.length,images,output});
+  const layoutHints=p.pageLayouts?.[page.number]||{style:'floating-v2'};
+  jsonWrite(path.join(dir,'排版.json'),{page,total:p.plan.pages.length,images,output,layoutHints});
   await pythonRun(['compose',path.join(dir,'排版.json')]);checkpoint(signal);
   activity(p,`正在核对第 ${page.number} 页的文字、画面和连续性…`);
-  const report=await qa(p,output,JSON.stringify(page),imageRefs(p,[...new Set(page.panels.flatMap(q=>q.references))]),signal,'1080×1440最终漫画页');
-  const result={number:page.number,file:path.relative(projectDir(p.id),output),qa:report,at:new Date().toISOString(),dependsOn:page.panels.map((_,i)=>artifactIdForImageKey(`${page.number}-${i+1}`))};
+  const report=await qa(p,output,JSON.stringify(pageQaDefinition(page)),imageRefs(p,[...new Set(page.panels.flatMap(q=>q.references))]),signal,'1080×1440最终漫画页');
+  const result={number:page.number,file:path.relative(projectDir(p.id),output),qa:report,layoutHints,at:new Date().toISOString(),dependsOn:page.panels.map((_,i)=>artifactIdForImageKey(`${page.number}-${i+1}`))};
   p.pages=p.pages.filter(q=>q.number!==page.number);p.pages.push(result);p.pages.sort((a,b)=>a.number-b.number);recordArtifact(p,`page:${page.number}`,'page',result.file,result.dependsOn);saveProject(p);
   if(!report.pass){
     const actions=[...repairActions(report)],onlyLayout=actions.length>0&&actions.every(action=>['reletter','recompose','review'].includes(action));
@@ -592,6 +614,32 @@ async function composePage(p,page,signal){
     if(!onlyLayout)throw new Error(`第 ${page.number} 页需要查看或修订：${report.issues.join('；')}`);
   }
   return result;
+}
+export function repairPageLayout(p,pageNumber){
+  verifyApproval(p);if(p.pending)throw new Error('有一张原图结果尚未确认，暂不能调整页面排版。');if(p.accepted)throw new Error('已收下的成品请先建立新版本再调整。');
+  const number=Number(pageNumber),page=p.plan.pages.find(item=>item.number===number),current=p.pages.find(item=>item.number===number);
+  if(!page||!current)throw new Error('这一页还没有可调整的成稿。');if(page.panels.some((_,index)=>!p.panels[`${number}-${index+1}`]?.file))throw new Error('这一页的原始分镜还不完整。');
+  return job(p,'revising',async signal=>{
+    activity(p,`正在只调整第 ${number} 页的文字框位置，不会重新生图…`,number,p.plan.pages.length,'页面');
+    invalidatePagePresentation(p,number,'layout-repaired');p.pageLayouts=p.pageLayouts||{};p.pageLayouts[number]=repairedLayoutHints(page,current.qa,p.pageLayouts[number]);saveProject(p);
+    const result=await composePage(p,page,signal);p.error=null;
+    if(result.qa.pass){p.status='paused';activity(p,`第 ${number} 页排版已修复并通过检查；原始分镜没有重新生成。`,number,p.plan.pages.length,'页面');}
+    else {p.status='attention';activity(p,`第 ${number} 页已换用新的文字框位置，但仍有排版问题，请查看后再次调整。`,number,p.plan.pages.length,'页面');}
+  });
+}
+export function unifyPageLayouts(p){
+  verifyApproval(p);if(p.pending)throw new Error('有一张原图结果尚未确认，暂不能统一页面排版。');if(p.accepted)throw new Error('已收下的成品请先建立新版本再调整。');
+  const numbers=(p.pages||[]).map(page=>Number(page.number)).filter(Number.isFinite).sort((a,b)=>a-b);if(numbers.length<2)throw new Error('至少需要两页成稿才能统一全篇排版。');
+  return job(p,'revising',async signal=>{
+    p.pageLayouts=p.pageLayouts||{};let failed=0;
+    for(const [index,number] of numbers.entries()){
+      const page=p.plan.pages.find(item=>item.number===number),current=p.pages.find(item=>item.number===number);if(!page||!current)continue;
+      checkpoint(signal);activity(p,`正在统一第 ${number} 页的圆角分格、浮动文字框和页码…`,index,numbers.length,'页面');
+      invalidatePagePresentation(p,number,'layout-unified');p.pageLayouts[number]=current.qa?.pass?{...p.pageLayouts[number],style:'floating-v2',source:'whole-story-unify',at:new Date().toISOString()}:repairedLayoutHints(page,current.qa,p.pageLayouts[number]);
+      const result=await composePage(p,page,signal);if(!result.qa.pass)failed++;
+    }
+    p.error=null;p.status=failed?'attention':'paused';activity(p,failed?`已有页面已统一为同一版式，其中 ${failed} 页仍需单独调整。`:`已有 ${numbers.length} 页已统一为同一版式，原始分镜均未重新生成。`,numbers.length,numbers.length,'页面');
+  });
 }
 async function addScreen(p,key,panel,signal){
   if(!panel.screenText || p.panels[key].screenApplied)return;
