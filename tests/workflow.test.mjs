@@ -55,17 +55,29 @@ test('input validation and restricted references',()=>{
   const bad=structuredClone(plan);bad.pages[0].panels[0].references=['02-小林人设/小林人设1.png'];assert.throws(()=>W.validatePlan(bad,brief),/未获准/);
   bad.pages[0].panels[0].references=[];bad.pages[0].panels[0].caption='小林发来消息';assert.throws(()=>W.validatePlan(bad,brief),/小林/);
 });
-test('web image provider uses dedicated Chrome and records exact artifacts',()=>{
+test('web image provider records the dedicated Chrome focus boundary',()=>{
   const text=G.chatGptWebImagePrompt({outputFile:'/tmp/result.png',manifestFile:'/tmp/web-generation.json',prompt:'单格测试',referenceFiles:['/tmp/wendi-1.png','/tmp/wendi-2.png']});
   assert.equal(G.WEB_IMAGE_PROVIDER,'chatgpt-web-iab');
-  assert.match(text,/只能新建本次任务的专用 Chrome 会话/);
+  assert.equal(G.WEB_IMAGE_TRANSPORT,'direct-chrome');
+  assert.equal(G.webWorkerStatus().browser,'chrome');
+  assert.match(text,/只能新建本次任务专用的 Chrome extension 标签页/);
   assert.match(text,/https:\/\/chatgpt\.com\//);
   assert.match(text,/复制到准确路径 \/tmp\/result\.png/);
   assert.match(text,/web-generation\.json/);
   assert.match(text,/禁止调用 image_gen/);
   assert.match(text,/禁止接管用户已有标签页/);
-  assert.match(text,/visible:false/);
-  assert.match(text,/后台隐藏/);
+  assert.match(text,/createBrowserTab\("chrome","https:\/\/chatgpt\.com",\{sessionName:"🎨 温蒂生图"\}\)/);
+  assert.doesNotMatch(text,/createBrowserTab\("chrome"[^\n]*visible:false/);
+  assert.doesNotMatch(text,/visible\s*:/);
+  assert.doesNotMatch(text,/createBrowserTab\("iab"/);
+  assert.match(text,/BROWSER_FOCUS_UNAVAILABLE/);
+  assert.match(text,/没有窗口\/标签页 active 或 focused 更新接口/);
+  assert.doesNotMatch(text,/browser\.capabilities\.list\(|management\.windows|getAll\(\{populate:true\}\)|management\.tabs\.update|management\.windows\.update/);
+  assert.match(text,/可能短暂取得焦点/);
+  assert.match(text,/无法严格保证零焦点切换/);
+  assert.match(text,/只绑定返回的自有 tab/);
+  assert.doesNotMatch(text,/不创建标签页、不上传、不发送/);
+  assert.doesNotMatch(text,/cua\.getTab\(/);
   assert.match(text,/tab\.close\(\)/);
   assert.match(text,/waitForEvent\("filechooser"\)/);
   assert.match(text,/chooser\.setFiles\(\)/);
@@ -74,8 +86,20 @@ test('web image provider uses dedicated Chrome and records exact artifacts',()=>
   assert.match(text,/authorization 是该操作发生后的持久证据/);
   assert.match(text,/当前同一个回合完成/);
 });
-test('web executor availability does not depend on an old worker probe',()=>{
-  assert.equal(G.webWorkerStatus().transport,'direct-chrome');assert.equal(G.webWorkerStatus().ready,true);
+test('web executor availability reports the direct Chrome focus boundary',()=>{
+  const worker=G.webWorkerStatus();assert.equal(worker.transport,'direct-chrome');assert.equal(worker.browser,'chrome');assert.equal(worker.state,'focus-unavailable');assert.equal(worker.focusRestoration,'unsupported');assert.equal(worker.focusSafe,false);assert.equal(worker.ready,true);assert.match(worker.message,/可能短暂取得焦点/);assert.match(worker.message,/无法严格保证零焦点切换/);
+});
+test('UI names concrete Chrome focus failures and keeps old IAB records historical',()=>{
+  const text=fs.readFileSync(path.join(W.APP,'app/page.tsx'),'utf8');
+  assert.match(text,/IAB_UNAVAILABLE/);
+  assert.match(text,/BROWSER_FOCUS_UNAVAILABLE/);
+  assert.match(text,/公开 CUA 没有 Chrome/);
+  assert.match(text,/无法零焦点切换/);
+  assert.match(text,/当前生产链路使用专用 Chrome 标签页/);
+  assert.match(text,/imageReady=\{data\?\.connection\.imageWorker\?\.ready !== false\}/);
+  assert.doesNotMatch(text,/imageWorker\?\.focusSafe !== false/);
+  assert.match(text,/专用 Chrome 标签页会短暂取得焦点/);
+  assert.doesNotMatch(text,/隐藏网页浏览器能力不可用；没有上传附件或发送消息。请恢复 Codex 内嵌浏览器 IAB/);
 });
 test('missing hidden IAB is definite pre-submission no-output evidence',()=>{
   const evidence=B.classifyGenerationEvidence({responseText:'Browser is not available: iab',exitCode:0});
@@ -263,6 +287,17 @@ test('an unavailable hidden IAB stops before any provider submission',async()=>{
   delete process.env.WENDI_TEST_NO_IMAGE_ONCE;delete process.env.WENDI_TEST_NO_IMAGE_TEXT;
   E.retryMissingImage(failed,'样张-1');failed=await done(failed.id);assert.equal(failed.currentTask.attempt,1);assert.equal(failed.progress.current,1);assert.equal(failed.progress.total,2);
 });
+test('an unavailable Chrome focus capability stops before any provider submission',async()=>{
+  const marker=path.join(temp,'chrome-focus-unavailable');process.env.WENDI_TEST_NO_IMAGE_ONCE=marker;process.env.WENDI_TEST_NO_IMAGE_TEXT='BROWSER_FOCUS_UNAVAILABLE: Chrome management capability is not advertised';
+  let failed=E.createProject({...brief,idea:'Chrome 焦点能力不可用测试'});E.planProject(failed);failed=await done(failed.id);E.approvePlan(failed,W.digest(failed.plan));failed=await done(failed.id);
+  assert.equal(failed.pending,null);assert.equal(failed.lastFailure.kind,'browser-unavailable');assert.equal(failed.lastFailure.attempts,0);assert.equal(failed.currentTask.providerInvocations,0);assert.equal(failed.currentTask.status,'failed_no_output');assert.match(failed.message,/公开 Chrome 焦点恢复能力|未提交图片请求/);
+  delete process.env.WENDI_TEST_NO_IMAGE_ONCE;delete process.env.WENDI_TEST_NO_IMAGE_TEXT;
+});
+test('manual retry keeps the direct Chrome path when focus restoration is unavailable',async()=>{
+  let project=E.createProject({...brief,idea:'手动重试允许已知焦点边界'});project.plan=structuredClone(plan);project.version=1;project.approved={version:1,hash:W.digest(project.plan)};project.samplesApproved=true;project.status='attention';project.currentTask={id:'focus-retry-task',kind:'image',target:'第1页-第1格',status:'failed_no_output',errorCode:'browser-unavailable',providerInvocations:0};project.lastFailure={kind:'browser-unavailable',definiteNoOutput:true,key:'第1页-第1格',attempts:0,taskId:'focus-retry-task',at:new Date().toISOString()};E.saveProject(project);
+  E.retryMissingImage(project,'第1页-第1格');project=await done(project.id);
+  assert.ok(!project.pending);assert.equal(project.currentTask.providerInvocations,1);assert.ok(project.panels['1-1']);assert.match(G.webWorkerStatus().message,/可能短暂取得焦点/);
+});
 test('a durable pre-submission web failure is safely retryable after restart',()=>{
   let failed=E.createProject({...brief,idea:'网页提交前失败恢复测试'});const dir=path.join(E.projectDir(failed.id),'.制作记录','pre-submit');
   fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(path.join(dir,'web-generation.json'),JSON.stringify({provider:G.WEB_IMAGE_PROVIDER,state:'failed',submitted:false,errorCode:'IAB_SESSION_LOST_BEFORE_SUBMIT',error:'IAB unavailable'}));
@@ -347,6 +382,27 @@ test('late accepted web failure preserves terminal identity during explicit reco
   assert.equal(saved.pending,null);assert.equal(saved.lastFailure.kind,'browser-unavailable');assert.equal(saved.currentTask.status,'failed_no_output');assert.equal(saved.currentTask.webState,'failed');
   assert.equal(JSON.parse(fs.readFileSync(path.join(dir,'web-generation.json'),'utf8')).requestId,requestId);
 });
+test('a pre-submission web failure never adopts an unrelated image path from run output',async()=>{
+  const project=E.createProject({...brief,idea:'提交前失败不得串用历史图片'});project.plan=structuredClone(plan);project.version=1;project.approved={version:1,hash:W.digest(project.plan)};project.samplesApproved=true;project.status='attention';
+  const dir=path.join(E.projectDir(project.id),'.制作记录','提交前串图防护'),target=path.join(E.projectDir(project.id),'v1','素材','第1页-第1格.png'),oldFile=path.join(E.projectDir(project.id),'v1','素材','历史旧图.png'),taskId='pre-submit-path-leak',requestId=crypto.randomUUID();fs.mkdirSync(path.dirname(target),{recursive:true});fs.mkdirSync(dir,{recursive:true});fs.copyFileSync(W.inside(W.REFS,W.FACE[0]),oldFile);const oldHash=sha256File(oldFile);
+  fs.writeFileSync(path.join(dir,'request.json'),JSON.stringify({schemaVersion:2,provider:G.WEB_IMAGE_PROVIDER,taskId,projectId:project.id,projectVersion:1,target:'第1页-第1格',expectedOutput:path.relative(E.projectDir(project.id),target)}));
+  fs.writeFileSync(path.join(dir,'worker-request.json'),JSON.stringify({schemaVersion:2,provider:G.WEB_IMAGE_PROVIDER,requestId,projectId:project.id,projectVersion:1}));
+  fs.writeFileSync(path.join(dir,'web-generation.json'),JSON.stringify({provider:G.WEB_IMAGE_PROVIDER,state:'failed',accepted:true,requestId,submitted:false,errorCode:'BROWSER_BACKGROUND_UNAVAILABLE',error:'hidden Chrome unavailable'}));
+  fs.writeFileSync(path.join(dir,'response.txt'),`历史记录里曾出现 \`${oldFile}\`。本次没有上传、提交或下载图片。`);
+  project.pending={key:'第1页-第1格',file:target,dir,prompt:'新分镜',refs:[],inputFiles:[],provider:G.WEB_IMAGE_PROVIDER,taskId,projectId:project.id,projectVersion:1,at:new Date().toISOString()};project.currentTask={id:taskId,kind:'image',target:'第1页-第1格',status:'unknown_result',providerInvocations:0};project.tasks=[project.currentTask];E.saveProject(project);
+  E.recoverImage(project);const saved=await done(project.id);
+  assert.equal(saved.pending,null);assert.equal(saved.lastFailure.kind,'browser-unavailable');assert.equal(saved.currentTask.status,'failed_no_output');assert.equal(saved.panels['1-1'],undefined);assert.equal(fs.existsSync(target),false);assert.equal(sha256File(oldFile),oldHash);
+});
+test('restart quarantines a web image that was attached despite pre-submission failure',()=>{
+  let project=E.createProject({...brief,idea:'重启清理提交前误挂图片'});project.plan=structuredClone(plan);project.version=1;project.approved={version:1,hash:W.digest(project.plan)};project.samplesApproved=true;project.status='attention';
+  const dir=path.join(E.projectDir(project.id),'.制作记录','已误挂的旧图'),file=path.join(E.projectDir(project.id),'v1','素材','第1页-第1格.png'),relative=path.relative(E.projectDir(project.id),file),taskId='attached-before-submit',requestId=crypto.randomUUID();fs.mkdirSync(path.dirname(file),{recursive:true});fs.mkdirSync(dir,{recursive:true});fs.copyFileSync(W.inside(W.REFS,W.FACE[0]),file);const originalHash=sha256File(file);
+  fs.writeFileSync(path.join(dir,'request.json'),JSON.stringify({schemaVersion:2,provider:G.WEB_IMAGE_PROVIDER,taskId,projectId:project.id,projectVersion:1,target:'第1页-第1格',expectedOutput:relative}));
+  fs.writeFileSync(path.join(dir,'worker-request.json'),JSON.stringify({schemaVersion:2,provider:G.WEB_IMAGE_PROVIDER,requestId,projectId:project.id,projectVersion:1}));
+  fs.writeFileSync(path.join(dir,'web-generation.json'),JSON.stringify({provider:G.WEB_IMAGE_PROVIDER,state:'failed',accepted:true,requestId,submitted:false,errorCode:'BROWSER_BACKGROUND_UNAVAILABLE',error:'hidden Chrome unavailable'}));
+  const record={key:'第1页-第1格',file:relative,provider:G.WEB_IMAGE_PROVIDER,qa:{pass:true},at:new Date().toISOString()};project.panels={'1-1':record};project.artifacts=[{id:'image:第1页-第1格',kind:'image',file:relative,dependsOn:[],valid:true,at:record.at}];project.tasks=[{id:taskId,kind:'image',target:'第1页-第1格',status:'artifact_saved',providerInvocations:0,artifact:file}];project.currentTask=project.tasks[0];E.saveProject(project);
+  E.recover();project=E.readProject(project.id);
+  assert.equal(project.panels['1-1'],undefined);assert.equal(project.quarantinedImages.length,1);assert.equal(project.quarantinedImages[0].image.file,relative);assert.equal(project.artifacts[0].valid,false);assert.equal(project.currentTask.status,'failed_no_output');assert.equal(project.lastFailure.kind,'browser-unavailable');assert.equal(E.imageRetryState(project).certainty,'confirmed_missing');assert.equal(fs.existsSync(file),true);assert.equal(sha256File(file),originalHash);
+});
 test('mismatched web failure cannot clear pending during explicit recovery',async()=>{
   const project=E.createProject({...brief,idea:'迟到接单终态身份保留测试'});project.plan=structuredClone(plan);project.version=1;project.approved={version:1,hash:W.digest(project.plan)};project.samplesApproved=true;project.status='attention';
   const dir=path.join(E.projectDir(project.id),'.制作记录','迟到接单失败'),file=path.join(E.projectDir(project.id),'v1','素材','迟到失败.png'),taskId='late-terminal-task',requestId=crypto.randomUUID(),acceptedAt='2026-09-11T09:36:41+08:00';fs.mkdirSync(dir,{recursive:true});
@@ -408,7 +464,7 @@ test('restart pauses jobs, and pending image never triggers a blind retry',()=>{
 test('composition rejects bad aspect ratios and oversized copy',async()=>{
   const image=path.join(temp,'wide.png');execFileSync(B.python(),['-c','from PIL import Image; import sys; Image.new("RGB",(1800,500)).save(sys.argv[1])',image]);
   const spec=path.join(temp,'bad-layout.json');W.jsonWrite(spec,{page:plan.pages[0],total:1,images:[image],output:path.join(temp,'bad.png')});
-  await assert.rejects(B.pythonRun(['compose',spec]),/比例/);
+  await assert.rejects(B.pythonRun(['compose',spec]),error=>{assert.match(error.message,/比例/);assert.doesNotMatch(error.message,/Traceback|ValueError/);return true;});
   const q=structuredClone(plan.pages[0]);q.panels[0].caption='太长的文案'.repeat(150);W.jsonWrite(spec,q);await assert.rejects(B.pythonRun(['geometry',spec]),/文案过长/);
 });
 test('web upload preparation shrinks large references without changing originals',async()=>{
@@ -422,8 +478,8 @@ test('HTTP service serves built app and blocks foreign writes and unlisted files
     assert(ready,output);const base=`http://127.0.0.1:${port}`;
     const health=await (await fetch(base+'/api/health')).json();assert.equal(typeof health.instanceId,'string');assert(health.instanceId.length>3);
     const boot=await (await fetch(base+'/api/bootstrap')).json();assert(boot.connection.ready);assert(boot.references.length>=20);
-    assert.equal(boot.connection.imageWorker.transport,'direct-chrome');
-    const refreshed=await (await fetch(base+'/api/connection',{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:'{}'})).json();assert.equal(refreshed.imageWorker.state,'available');assert.equal(refreshed.imageWorker.transport,'direct-chrome');
+  assert.equal(boot.connection.imageWorker.transport,'direct-chrome');assert.equal(boot.connection.imageWorker.browser,'chrome');assert.equal(boot.connection.imageWorker.state,'focus-unavailable');assert.equal(boot.connection.imageWorker.focusRestoration,'unsupported');assert.equal(boot.connection.imageWorker.focusSafe,false);
+  const refreshed=await (await fetch(base+'/api/connection',{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:'{}'})).json();assert.equal(refreshed.imageWorker.state,'focus-unavailable');assert.equal(refreshed.imageWorker.transport,'direct-chrome');assert.equal(refreshed.imageWorker.browser,'chrome');
     const terminalProject=E.createProject({...brief,idea:'HTTP 迟到接单终态一致性测试'});terminalProject.plan=structuredClone(plan);terminalProject.version=2;terminalProject.approved={version:2,hash:W.digest(terminalProject.plan)};terminalProject.samplesApproved=true;terminalProject.status='attention';
     const terminalDir=path.join(E.projectDir(terminalProject.id),'.制作记录','迟到终态'),terminalFile=path.join(E.projectDir(terminalProject.id),'v2','素材','终态占位.png'),terminalTaskId='http-late-terminal-task',terminalRequestId=crypto.randomUUID(),terminalAcceptedAt='2026-09-11T09:36:41+08:00';fs.mkdirSync(terminalDir,{recursive:true});fs.mkdirSync(path.dirname(terminalFile),{recursive:true});fs.writeFileSync(terminalFile,'fixture placeholder');
     fs.writeFileSync(path.join(terminalDir,'request.json'),JSON.stringify({schemaVersion:2,provider:G.WEB_IMAGE_PROVIDER,taskId:terminalTaskId,projectId:terminalProject.id,projectVersion:2,target:'第1页-第1格'}));fs.writeFileSync(path.join(terminalDir,'worker-request.json'),JSON.stringify({schemaVersion:2,provider:G.WEB_IMAGE_PROVIDER,requestId:terminalRequestId,projectId:terminalProject.id,projectVersion:2}));fs.writeFileSync(path.join(terminalDir,'web-generation.json'),JSON.stringify({provider:G.WEB_IMAGE_PROVIDER,state:'failed',accepted:true,requestId:terminalRequestId,acceptedAt:terminalAcceptedAt,submitted:false,errorCode:'IAB_UNAVAILABLE',error:'Codex IAB unavailable'}));

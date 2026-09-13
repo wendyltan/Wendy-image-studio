@@ -156,7 +156,7 @@ type Project = {
     target: string;
   } | null;
   lastFailure?: {
-    kind: 'network' | 'no-output';
+    kind: 'network' | 'no-output' | 'browser-unavailable';
     definiteNoOutput: boolean;
     key: string;
     attempts: number;
@@ -271,7 +271,17 @@ type Bootstrap = {
     message: string;
     imageWorker?: {
       ready: boolean;
-      state?: 'unavailable' | 'unknown' | 'verified-ready';
+      state?:
+        | 'available'
+        | 'unavailable'
+        | 'unknown'
+        | 'verified-ready'
+        | 'focus-unavailable';
+      focusSafe?: boolean;
+      focusRestoration?: 'unsupported' | 'conditional' | 'verified';
+      focusPolicy?: string;
+      browser?: string;
+      transport?: string;
       evidence?: string;
       message: string;
       probe?: {
@@ -2231,8 +2241,17 @@ function ProjectView({
         <div className="recovery-card">
           <AlertCircle />
           <div>
-            <h3>生图后台需要恢复</h3>
-            <p>{imageMessage || '恢复后再确认方案，避免流程开始后才中断。'}</p>
+            <h3>网页生图当前不可用</h3>
+            <p>{imageMessage || '请先连接 Codex 和 Chrome Computer Use。'}</p>
+          </div>
+        </div>
+      )}
+      {imageReady && imageMessage && project.status !== 'complete' && (
+        <div className="recovery-card">
+          <AlertCircle />
+          <div>
+            <h3>专用 Chrome 标签页会短暂取得焦点</h3>
+            <p>{imageMessage}</p>
           </div>
         </div>
       )}
@@ -2421,7 +2440,7 @@ function ProjectView({
                       </button>
                     )}
                     {!imageReady && (
-                      <small>{imageMessage || '生图后台恢复后即可开始。'}</small>
+                      <small>{imageMessage || '请先连接 Codex 和 Chrome Computer Use。'}</small>
                     )}
                   </div>
                 </div>
@@ -2788,13 +2807,33 @@ function WorkflowStatus({
   const webText = project.pending?.webState
     ? webStateLabels[project.pending.webState] || '网页后台处理中'
     : '';
+  const webFailureMessages: Record<string, string> = {
+    IAB_UNAVAILABLE:
+      '这是旧请求记录中的 Codex 内嵌浏览器 IAB 失败；没有上传附件或发送消息。当前生产链路使用专用 Chrome 标签页，当前请求已失败，记录仍保留。',
+    IAB_SESSION_LOST_BEFORE_SUBMIT:
+      '这是旧请求记录中的 Codex 内嵌浏览器 IAB 断开；没有上传附件或发送消息。当前生产链路使用专用 Chrome 标签页，当前请求已失败，记录仍保留。',
+    FILE_UPLOAD_IAB_UNAVAILABLE:
+      '这是旧请求记录中的 IAB 附件上传失败；没有发送消息。当前生产链路使用专用 Chrome 标签页，当前请求已失败，记录仍保留。',
+    BROWSER_FOCUS_UNAVAILABLE:
+      '后台已接单，但公开 CUA 没有 Chrome 窗口或标签页焦点恢复能力，无法零焦点切换；为保护温蒂创作室页面，没有创建标签页、上传附件或发送消息。当前请求已失败，记录仍保留。',
+    BROWSER_FOCUS_RESTORE_FAILED:
+      '后台已接单，但专用 Chrome 标签页创建后无法验证已恢复温蒂创作室焦点；没有上传附件或发送消息。当前请求已失败，记录仍保留。',
+    BROWSER_FOCUS_RESTORE_FAILED_AFTER_CLOSE:
+      '网页生图已停止，但关闭专用 Chrome 标签页后无法验证温蒂创作室焦点；请求记录仍保留，不会自动重试。',
+    BROWSER_TAB_BACKGROUND_UNAVAILABLE:
+      '后台已接单，但专用 Chrome 标签页在恢复创作室焦点后无法继续读取；没有上传附件或发送消息。当前请求已失败，记录仍保留。',
+    BROWSER_CHROME_UNAVAILABLE:
+      '后台已接单，但 Chrome Computer Use 扩展不可用；没有上传附件或发送消息。当前请求已失败，记录仍保留。',
+    BROWSER_BACKGROUND_UNAVAILABLE:
+      '这是旧请求记录中的后台浏览器能力失败；没有上传附件或发送消息。当前生产链路不会使用隐藏 IAB，请确认 Chrome 焦点管理能力后再重试。',
+  };
+  const webFailureCode = String(project.pending?.errorCode || '');
   const webFailureText =
     project.pending?.webState === 'failed'
-      ? project.pending.accepted && project.pending.errorCode === 'IAB_UNAVAILABLE'
-        ? '后台已接单，但提交前 Codex IAB 不可用；没有上传附件或发送消息。当前请求已失败，记录仍保留。'
-        : project.pending.accepted
+      ? webFailureMessages[webFailureCode] ||
+        (project.pending.accepted
           ? '后台已接单，但当前网页生图请求已失败；请求记录和原图找回入口仍保留。'
-          : '网页生图请求已失败；请求记录和原图找回入口仍保留。'
+          : '网页生图请求已失败；请求记录和原图找回入口仍保留。')
       : '';
   const statusMessage =
     webFailureText ||

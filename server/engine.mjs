@@ -17,7 +17,8 @@ const SCREEN_LOCATION_SCHEMA={type:'object',additionalProperties:false,required:
 // before the local copy step fails, so it must remain recoverable.
 const DEFINITE_NO_IMAGE=/(?:未能生成(?:任何)?(?:替代品|图片)?|没有生成(?:任何)?(?:替代品|图片)?|未(?:产生|产出)(?:任何)?图片|未(?:生成|输出)(?:任何)?图片|没有(?:产生|产出)(?:任何)?图片|目标路径尚不存在|no image (?:was )?(?:generated|produced|created|returned)|(?:did not|didn't) (?:generate|produce|return) (?:an? )?image|image generation (?:produced|returned) no image)/i;
 const NETWORK_FAILURE=/(?:network|connection|连接|网络|websocket)/i;
-const IAB_UNAVAILABLE=/(?:Browser is not available:\s*iab|隐藏\s*IAB.*不可用)/i;
+const IAB_UNAVAILABLE=/(?:Browser is not available:\s*iab|IAB[_\s-]*(?:UNAVAILABLE|NOT[_\s-]*AVAILABLE)|IAB[_\s-]*SESSION[_\s-]*LOST[_\s-]*BEFORE[_\s-]*SUBMIT|Capability is not available:\s*(?:visibility|browser)|隐藏\s*IAB.*不可用)/i;
+const BROWSER_FOCUS_UNAVAILABLE=/(?:BROWSER_(?:FOCUS|TAB_BACKGROUND|CHROME)_(?:UNAVAILABLE|RESTORE_FAILED)|Browser is not available:\s*chrome|Chrome management capability is not advertised|焦点(?:恢复|管理)能力(?:不可用|未提供|未广告)|非前台(?:标签页|tab).*(?:不可用|失败)|后台标签页.*(?:不可用|失败)|无法恢复创作室焦点)/i;
 export function projectDir(id){if(!ID.test(id))throw new Error('作品不存在');return inside(DATA,id);}
 function inferredModelAt(p,at){
   const history=(p.modelHistory||[]).filter(item=>Date.parse(item.at)<=at).sort((a,b)=>Date.parse(a.at)-Date.parse(b.at));
@@ -66,6 +67,7 @@ export function recover(){
   for(const p of listProjects()){
   if(jobStore.hasLiveWork(p.id))continue;
   let migrated=false;
+  if(quarantinePreSubmissionArtifacts(p))migrated=true;
   if(p.lastFailure?.kind==='network'&&p.lastFailure.definiteNoOutput!==false){p.lastFailure.definiteNoOutput=false;migrated=true;}
   if(p.currentTask?.status==='failed_no_output'&&(!['no-output','browser-unavailable'].includes(p.currentTask.errorCode)||p.lastFailure?.kind==='network')){p.currentTask.status='unknown_result';p.currentTask.errorCode='network';p.status='attention';p.message=unknownResultMessage(p.currentTask.target);p.error=p.message;migrated=true;}
   if(!p.lastFailure&&p.currentTask?.status==='failed_no_output'&&!p.pending){
@@ -239,6 +241,47 @@ function matchingPendingManifest(pending){
     return manifest;
   }catch{return null;}
 }
+function manifestBrowserUnavailable(manifest){
+  return /(?:IAB|WEB_WORKER_ARCHIVED|BROWSER(?:_[A-Z]+)*(?:_UNAVAILABLE|_FAILED)|FILE_UPLOAD_CHROME_UNAVAILABLE|CHATGPT_LOGIN_REQUIRED|Browser is not available|Chrome management capability is not advertised|焦点(?:恢复|管理)能力)/i.test(String(manifest?.errorCode||manifest?.error||''));
+}
+function preSubmissionPanelEvidence(p,panelKey,record,task){
+  const records=path.join(projectDir(p.id),'.制作记录');if(!fs.existsSync(records))return null;
+  let artifact;try{artifact=inside(projectDir(p.id),record.file);}catch{return null;}
+  for(const name of fs.readdirSync(records).reverse()){
+    const dir=path.join(records,name);let request,worker,manifest;
+    try{
+      request=JSON.parse(fs.readFileSync(path.join(dir,'request.json'),'utf8'));
+      worker=JSON.parse(fs.readFileSync(path.join(dir,'worker-request.json'),'utf8'));
+      manifest=readWebManifest(path.join(dir,'web-generation.json'));
+    }catch{continue;}
+    if(request.provider!==WEB_IMAGE_PROVIDER||worker.provider!==WEB_IMAGE_PROVIDER||manifest?.provider!==WEB_IMAGE_PROVIDER)continue;
+    if(request.taskId!==task.id||request.projectId!==p.id||Number(request.projectVersion)!==Number(p.version)||request.target!==task.target)continue;
+    if(!manifest.requestId||worker.requestId!==manifest.requestId||manifest.state!=='failed'||manifest.submitted===true)continue;
+    if(request.expectedOutput&&path.resolve(projectDir(p.id),request.expectedOutput)!==artifact)continue;
+    if(panelKeyFromImageKey(request.target)!==panelKey)continue;
+    return {dir,manifest};
+  }
+  return null;
+}
+function quarantinePreSubmissionArtifacts(p){
+  let count=0;
+  for(const [panelKey,record] of Object.entries(p.panels||{})){
+    if(record?.provider!==WEB_IMAGE_PROVIDER||!record.file)continue;
+    let artifact;try{artifact=inside(projectDir(p.id),record.file);}catch{continue;}
+    const task=(p.tasks||[]).slice().reverse().find(item=>item.kind==='image'&&panelKeyFromImageKey(item.target)===panelKey&&Number(item.providerInvocations)===0&&['artifact_saved','artifact_saved_unchecked','completed'].includes(item.status)&&(!item.artifact||path.resolve(item.artifact)===path.resolve(artifact)));
+    if(!task)continue;
+    const evidence=preSubmissionPanelEvidence(p,panelKey,record,task);if(!evidence)continue;
+    const kind=manifestBrowserUnavailable(evidence.manifest)?'browser-unavailable':'no-output',at=new Date().toISOString();
+    p.quarantinedImages=Array.isArray(p.quarantinedImages)?p.quarantinedImages:[];
+    p.quarantinedImages.push({panelKey,image:structuredClone(record),taskId:task.id,reason:'pre-submission-misattribution',runDir:path.relative(projectDir(p.id),evidence.dir),at});p.quarantinedImages=p.quarantinedImages.slice(-40);
+    invalidatePanelDownstream(p,panelKey);invalidateArtifacts(p,[artifactIdForImageKey(task.target)]);delete p.panels[panelKey];
+    Object.assign(task,{status:'failed_no_output',errorCode:kind,providerInvocations:0,quarantinedArtifact:task.artifact||artifact,completedAt:task.completedAt||at});p.currentTask=task;
+    if(p.pending?.taskId===task.id)p.pending=null;
+    const message=`${task.target} 的网页任务在上传和提交前已经停止；误挂接的历史图片已解除，原文件与制作记录均已保留。公开 Chrome 焦点管理能力可用后，点击“重试当前图片”只会重新制作这一张。`;
+    p.lastFailure={kind,definiteNoOutput:true,key:task.target,attempts:0,inputTokens:0,taskId:task.id,at,message};p.status='attention';p.message=message;p.error=message;count++;
+  }
+  return count;
+}
 function definiteImageFailure(pending,extra=''){
   if(!pending?.dir)return null;const evidence=runEvidence(pending.dir),classified=readGenerationEvidence(pending.dir),combined=[extra,evidence.text,evidence.eventText].filter(Boolean).join('\n');
   const manifest=pending.provider===WEB_IMAGE_PROVIDER?matchingPendingManifest(pending):readWebManifest(path.join(pending.dir,'web-generation.json'));
@@ -247,17 +290,17 @@ function definiteImageFailure(pending,extra=''){
   // that the provider produced no image. Preserve it for recovery instead.
   if(manifest?.submitted)return null;
   if(manifest?.state==='failed'){
-    const unavailable=/(?:IAB|WEB_WORKER_ARCHIVED|BROWSER_UNAVAILABLE|CHATGPT_LOGIN_REQUIRED|Browser is not available)/i.test(String(manifest.errorCode||manifest.error||''));
+    const unavailable=manifestBrowserUnavailable(manifest);
     return {kind:unavailable?'browser-unavailable':'no-output',definiteNoOutput:true,key:pending.key,attempts:0,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString(),...(manifest.error?{message:manifest.error}: {})};
   }
   if(NETWORK_FAILURE.test(combined)||classified.connectionRelated)return null;
   const manifestError=[manifest?.errorCode,manifest?.error].filter(Boolean).join(' ');
-  if(IAB_UNAVAILABLE.test(combined)||IAB_UNAVAILABLE.test(manifestError))return {kind:'browser-unavailable',definiteNoOutput:true,key:pending.key,attempts:0,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString()};
+  if(IAB_UNAVAILABLE.test(combined)||IAB_UNAVAILABLE.test(manifestError)||BROWSER_FOCUS_UNAVAILABLE.test(combined)||BROWSER_FOCUS_UNAVAILABLE.test(manifestError))return {kind:'browser-unavailable',definiteNoOutput:true,key:pending.key,attempts:0,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString()};
   if(!DEFINITE_NO_IMAGE.test(combined)&&!DEFINITE_NO_IMAGE.test(manifestError)&&classified.outcome!=='no_image')return null;
   const attempts=Math.max(1,(evidence.eventText.match(/image generation failed/gi)||[]).length);
   return {kind:'no-output',definiteNoOutput:true,key:pending.key,attempts,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString()};
 }
-function failureMessage(failure){if(failure.message)return failure.message;const usage=failure.inputTokens?`本次后台处理记录约 ${failure.inputTokens.toLocaleString('zh-CN')} 输入 tokens；`:'';const action=String(failure.key||'').includes('样张')?'重试当前样张':'重试当前图片';if(failure.kind==='browser-unavailable')return `专用生图页面暂不可用，本次未提交图片请求。${usage}当前节点已经保存；Chrome 已连接且 ChatGPT 登录后点击“${action}”，只会重试这一张。`;return `${failure.kind==='network'?'生图服务连接失败':'本次生图未完成'}：已发起 ${failure.attempts} 次图片请求，但没有取得图片。${usage}自动重试已停止，上一张样张和当前节点都已保存。实际订阅余额以页面顶部为准；网络稳定后点击“${action}”，只会重试这一张。`;}
+function failureMessage(failure){const usage=failure.inputTokens?`本次后台处理记录约 ${failure.inputTokens.toLocaleString('zh-CN')} 输入 tokens；`:'';const action=String(failure.key||'').includes('样张')?'重试当前样张':'重试当前图片';if(failure.kind==='browser-unavailable'){const historical=IAB_UNAVAILABLE.test(String(failure.message||''));return `${historical?'历史 Codex 内嵌浏览器 IAB':'专用 Chrome 标签页的公开焦点恢复能力'}暂不可用，本次未提交图片请求。${usage}当前节点已经保存；${historical?'当前生产链路不会退回 IAB，请确认 Chrome Computer Use 与焦点安全能力':'当前公开 CUA 无法保证零焦点切换，请等待支持焦点恢复的能力'}后点击“${action}”，只会重试这一张。`;}if(failure.message)return failure.message;return `${failure.kind==='network'?'生图服务连接失败':'本次生图未完成'}：已发起 ${failure.attempts} 次图片请求，但没有取得图片。${usage}自动重试已停止，上一张样张和当前节点都已保存。实际订阅余额以页面顶部为准；网络稳定后点击“${action}”，只会重试这一张。`;}
 function sampleRepairCount(p,index){
   p.sampleRepairCounts=Array.isArray(p.sampleRepairCounts)?p.sampleRepairCounts:[0,0];
   const parsed=Number(/自动修订(\d+)/.exec(p.samples[index]?.key||'')?.[1])||0;
@@ -430,14 +473,31 @@ function previousConversation(prior){
 }
 function attributableCandidates(pending){
   const evidence=readGenerationEvidence(pending.dir||''),inputs=new Set((pending.inputFiles||[]).map(file=>path.resolve(file)));
+  if(pending.provider===WEB_IMAGE_PROVIDER){
+    if(process.env.WENDI_TEST_PLAN_FILE&&fs.existsSync(pending.file))return {evidence,candidates:[path.resolve(pending.file)]};
+    const manifest=matchingPendingManifest(pending),artifact=path.resolve(String(manifest?.artifactPath||'')),target=path.resolve(pending.file);
+    const proven=manifest?.state==='downloaded'&&manifest.accepted===true&&manifest.submitted===true&&artifact===target&&fs.existsSync(target);
+    return {evidence,candidates:proven?[target]:[]};
+  }
   const target=fs.existsSync(pending.file)?[pending.file]:[];
   const reported=(evidence.imagePaths||[]).filter(file=>path.isAbsolute(file)&&fs.existsSync(file));
-  const legacy=pending.provider===WEB_IMAGE_PROVIDER?[]:(generatedCandidates(pending.dir,Date.parse(pending.at))||[]);
+  const legacy=generatedCandidates(pending.dir,Date.parse(pending.at))||[];
   const candidates=[...new Set([...target,...reported,...legacy].map(file=>path.resolve(file)).filter(file=>!inputs.has(file)))];
   return {evidence,candidates};
 }
 async function generate(p,key,prompt,refnames,signal,prior=null,verify=true,qaKind='原始分镜',attempt=1){
-  checkpoint(signal);await protectQuota(p);checkpoint(signal);const refs=imageRefs(p,refnames);const folder=path.join(versionDir(p),'素材');fs.mkdirSync(folder,{recursive:true});
+  checkpoint(signal);
+  // Check that the local Codex executor is available before doing quota work
+  // or preparing files.  The public CUA has no focus-restore API, but the
+  // direct-Chrome path records that boundary and continues with its one owned
+  // tab instead of pretending it can run invisibly.
+  if(!process.env.WENDI_TEST_PLAN_FILE){
+    const worker=webWorkerStatus();
+    if(!worker.ready){
+      const error=new Error(worker.message);error.code='BROWSER_CHROME_UNAVAILABLE';throw error;
+    }
+  }
+  await protectQuota(p);checkpoint(signal);const refs=imageRefs(p,refnames);const folder=path.join(versionDir(p),'素材');fs.mkdirSync(folder,{recursive:true});
   if(p.pending)throw new Error('当前图片任务尚未结束，请先检查已有原图。');
   let file=path.join(folder,`${key}-${Date.now()}.png`);const dir=runDir(p,key),sourceFiles=prior?[prior,...refs]:refs,uploadSpec=path.join(dir,'上传素材.json');fs.mkdirSync(dir,{recursive:true});
   activity(p,`正在整理并压缩${sourceFiles.length}个上传素材…`);jsonWrite(uploadSpec,{files:sourceFiles,outputDir:path.join(dir,'上传素材')});
@@ -466,8 +526,7 @@ async function generate(p,key,prompt,refnames,signal,prior=null,verify=true,qaKi
   // Ambiguous candidates are recorded but never guessed at.
   const {evidence,candidates}=attributableCandidates(pending);
   let persisted=null;
-  if(fs.existsSync(file))persisted=await persistImage(file,file);
-  else if(candidates.length===1)persisted=await persistImage(candidates[0],file);
+  if(candidates.length===1)persisted=await persistImage(candidates[0],file);
   if(!persisted){
     const candidateNames=candidates.map(candidate=>path.basename(candidate));
     writeRunResult(dir,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:task.id,attempt:task.attempt,endedAt:new Date().toISOString(),outcome:'artifact_not_located',diagnostics:generationDiagnosticSummary(evidence),candidateCount:candidateNames.length,candidateNames,error:failure?String(failure.message||failure).slice(0,500):null});
@@ -795,8 +854,7 @@ export function recoverImage(p){verifyApproval(p);if(!p.pending)throw new Error(
   let file=pending.file;
   const {evidence,candidates}=attributableCandidates(pending);
   let persisted=null;
-  if(fs.existsSync(file))persisted=await persistImage(file,file);
-  else if(candidates.length===1)persisted=await persistImage(candidates[0],file);
+  if(candidates.length===1)persisted=await persistImage(candidates[0],file);
   if(!persisted){
     writeRunResult(pending.dir,{schemaVersion:2,provider:pending.provider||'legacy',taskId:pending.taskId||null,endedAt:new Date().toISOString(),outcome:'artifact_still_unknown',...recoveryIdentity,diagnostics:generationDiagnosticSummary(evidence),candidateCount:candidates.length,candidateNames:candidates.map(candidate=>path.basename(candidate))});
     const known=definiteImageFailure(pending);

@@ -5,7 +5,7 @@ import readline from 'node:readline';
 import {APP} from './workflow.mjs';
 
 const IMAGE_PATH = /(?:^|[\s"'`(])((?:\/[^\n<>"'`]+?)\.(?:png|webp|jpe?g))(?:$|[\s"'`,)])/gi;
-const CLEAR_NO_IMAGE = /(?:未产生(?:任何)?图片|未产出(?:任何)?图片|未能生成(?:图片)?|没有生成(?:替代品|图片)|没有(?:任何)?图片(?:产出|生成)?|目标路径尚不存在|未写入目标路径|Browser is not available:\s*iab|隐藏\s*IAB.*不可用|no image (?:was )?(?:generated|produced|created)|image generation (?:did not|failed to) (?:produce|create))/i;
+const CLEAR_NO_IMAGE = /(?:未产生(?:任何)?图片|未产出(?:任何)?图片|未能生成(?:图片)?|没有生成(?:替代品|图片)|没有(?:任何)?图片(?:产出|生成)?|目标路径尚不存在|未写入目标路径|Browser is not available:\s*(?:iab|chrome)|隐藏\s*IAB.*不可用|BROWSER_(?:FOCUS|TAB_BACKGROUND|CHROME)_(?:UNAVAILABLE|RESTORE_FAILED)|Chrome management capability is not advertised|焦点(?:恢复|管理)能力(?:不可用|未提供|未广告)|无法恢复创作室焦点|no image (?:was )?(?:generated|produced|created)|image generation (?:did not|failed to) (?:produce|create))/i;
 const NETWORK_INTERRUPTION = /(?:network|connection|connect(?:ion)? (?:reset|refused|failed|closed)|websocket|tls|ssl|tunnel|econn(?:reset|refused|timeout)|enotfound|连接(?:错误|中断|失败|超时)?|网络(?:错误|中断|失败|超时)?|代理|隧道)/i;
 
 function eventObjects(value){
@@ -108,7 +108,11 @@ export function pythonRun(args) {
   return new Promise((resolve,reject)=>{
     const p=spawn(python(),[path.join(APP,'server/compose.py'),...args],{stdio:['ignore','pipe','pipe']});
     let out='',err=''; p.stdout.on('data',c=>out+=c);p.stderr.on('data',c=>err+=c);
-    p.on('error',reject);p.on('close',code=>code===0?resolve(out):reject(new Error(err.trim()||'图片排版未完成')));
+    p.on('error',reject);p.on('close',code=>{
+      if(code===0){resolve(out);return;}
+      const last=err.trim().split('\n').map(line=>line.trim()).filter(Boolean).at(-1)||'图片排版未完成';
+      reject(new Error(last.replace(/^[\w.]+(?:Error|Exception):\s*/,'')||'图片排版未完成'));
+    });
   });
 }
 export async function connectionStatus() {
