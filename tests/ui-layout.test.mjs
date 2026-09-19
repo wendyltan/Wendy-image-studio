@@ -5,6 +5,14 @@ import { test } from 'node:test';
 
 const appRoot = path.resolve(import.meta.dirname, '..');
 const page = fs.readFileSync(path.join(appRoot, 'app/page.tsx'), 'utf8');
+const studioSources = [
+  page,
+  fs.readFileSync(path.join(appRoot, 'app/studio/project-view.tsx'), 'utf8'),
+  fs.readFileSync(path.join(appRoot, 'app/studio/workflow-status.tsx'), 'utf8'),
+  fs.readFileSync(path.join(appRoot, 'app/studio/recovery-cards.tsx'), 'utf8'),
+  fs.readFileSync(path.join(appRoot, 'app/studio/visuals.tsx'), 'utf8'),
+  fs.readFileSync(path.join(appRoot, 'app/studio/workflow-utils.ts'), 'utf8'),
+].join('\n');
 const css = fs.readFileSync(path.join(appRoot, 'app/globals.css'), 'utf8');
 
 function rule(selector) {
@@ -21,7 +29,7 @@ test('source storyboard cards keep mixed-ratio images at natural card height', (
   const card = rule('.source-grid>div');
   const image = rule('.image-button img');
 
-  assert.match(page, /className="source-grid"/);
+  assert.match(studioSources, /className="source-grid"/);
   assert.match(grid, /display:grid/);
   assert.match(
     grid,
@@ -35,9 +43,9 @@ test('source storyboard cards keep mixed-ratio images at natural card height', (
 });
 
 test('formal panel decision keeps its explanation separated from high-contrast actions', () => {
-  assert.match(page, /className="approval-card panel-decision-card"/);
-  assert.match(page, /<h2>正式分镜需要你来决定<\/h2>/);
-  assert.match(page, /className="inline-actions"/);
+  assert.match(studioSources, /className="approval-card panel-decision-card"/);
+  assert.match(studioSources, /<h2>正式分镜需要你来决定<\/h2>/);
+  assert.match(studioSources, /className="inline-actions"/);
 
   const decisionActions = rule('.panel-decision-card>.inline-actions');
   assert.match(
@@ -71,11 +79,11 @@ test('formal panel decision keeps its explanation separated from high-contrast a
 });
 
 test('storyboard grids use measured row spans instead of CSS columns', () => {
-  assert.match(page, /function MeasuredMasonryGrid/);
-  assert.match(page, /new ResizeObserver/);
-  assert.match(page, /requestAnimationFrame/);
-  assert.match(page, /className="finished-grid"/);
-  assert.match(page, /className="source-grid"/);
+  assert.match(studioSources, /function MeasuredMasonryGrid/);
+  assert.match(studioSources, /new ResizeObserver/);
+  assert.match(studioSources, /requestAnimationFrame/);
+  assert.match(studioSources, /className="finished-grid"/);
+  assert.match(studioSources, /className="source-grid"/);
   assert.match(
     css,
     /grid-auto-rows:\s*var\(--masonry-row-size\)/,
@@ -105,67 +113,67 @@ test('storyboard grids use measured row spans instead of CSS columns', () => {
 });
 
 test('deferred QA is visible as a non-passing state on finished cards', () => {
-  assert.match(page, /qa\.status\s*===\s*['"]deferred['"]/);
-  assert.match(page, /待检查\/未校对/);
+  assert.match(studioSources, /qa\.status\s*===\s*['"]deferred['"]/);
+  assert.match(studioSources, /待检查\/未校对/);
   assert.match(css, /\.qa-label\.deferred\{/);
 });
 
 test('panel decisions prefill the manual repair prompt into image revision', () => {
   assert.match(
-    page,
+    studioSources,
     /onEdit=\{\(repairPrompt\) => \{\s*setEditNote\(repairPrompt \|\| ''\)/,
     'manual panel repair instructions should be shown in the existing edit dialog',
   );
   assert.match(
-    page,
+    studioSources,
     /onClick=\{\(\) => onEdit\(image\.qa\.repairPrompt\)\}/,
     'the panel decision must pass its precise repair prompt to the edit handler',
   );
   assert.match(
-    page,
+    studioSources,
     /action\('revise-image', \{ key: edit\.key, note: editNote \}\)/,
     'the prefilled repair instructions must be sent as the revision note',
   );
 });
 
 test('terminal workflow timing freezes safely and marks unreached browser stages', () => {
-  assert.match(page, /function terminalTime\(/);
+  assert.match(studioSources, /function terminalTime\(/);
   assert.match(
-    page,
+    studioSources,
     /task\?\.completedAt,[\s\S]*progress\?\.completedAt,[\s\S]*task\?\.lastProgressAt/,
     'terminal timing should prefer task completion and safe progress timestamps',
   );
-  assert.match(page, /state: 'not_reached'/);
-  assert.match(page, /stage\.state === 'not_reached'[\s\S]*'未到达'/);
+  assert.match(studioSources, /state: 'not_reached'/);
+  assert.match(studioSources, /stage\.state === 'not_reached'[\s\S]*'未到达'/);
   assert.doesNotMatch(
-    page,
+    studioSources,
     /fallbackEnd\s*=\s*Date\.now\(\)/,
     'terminal stage durations must not default to the wall clock',
   );
-  assert.match(page, /stageFallbackEnd/);
+  assert.match(studioSources, /stageFallbackEnd/);
 });
 
 test('recovery and panel decisions render through one primary card priority', () => {
-  assert.match(page, /const primaryCard = unknownResult/);
-  assert.match(page, /primaryCard === 'panel'/);
-  assert.match(page, /previousAttemptNoOutput=\{noOutput\}/);
-  assert.match(page, /本次修改未取得新图，上一版原图仍保留/);
-  assert.match(page, /panelDecisionPrimary=\{primaryCard === 'panel'\}/);
-  assert.match(page, /采用上一版/);
-  assert.match(page, /继续修改这一张/);
+  assert.match(studioSources, /const primaryCard = unknownResult/);
+  assert.match(studioSources, /primaryCard === 'panel'/);
+  assert.match(studioSources, /previousAttemptNoOutput=\{noOutput\}/);
+  assert.match(studioSources, /本次修改未取得新图，上一版原图仍保留/);
+  assert.match(studioSources, /panelDecisionPrimary=\{primaryCard === 'panel'\}/);
+  assert.match(studioSources, /采用上一版/);
+  assert.match(studioSources, /继续修改这一张/);
   assert.match(
-    page,
+    studioSources,
     /primaryCard === 'no-output'[\s\S]*NoOutputCard/,
     'known missing output should remain available when no previous panel decision exists',
   );
 });
 
 test('model usage details are collapsed while the aggregate remains visible', () => {
-  assert.match(page, /<section className="metrics-panel"/);
-  assert.match(page, /<details className="model-usage-details">/);
-  assert.match(page, /<summary>查看模型明细<\/summary>/);
+  assert.match(studioSources, /<section className="metrics-panel"/);
+  assert.match(studioSources, /<details className="model-usage-details">/);
+  assert.match(studioSources, /<summary>查看模型明细<\/summary>/);
   assert.doesNotMatch(
-    page,
+    studioSources,
     /<details className="model-usage-details" open>/,
     'model detail rows should be collapsed by default',
   );
@@ -173,26 +181,26 @@ test('model usage details are collapsed while the aggregate remains visible', ()
 });
 
 test('idle wall-clock updates are conditional and storyboard images are lazy decoded', () => {
-  assert.match(page, /function workflowClockActive\(/);
-  assert.match(page, /project\.busy/);
-  assert.match(page, /taskRunning = project\?\.currentTask\?\.status === 'running'/);
-  assert.match(page, /project\.progress\?\.activeStage\?\.state === 'running'/);
-  assert.match(page, /if \(!clockActive\) return;/);
+  assert.match(studioSources, /function workflowClockActive\(/);
+  assert.match(studioSources, /project\.busy/);
+  assert.match(studioSources, /taskRunning = project\?\.currentTask\?\.status === 'running'/);
+  assert.match(studioSources, /project\.progress\?\.activeStage\?\.state === 'running'/);
+  assert.match(studioSources, /if \(!clockActive\) return;/);
   assert.match(
-    page,
+    studioSources,
     /alt="样张"[\s\S]{0,180}loading="lazy"[\s\S]{0,80}decoding="async"/,
   );
   assert.match(
-    page,
+    studioSources,
     /alt=\{`第\$\{p\.number\}页`\}[\s\S]{0,180}loading="lazy"[\s\S]{0,80}decoding="async"/,
   );
   assert.match(
-    page,
+    studioSources,
     /alt=\{`分镜\$\{k\}`\}[\s\S]{0,180}loading="lazy"[\s\S]{0,80}decoding="async"/,
   );
-  assert.match(page, /className="reference-grid"/);
+  assert.match(studioSources, /className="reference-grid"/);
   assert.match(
-    page,
+    studioSources,
     /src=\{a\.url\}[\s\S]*loading="lazy"[\s\S]*decoding="async"/,
   );
 });

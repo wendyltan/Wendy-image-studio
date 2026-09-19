@@ -5,8 +5,9 @@ import {DATA,REFS,FACE,CHECKS,jsonWrite,inside,rules,digest,validatePlan,PLAN_SC
 import {runCodex,pythonRun,rateLimitSnapshot,readGenerationEvidence,generationDiagnosticSummary,findCodex} from './bridge.mjs';
 import {JobStore} from './job-store.mjs';
 import {WEB_IMAGE_PROVIDER,WEB_IMAGE_EXECUTOR_ROLE,WEB_IMAGE_EXECUTOR_EFFORT,chatGptWebImagePrompt,dispatchChatGptWebJob,resumeChatGptWebJob,confirmedUnsentWebAudit,readWebManifest,webWorkerStatus} from './chatgpt-web-provider.mjs';
-import {readRunIdentity,compareRunIdentity,readRunEvidence} from './run-identity.mjs';
-import {IMAGE_OUTCOME,SAVED_ARTIFACT_QA_MESSAGE,SavedArtifactQaUnavailableError,savedArtifactQaUnavailable} from './image-lifecycle.mjs';
+import {IMAGE_OUTCOME,SAVED_ARTIFACT_QA_MESSAGE,SavedArtifactQaUnavailableError,savedArtifactQaUnavailable,applySavedArtifactQaOutcome} from './image-lifecycle.mjs';
+import {createTaskState,imageRetryState as deriveImageRetryState,retryableImageFailure as deriveRetryableImageFailure,unknownResultMessage as deriveUnknownResultMessage} from './task-state.mjs';
+import {createImageRecovery} from './image-recovery.mjs';
 import {buildRevisionPrompt,revisionPromptTelemetry} from './revision-prompt.mjs';
 export {buildRevisionPrompt,revisionPromptTelemetry};
 export const active = new Map();
@@ -88,6 +89,8 @@ export function saveProject(p){
   }
   p.schemaVersion=3;p.revision=(Number(p.revision)||0)+1;p.updatedAt=new Date().toISOString();jsonWrite(file,p);
 }
+const taskState=createTaskState({saveProject});
+const {beginTask,finishTask}=taskState;
 export function listProjects(){return fs.readdirSync(DATA).filter(id=>ID.test(id)&&fs.existsSync(path.join(DATA,id,'project.json'))).map(readProject).sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt));}
 export function recover(){
   const recoverable=jobStore.recoverable();
@@ -269,16 +272,6 @@ export function refreshQuotaPauses(remaining){
   return changed;
 }
 function runDir(p,label){return path.join(projectDir(p.id),'.制作记录',`${Date.now()}-${crypto.randomUUID().slice(0,8)}-${label}`);}
-function beginTask(p,kind,target,detail={}){
-  const now=new Date().toISOString();p.tasks=Array.isArray(p.tasks)?p.tasks:[];
-  // A user-requested retry is a new attempt, never an invisible continuation
-  // of the failed provider call.  Keeping this number makes the on-disk run
-  // history useful after a restart without pretending it is a provider count.
-  const attempt=p.tasks.filter(item=>item.kind===kind&&item.target===target).length+1;
-  const task={id:crypto.randomUUID(),kind,target,status:'running',attempt,startedAt:now,lastProgressAt:now,projectId:p.id,projectVersion:p.version,...detail};
-  p.tasks.push(task);p.tasks=p.tasks.slice(-80);p.currentTask=task;saveProject(p);return task;
-}
-function finishTask(p,task,status,extra={}){if(!task)return;Object.assign(task,{status,completedAt:new Date().toISOString(),...extra});if(p.currentTask?.id===task.id)p.currentTask=task;saveProject(p);}
 function recordArtifact(p,id,kind,file,dependsOn=[],extra={}){p.artifacts=Array.isArray(p.artifacts)?p.artifacts:[];p.artifacts=p.artifacts.filter(x=>x.id!==id);p.artifacts.push({id,kind,file,dependsOn,valid:true,at:new Date().toISOString(),...extra});p.artifacts=p.artifacts.slice(-200);}
 function invalidateArtifacts(p,ids){
   // A panel can feed a page, which in turn feeds the story audit and export.
@@ -295,27 +288,32 @@ function invalidateArtifacts(p,ids){
   return [...invalid];
 }
 function repairActions(report){return new Set((report?.issueDetails||[]).filter(x=>x.severity==='blocking'||x.severity==='review').map(x=>x.repairAction));}
-function runEvidence(dir){
-  const durable=readRunEvidence(dir||''),text=durable.responseText,eventText=durable.eventsText;let browserText='',usage=null;
-  for(const e of durable.events){if(e.type==='turn.completed'&&e.usage)usage=e.usage;const item=e?.item||e,server=String(item?.server||item?.serverName||'').toLowerCase(),tool=String(item?.tool||item?.name||'').toLowerCase();if(item?.type==='mcp_tool_call'&&(server==='cua_repl'||server.includes('browser')||tool==='browser')&&(!tool||tool==='js'||tool==='browser')){const content=Array.isArray(item.result?.content)?item.result.content:[];browserText+=content.filter(block=>block?.type==='text'&&typeof block.text==='string').map(block=>block.text).join('\n')+'\n';}}
-  return {text,eventText,browserText,usage,parseErrors:durable.parseErrors};
-}
-function matchingWebRunRecord(pending){
-  if(!pending?.dir)return null;
-  try{
-    const dir=path.resolve(pending.dir),record=readRunIdentity(dir),{request,worker,execution}=record,manifest=readWebManifest(path.join(dir,'web-generation.json'));
-    if(Object.keys(record.parseErrors||{}).length||!request||!worker||!manifest)return null;
-    if(request.provider!==WEB_IMAGE_PROVIDER||worker.provider!==WEB_IMAGE_PROVIDER||manifest.provider!==WEB_IMAGE_PROVIDER||!manifest.requestId||worker.requestId!==manifest.requestId)return null;
-    const expected={projectId:pending.projectId??request.projectId,projectVersion:pending.projectVersion??request.projectVersion,taskId:pending.taskId??request.taskId,target:pending.key??request.target,requestId:manifest.requestId,runId:record.runId};
-    const outputFile=pending.file||worker.outputFile||record.expectedOutput;if(outputFile)expected.outputFile=path.resolve(String(outputFile));
-    const comparison=compareRunIdentity({record,expected});if(!comparison.ok)return null;
-    if(worker.manifestFile&&path.resolve(worker.manifestFile)!==path.join(dir,'web-generation.json'))return null;
-    return {dir,request,worker,manifest,execution,runId:record.runId,identity:comparison};
-  }catch{return null;}
-}
-function matchingPendingManifest(pending){
-  return matchingWebRunRecord(pending)?.manifest||null;
-}
+const imageRecovery=createImageRecovery({
+  webImageProvider:WEB_IMAGE_PROVIDER,
+  readGenerationEvidence,
+  generationDiagnosticSummary,
+  readWebManifest,
+  pythonRun,
+  jsonWrite,
+  projectDir,
+  inside,
+  saveProject,
+  job,
+  verifyApproval,
+  finishTask,
+  activity,
+  invalidatePanelDownstream,
+  recordArtifact,
+  attachImageRecord,
+  artifactIdForImageKey,
+  panelKeyFromImageKey,
+  sampleIndexFromKey,
+  sampleRepairCount,
+  definiteImageFailure,
+  failureMessage,
+});
+const {runEvidence,matchingWebRunRecord,matchingPendingManifest,checksum,verifyImage,inspectOrphanImageEvidence,persistImage,writeRunResult,attributableCandidates,recoverImage:recoverImageAction}=imageRecovery;
+export {inspectOrphanImageEvidence};
 function preAcceptanceQuotaEvidence(pending,manifest,failure=null,made=null){
   if(!pending||pending.provider!==WEB_IMAGE_PROVIDER||!manifest||manifest.state!=='queued'||manifest.accepted===true||manifest.submitted===true||Number(manifest.referenceCount)!==0)return null;
   const record=matchingWebRunRecord(pending);if(!record||record.manifest?.requestId!==manifest.requestId)return null;
@@ -639,80 +637,8 @@ function layoutOnlyRevision(note){
   const hasImageChange=/(?:人物|脸|五官|发型|头发|服装|动作|手|脚|姿势|视线|表情|场景|背景|物件|泳包|杯子|电脑|光线|画面|构图|比例|安全区|噪点|颗粒|颜色|色彩)/.test(text);
   return hasLayout&&!hasImageChange;
 }
-function generatedCandidates(dir,after){
-  if(!dir)return [];
-  const events=path.join(dir,'events.jsonl');if(!fs.existsSync(events))return null;
-  let thread;
-  for(const line of fs.readFileSync(events,'utf8').split('\n')){try{const e=JSON.parse(line);if(e.type==='thread.started')thread=e.thread_id;}catch{}}
-  if(!thread||!/^[a-f0-9-]{36}$/.test(thread))return null;
-  const home=process.env.CODEX_HOME||path.join(process.env.HOME,'.codex');
-  const folder=path.join(home,'generated_images',thread);if(!fs.existsSync(folder))return null;
-  return fs.readdirSync(folder).filter(x=>/\.(png|webp|jpe?g)$/i.test(x)).map(x=>path.join(folder,x)).filter(file=>{
-    try{return fs.statSync(file).isFile()&&fs.statSync(file).mtimeMs>=after-5000;}catch{return false;}
-  }).sort((a,b)=>fs.statSync(b).mtimeMs-fs.statSync(a).mtimeMs);
-}
-function extensionForImage(info,file){
-  const format=String(info?.format||'').toLowerCase();
-  if(format==='jpeg')return '.jpg';if(['png','webp'].includes(format))return `.${format}`;
-  const ext=path.extname(file).toLowerCase();return ['.png','.webp','.jpg','.jpeg'].includes(ext)?ext:null;
-}
-function checksum(file){return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');}
-async function verifyImage(file){
-  const info=JSON.parse(await pythonRun(['info',file]));const extension=extensionForImage(info,file);
-  if(!extension)throw new Error('已找到的文件不是可用的 PNG、JPG 或 WebP 图片。');
-  return {...info,extension,sizeBytes:fs.statSync(file).size,sha256:checksum(file)};
-}
-/**
- * Read-only evidence gate for an image whose manifest was damaged after the
- * browser downloaded it.  This function never attaches, retries, or changes a
- * project; a user-facing recovery action may call it and then explicitly
- * adopt the returned file.  Every modern record must still agree on the
- * request/task/project/run/output binding, while old records can omit fields
- * that did not exist when they were created.
- */
-export async function inspectOrphanImageEvidence({dir,file=null,expected={}}={}){
-  const reasons=[];let record=null,integrity=null;
-  try{record=readRunIdentity(dir,{strict:true});}
-  catch(error){return {status:'not_recoverable',reasons:[error.message],requiresUserAction:true,canAutoAdopt:false};}
-  if(Object.keys(record.parseErrors||{}).length)reasons.push('执行记录含有非法 JSON。');
-  const {request,worker,manifest,execution}=record;
-  if(!request||!worker||!manifest||!execution)reasons.push('request、worker、manifest 或 execution 记录不完整。');
-  const output=record.expectedOutput;
-  const target=file?path.resolve(String(file)):output;
-  if(!output||!target||target!==output)reasons.push('候选原图路径与 expectedOutput 不一致。');
-  if(target&&!fs.existsSync(target))reasons.push('expectedOutput 文件不存在。');
-  else if(target&&!fs.statSync(target).isFile())reasons.push('expectedOutput 不是普通文件。');
-  if(request?.provider!==undefined&&request.provider!==WEB_IMAGE_PROVIDER)reasons.push('request provider 不匹配。');
-  if(worker?.provider!==WEB_IMAGE_PROVIDER||manifest?.provider!==WEB_IMAGE_PROVIDER)reasons.push('网页执行器 provider 不匹配。');
-  const expectedIdentity={projectId:expected.projectId??request?.projectId,projectVersion:expected.projectVersion??request?.projectVersion,taskId:expected.taskId??request?.taskId,target:expected.target??request?.target,requestId:expected.requestId??manifest?.requestId,runId:record.runId,outputFile:output};
-  const comparison=compareRunIdentity({record,expected:expectedIdentity,requireModern:false});
-  if(!comparison.ok)reasons.push(...comparison.issues);
-  if(!request?.requestId||String(request.requestId)!==String(manifest?.requestId||''))reasons.push('request.requestId 缺失或不匹配。');
-  if(!request?.runId||String(request.runId)!==record.runId)reasons.push('request.runId 缺失或不匹配。');
-  if(!worker?.runId||String(worker.runId)!==record.runId)reasons.push('worker.runId 缺失或不匹配。');
-  if(!worker?.outputFile||path.resolve(String(worker.outputFile))!==output)reasons.push('worker.outputFile 缺失或不匹配。');
-  if(!execution?.runId||String(execution.runId)!==record.runId)reasons.push('execution.runId 缺失或不匹配。');
-  if(!request?.expectedOutput)reasons.push('request.expectedOutput 缺失。');
-  if(!worker?.requestId||!manifest?.requestId||worker.requestId!==manifest.requestId)reasons.push('requestId 缺失或不一致。');
-  if(manifest?.state!=='downloaded'||manifest?.submitted!==true)reasons.push('manifest 没有已提交且已下载的正向证据。');
-  if(manifest?.artifactPath&&path.resolve(String(manifest.artifactPath))!==output)reasons.push('manifest.artifactPath 与 expectedOutput 不匹配。');
-  if(!reasons.length){
-    try{integrity=await verifyImage(target);}
-    catch(error){reasons.push(`原图无法解码：${error.message}`);}
-  }
-  if(integrity&&expected.sha256&&integrity.sha256!==expected.sha256)reasons.push('原图 SHA-256 与用户指定值不匹配。');
-  if(reasons.length)return {status:'not_recoverable',reasons:[...new Set(reasons)],requiresUserAction:true,canAutoAdopt:false,identity:comparison.identity,file:target||null};
-  return {status:'recoverable_orphan',requiresUserAction:true,canAutoAdopt:false,file:target,integrity,identity:comparison.identity,manifestState:manifest.state,requestId:manifest.requestId};
-}
-async function persistImage(source,target){
-  if(!fs.existsSync(source))return null;
-  const temp=`${target}.partial-${crypto.randomUUID()}`;fs.copyFileSync(source,temp);
-  try{
-    const integrity=await verifyImage(temp);const finalFile=target.replace(/\.[^.]+$/,integrity.extension);
-    fs.renameSync(temp,finalFile);if(source===target&&finalFile!==target)fs.unlinkSync(target);return {file:finalFile,integrity};
-  }catch(error){try{fs.unlinkSync(temp);}catch{}throw error;}
-}
-function writeRunResult(dir,result){if(dir)jsonWrite(path.join(dir,'result.json'),result);}
+/* Image file inspection, orphan evidence, and explicit recovery live in
+ * image-recovery.mjs. Keep the engine's aliases here for the public workflow. */
 function writeRunRequest(dir,p,task,pending){
   const summarize=file=>{try{return {name:path.basename(file),sizeBytes:fs.statSync(file).size,sha256:checksum(file)};}catch{return {name:path.basename(file),missing:true};}};
   jsonWrite(path.join(dir,'request.json'),{schemaVersion:2,provider:pending.provider||'legacy',taskId:task.id,attempt:task.attempt,target:pending.key,createdAt:pending.at,projectId:p.id,
@@ -726,20 +652,6 @@ function previousConversation(prior){
     const record=JSON.parse(fs.readFileSync(prior+'.json','utf8'));
     return /^https:\/\/chatgpt\.com\/c\/[^\s?#]+/.test(String(record.conversationUrl||''))?String(record.conversationUrl):null;
   }catch{return null;}
-}
-function attributableCandidates(pending){
-  const evidence=readGenerationEvidence(pending.dir||''),inputs=new Set((pending.inputFiles||[]).map(file=>path.resolve(file)));
-  if(pending.provider===WEB_IMAGE_PROVIDER){
-    if(process.env.WENDI_TEST_PLAN_FILE&&fs.existsSync(pending.file))return {evidence,candidates:[path.resolve(pending.file)]};
-    const manifest=matchingPendingManifest(pending),artifact=path.resolve(String(manifest?.artifactPath||'')),target=path.resolve(pending.file);
-    const proven=manifest?.state==='downloaded'&&manifest.accepted===true&&manifest.submitted===true&&artifact===target&&fs.existsSync(target);
-    return {evidence,candidates:proven?[target]:[]};
-  }
-  const target=fs.existsSync(pending.file)?[pending.file]:[];
-  const reported=(evidence.imagePaths||[]).filter(file=>path.isAbsolute(file)&&fs.existsSync(file));
-  const legacy=generatedCandidates(pending.dir,Date.parse(pending.at))||[];
-  const candidates=[...new Set([...target,...reported,...legacy].map(file=>path.resolve(file)).filter(file=>!inputs.has(file)))];
-  return {evidence,candidates};
 }
 async function generate(p,key,prompt,refnames,signal,prior=null,verify=true,qaKind='原始分镜',attempt=1,revisionMeta={}){
   checkpoint(signal);
@@ -818,8 +730,8 @@ async function generate(p,key,prompt,refnames,signal,prior=null,verify=true,qaKi
       jsonWrite(file+'.json',record);finishTask(p,task,IMAGE_OUTCOME.ARTIFACT_SAVED_UNCHECKED,{artifact:file,qa:'unavailable',error:record.qa.qaError});saveProject(p);throw error;
     }
     const outcome=savedArtifactQaUnavailable(error,{artifact:file});
-    record.qa={...record.qa,status:outcome.qaStatus,summary:outcome.message,qaError:outcome.detail};
-    jsonWrite(file+'.json',record);writeRunResult(dir,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:task.id,attempt:task.attempt,endedAt:new Date().toISOString(),outcome:outcome.outcome,artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,errorCode:outcome.errorCode,error:outcome.detail});finishTask(p,task,outcome.outcome,{artifact:file,qa:outcome.qaStatus,error:outcome.detail,errorCode:outcome.errorCode});p.status='attention';p.message=outcome.message;p.error=outcome.message;saveProject(p);throw new SavedArtifactQaUnavailableError(error,{artifact:file});
+    applySavedArtifactQaOutcome({project:p,task,record,artifactFile:file,outcome,saveProject,finishTask,jsonWrite,writeRunResult:result=>writeRunResult(dir,result),runResult:{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:task.id,attempt:task.attempt,endedAt:new Date().toISOString(),outcome:outcome.outcome,artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,errorCode:outcome.errorCode,error:outcome.detail}});
+    throw new SavedArtifactQaUnavailableError(error,{artifact:file});
   }
 }
 export function sampleProject(p){verifyApproval(p);return job(p,'sampling',async signal=>{
@@ -1113,7 +1025,7 @@ function resumeSameRequestImage(p){
     jsonWrite(file+'.json',imageRecord);const panelKey=panelKeyFromImageKey(pending.key);if(panelKey)invalidatePanelDownstream(p,panelKey);recordArtifact(p,artifactIdForImageKey(pending.key),'image',imageRecord.file,[],{integrity:persisted.integrity});attachImageRecord(p,imageRecord);p.pending=null;p.lastFailure=null;finishTask(p,task,'artifact_saved',{artifact:file,qa:'pending',webState:'downloaded'});saveProject(p);
     try{
       checkpoint(signal);const check=await qa(p,file,pending.prompt,imageRefs(p,pending.refs||[]),signal,'原始分镜');imageRecord.qa=check;jsonWrite(file+'.json',imageRecord);finishTask(p,task,'completed',{artifact:file,qa:check.pass?'passed':'needs_review',webState:'downloaded'});p.status=check.pass?'paused':'attention';p.error=null;p.message=check.pass?`${pending.key} 已按原请求完成、保存并校对；本次只续接这一张。`:`${pending.key} 原图已保存，画面检查建议：${(check.issues||[]).join('；')||'请人工查看'}。本次不会自动重画。`;if(panelKey&&!check.pass)requirePanelDecision(p,panelKey,imageRecord);saveProject(p);return imageRecord;
-    }catch(error){const outcome=savedArtifactQaUnavailable(error,{artifact:file,webState:'downloaded'});imageRecord.qa={...imageRecord.qa,status:outcome.qaStatus,summary:outcome.message,qaError:outcome.detail};jsonWrite(file+'.json',imageRecord);writeRunResult(pending.dir,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:task.id,requestId:webManifest.requestId,endedAt:new Date().toISOString(),outcome:outcome.outcome,artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,errorCode:outcome.errorCode,error:outcome.detail});finishTask(p,task,outcome.outcome,{artifact:file,qa:outcome.qaStatus,webState:'downloaded',error:outcome.detail,errorCode:outcome.errorCode});p.status='attention';p.message=outcome.message;p.error=outcome.message;saveProject(p);return imageRecord;}
+    }catch(error){const outcome=savedArtifactQaUnavailable(error,{artifact:file,webState:'downloaded'});applySavedArtifactQaOutcome({project:p,task,record:imageRecord,artifactFile:file,outcome,saveProject,finishTask,jsonWrite,writeRunResult:result=>writeRunResult(pending.dir,result),runResult:{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:task.id,requestId:webManifest.requestId,endedAt:new Date().toISOString(),outcome:outcome.outcome,artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,errorCode:outcome.errorCode,error:outcome.detail},extraTask:{webState:'downloaded'}});return imageRecord;}
   });
 }
 export function resume(p){if(p.pending){
@@ -1129,24 +1041,12 @@ export function resume(p){if(p.pending){
   return generatePages(p);
 }
 export function retryableImageFailure(p){
-  const state=imageRetryState(p);return state?.certainty==='confirmed_missing'?state.failure:null;
+  return deriveRetryableImageFailure(p,CONFIRMED_PRE_SUBMISSION_KINDS);
 }
 export function imageRetryState(p){
-  const task=p.currentTask;
-  if(p.pending){
-    if(task?.status==='unknown_result'&&task.target===p.pending.key)return {certainty:'unknown_result',target:task.target,failure:{kind:'network',definiteNoOutput:false,key:task.target,attempts:task.providerInvocations||1,taskId:task.id,at:task.completedAt||p.updatedAt||new Date().toISOString()}};
-    return null;
-  }
-  const failure=p.lastFailure;
-  if(failure?.key){
-    if(CONFIRMED_PRE_SUBMISSION_KINDS.has(failure.kind)&&failure.definiteNoOutput===true)return {certainty:'confirmed_missing',target:failure.key,failure};
-    if(failure.kind==='network')return {certainty:'unknown_result',target:failure.key,failure};
-  }
-  if(!task?.target||!['failed_no_output','unknown_result'].includes(task.status))return null;
-  if(task.status==='failed_no_output'&&CONFIRMED_PRE_SUBMISSION_KINDS.has(task.errorCode))return {certainty:'confirmed_missing',target:task.target,failure:{kind:task.errorCode,definiteNoOutput:true,key:task.target,attempts:CONFIRMED_PRE_SUBMISSION_KINDS.has(task.errorCode)&&task.errorCode!=='no-output'?0:(task.providerInvocations||1),taskId:task.id,at:task.completedAt||p.updatedAt||new Date().toISOString()}};
-  return {certainty:'unknown_result',target:task.target,failure:{kind:'network',definiteNoOutput:false,key:task.target,attempts:task.providerInvocations||1,taskId:task.id,at:task.completedAt||p.updatedAt||new Date().toISOString()}};
+  return deriveImageRetryState(p,CONFIRMED_PRE_SUBMISSION_KINDS);
 }
-function unknownResultMessage(target='当前图片'){return `${target} 的连接在结果确认前中断，无法证明远端是否已经生成。系统不会自行重试；你可以先检查本地记录，或明确选择重新生成这一张。`;}
+function unknownResultMessage(target='当前图片'){return deriveUnknownResultMessage(target);}
 export function retryMissingImage(p,target,{allowUnknownResult=false}={}){
   verifyApproval(p);const state=imageRetryState(p),failure=state?.failure;
   if(p.pending&&!(allowUnknownResult&&state?.certainty==='unknown_result'))throw new Error('上次生成结果尚未确认，请先检查已保存图片。');
@@ -1180,49 +1080,7 @@ export function retryMissingImage(p,target,{allowUnknownResult=false}={}){
     p.panels[panelKey]=result;p.accepted=false;p.status='paused';const totalPanels=p.plan.pages.reduce((total,item)=>total+item.panels.length,0);activity(p,`${target} 已重新生成并保存；本次不会继续生成其他分镜。`,Object.keys(p.panels).length,totalPanels,'分镜');
   });
 }
-function assertCurrentPending(p,pending){
-  let request={};try{request=JSON.parse(fs.readFileSync(path.join(pending.dir||'','request.json'),'utf8'));}catch{}
-  const projectId=pending.projectId||request.projectId||null,version=Number(pending.projectVersion??request.projectVersion);
-  if(!Number.isInteger(version))throw new Error('待恢复任务缺少可信的方案版本归属，请人工处理；原图和记录已保留。');
-  if(projectId&&projectId!==p.id)throw new Error('待恢复任务不属于当前作品，原图和记录已保留，请人工处理。');
-  if(!projectId){const root=path.resolve(projectDir(p.id)),dir=path.resolve(pending.dir||'');if(!dir.startsWith(root+path.sep))throw new Error('待恢复任务缺少可信的作品归属，请人工处理；原图和记录已保留。');}
-  if(version!==Number(p.version))throw new Error(`待恢复任务属于方案 v${version}，当前是方案 v${p.version}；原图和记录已保留，请先查看历史方案。`);
-}
-export function recoverImage(p){verifyApproval(p);if(!p.pending)throw new Error('没有待找回的图片');return job(p,'revising',async()=>{
-  const pending=p.pending;assertCurrentPending(p,pending);const webManifest=pending.provider===WEB_IMAGE_PROVIDER?matchingPendingManifest(pending):null;
-  const recoveryIdentity={projectId:p.id,projectVersion:p.version,target:pending.key,...(webManifest?{requestId:webManifest.requestId||null,acceptanceState:webManifest.state,accepted:webManifest.accepted===true,acceptedAt:webManifest.acceptedAt||null,submitted:webManifest.submitted===true,submittedAt:webManifest.submittedAt||null}: {})};
-  let file=pending.file;
-  const {evidence,candidates}=attributableCandidates(pending);
-  let persisted=null,orphanEvidence=null;
-  // A downloaded web artifact is only eligible for this explicit recovery
-  // action after the complete durable identity chain has been rechecked. This
-  // keeps the existing UI entry local-only while preventing a stale or
-  // cross-run file from being adopted merely because it exists at the target.
-  if(pending.provider===WEB_IMAGE_PROVIDER&&webManifest?.state==='downloaded'){
-    orphanEvidence=await inspectOrphanImageEvidence({dir:pending.dir,file,expected:{projectId:p.id,projectVersion:p.version,taskId:pending.taskId,target:pending.key,requestId:webManifest.requestId}});
-    if(orphanEvidence.status!=='recoverable_orphan'){
-      writeRunResult(pending.dir,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:pending.taskId||null,endedAt:new Date().toISOString(),outcome:'artifact_still_unknown',...recoveryIdentity,evidenceStatus:orphanEvidence.status,reasons:orphanEvidence.reasons||[],diagnostics:generationDiagnosticSummary(evidence)});
-      throw new Error(`已保存文件未通过本次 request、执行器、下载结果和完整性核验，原图与记录已保留；不会自动采用或重生。${(orphanEvidence.reasons||[]).slice(0,3).join('；')}`);
-    }
-  }
-  if(orphanEvidence?.status==='recoverable_orphan')persisted=await persistImage(orphanEvidence.file,file);
-  else if(candidates.length===1)persisted=await persistImage(candidates[0],file);
-  if(!persisted){
-    writeRunResult(pending.dir,{schemaVersion:2,provider:pending.provider||'legacy',taskId:pending.taskId||null,endedAt:new Date().toISOString(),outcome:'artifact_still_unknown',...recoveryIdentity,diagnostics:generationDiagnosticSummary(evidence),candidateCount:candidates.length,candidateNames:candidates.map(candidate=>path.basename(candidate))});
-    const known=definiteImageFailure(pending);
-    if(known){p.pending=null;p.lastFailure=known;const task=(p.tasks||[]).find(item=>item.id===pending.taskId);finishTask(p,task,'failed_no_output',{errorCode:known.kind,webState:webManifest?.state||task?.webState||null});saveProject(p);throw new Error(failureMessage(known));}
-    throw new Error('连接在保存结果前中断，系统仍无法确认是否已经生成。稍后可再次检查已有原图；检查本身不会重新生图。');
-  }
-  file=persisted.file;pending.file=file;
-  writeRunResult(pending.dir,{schemaVersion:2,provider:pending.provider||'legacy',taskId:pending.taskId||null,endedAt:new Date().toISOString(),outcome:'artifact_recovered',...recoveryIdentity,artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,diagnostics:generationDiagnosticSummary(evidence)});
-  // Recovery is deliberately local-only. It attaches a verified file to the
-  // project but does not run the model QA again and therefore never consumes a
-  // new model call or image opportunity.
-  const record={key:pending.key,file:path.relative(projectDir(p.id),file),provider:pending.provider||'legacy',prompt:pending.prompt,refs:pending.refs,integrity:persisted.integrity,qa:{pass:null,status:'recovered_pending_review',summary:'原图已找回，尚未自动校对。请查看图片后选择继续或修改。',issues:[],repairPrompt:''},at:new Date().toISOString()};
-  jsonWrite(file+'.json',record);const recoveredPanelKey=panelKeyFromImageKey(pending.key);if(recoveredPanelKey)invalidatePanelDownstream(p,recoveredPanelKey);recordArtifact(p,artifactIdForImageKey(pending.key),'image',record.file,[],{integrity:persisted.integrity});attachImageRecord(p,record);
-  const sampleIndex=sampleIndexFromKey(pending.key);if(sampleIndex!==null)sampleRepairCount(p,sampleIndex);
-  p.pending=null;p.lastFailure=null;p.status='paused';const task=(p.tasks||[]).find(item=>item.id===pending.taskId);finishTask(p,task,'recovered_local',{artifact:file,qa:'not_run'});activity(p,'原图已找回并挂接到作品。未重新生图，也没有再次自动校对。');
-});}
+export function recoverImage(p){return recoverImageAction(p);}
 export function reviewImage(p,key){
   verifyApproval(p);if(p.pending)throw new Error('请先完成这次原图找回，再重新校对。');
   const sample=/^sample-([12])$/.exec(key);const panel=/^(\d+)-(\d+)$/.exec(key);let record,refs,prompt,kind;
@@ -1244,8 +1102,8 @@ export function reviewImage(p,key){
         jsonWrite(file+'.json',record);finishTask(p,task,'review_failed',{artifact:file,error:record.qa.qaError});saveProject(p);throw error;
       }
       const outcome=savedArtifactQaUnavailable(error,{artifact:file,taskStatus:IMAGE_OUTCOME.REVIEW_REQUIRED});
-      record.qa={pass:null,status:outcome.qaStatus,summary:outcome.message,issues:[],repairPrompt:'',qaError:outcome.detail};
-      jsonWrite(file+'.json',record);finishTask(p,task,outcome.outcome,{artifact:file,error:outcome.detail,errorCode:outcome.errorCode});p.status='attention';p.message=outcome.message;p.error=outcome.message;saveProject(p);throw new SavedArtifactQaUnavailableError(error,{artifact:file,taskStatus:IMAGE_OUTCOME.REVIEW_REQUIRED});
+      applySavedArtifactQaOutcome({project:p,task,record,artifactFile:file,outcome,saveProject,finishTask,jsonWrite});
+      throw new SavedArtifactQaUnavailableError(error,{artifact:file,taskStatus:IMAGE_OUTCOME.REVIEW_REQUIRED});
     }
   });
 }

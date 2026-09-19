@@ -60,6 +60,23 @@ function validateUrl(value){if(!URL_RE.test(String(value||'')))throw usageError(
 function validateLockedPatch(patch){
   for(const key of Object.keys(patch))if(RUN_LOCKED_FIELDS.includes(key))throw usageError(`manifest 身份字段 ${key} 已锁定，不能由网页执行器改写。`);
 }
+function failureFlags(args,current){
+  const submitted=args.submitted===undefined?current.submitted===true:bool(args.submitted,'submitted');
+  const submissionIntent=args.submissionIntent===undefined?current.submissionIntent===true:bool(args.submissionIntent,'submissionIntent');
+  const submissionUncertain=args.submissionUncertain===undefined
+    ? submitted&&(current.submissionUncertain===true||String(args.errorCode||'')==='SUBMISSION_UNCERTAIN')
+    : bool(args.submissionUncertain,'submissionUncertain');
+  const preSubmissionFailure=args.preSubmissionFailure===undefined?!submitted:bool(args.preSubmissionFailure,'preSubmissionFailure');
+  if(!submitted){
+    if(submissionUncertain)throw usageError('未提交的失败不能标记为 submissionUncertain。');
+    if(!preSubmissionFailure)throw usageError('未提交的失败必须标记为 preSubmissionFailure。');
+  }else{
+    if(!submissionIntent)throw usageError('submitted 前必须已经记录 submissionIntent。');
+    if(preSubmissionFailure)throw usageError('已提交或提交不确定的请求不能标记为 preSubmissionFailure。');
+    if(String(args.errorCode||'')==='SUBMISSION_UNCERTAIN'&&!submissionUncertain)throw usageError('SUBMISSION_UNCERTAIN 必须标记为 submissionUncertain。');
+  }
+  return {submitted,submissionIntent,submissionUncertain,preSubmissionFailure};
+}
 function readRecords(file){
   const dir=path.dirname(file),record=readRunIdentity(dir,{strict:true});
   if(record.files.manifest!==file)throw usageError('manifestFile 不属于当前执行目录。');
@@ -93,15 +110,13 @@ function stagePatch(stage,args,record){
     patch.state='downloaded';patch.accepted=true;patch.submitted=true;patch.artifactPath=artifact;patch.downloadedAt=now();
     if(args.conversationUrl)patch.conversationUrl=validateUrl(args.conversationUrl);
   }else if(stage==='failed'){
-    const submitted=args.submitted===undefined?current.submitted===true:bool(args.submitted,'submitted');
+    const flags=failureFlags(args,current),{submitted,submissionIntent,submissionUncertain,preSubmissionFailure}=flags;
     patch.state='failed';patch.accepted=current.accepted===true;patch.submitted=submitted;patch.errorCode=String(args.errorCode||'WEB_IMAGE_FAILED').slice(0,120);patch.error=String(args.error||'网页生图未完成。').slice(0,2000);patch.failedAt=now();
     if(!submitted)patch.referenceCount=0;
-    if(args.submissionIntent!==undefined)patch.submissionIntent=bool(args.submissionIntent,'submissionIntent');
-    if(args.submissionUncertain!==undefined)patch.submissionUncertain=bool(args.submissionUncertain,'submissionUncertain');
-    if(args.preSubmissionFailure!==undefined)patch.preSubmissionFailure=bool(args.preSubmissionFailure,'preSubmissionFailure');
-    if(submitted&&(patch.preSubmissionFailure===true||patch.preSubmissionFailure===undefined&&current.preSubmissionFailure===true))throw usageError('已提交或提交不确定的请求不能标记为 preSubmissionFailure。');
+    patch.submissionIntent=submissionIntent;
+    patch.submissionUncertain=submissionUncertain;
+    patch.preSubmissionFailure=preSubmissionFailure;
     if(args.conversationUrl)patch.conversationUrl=validateUrl(args.conversationUrl);
-    if(submitted)patch.submissionUncertain=args.submissionUncertain===undefined?current.submissionUncertain===true:patch.submissionUncertain;
   }else if(stage==='resume'){
     const confirmedUnsent=Boolean(args.confirmedUnsentAudit);
     if(!['queued','failed'].includes(current.state)||current.submitted===true&&!confirmedUnsent)throw usageError('只有未提交或确认未发送的请求可以续接。');

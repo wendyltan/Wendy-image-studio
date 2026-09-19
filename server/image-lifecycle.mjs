@@ -23,6 +23,23 @@ export function isSavedArtifactQaUnavailable(value) {
   return value?.errorCode===IMAGE_ERROR.QA_UNAVAILABLE&&[IMAGE_OUTCOME.ARTIFACT_SAVED_UNCHECKED,IMAGE_OUTCOME.REVIEW_REQUIRED].includes(value?.outcome);
 }
 
+/**
+ * Apply the durable side of a saved-artifact QA failure in one place.  The
+ * image has already been persisted, so this transition must never clear it,
+ * turn it into a missing-output failure, or schedule another generation.
+ */
+export function applySavedArtifactQaOutcome({project,task,record,artifactFile,outcome,saveProject,finishTask,jsonWrite,writeRunResult=null,runResult=null,extraTask={}}={}){
+  if(!project||!record||!outcome)throw new TypeError('saved artifact QA outcome requires project, record, and outcome');
+  const detail=String(outcome.detail||'自动校对不可用').slice(0,500);
+  record.qa={...record.qa,status:outcome.qaStatus||'unavailable',summary:outcome.message||SAVED_ARTIFACT_QA_MESSAGE,qaError:detail};
+  if(typeof jsonWrite==='function'&&artifactFile)jsonWrite(`${artifactFile}.json`,record);
+  if(typeof writeRunResult==='function'&&runResult)writeRunResult(runResult);
+  if(typeof finishTask==='function'&&task)finishTask(project,task,outcome.outcome||IMAGE_OUTCOME.ARTIFACT_SAVED_UNCHECKED,{artifact:artifactFile,qa:outcome.qaStatus||'unavailable',error:detail,errorCode:outcome.errorCode||IMAGE_ERROR.QA_UNAVAILABLE,...extraTask});
+  project.status='attention';project.message=outcome.message||SAVED_ARTIFACT_QA_MESSAGE;project.error=project.message;
+  if(typeof saveProject==='function')saveProject(project);
+  return record;
+}
+
 export class SavedArtifactQaUnavailableError extends Error {
   constructor(error, options={}) {
     const outcome=savedArtifactQaUnavailable(error,options);

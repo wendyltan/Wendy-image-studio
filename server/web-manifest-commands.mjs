@@ -1,0 +1,47 @@
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+
+const DEFAULT_HELPER=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'run-manifest.mjs');
+
+export const SUBMISSION_FAILURE_MATRIX=Object.freeze({
+  preSubmission:Object.freeze({submitted:false,submissionIntent:false,submissionUncertain:false,preSubmissionFailure:true}),
+  confirmedUnsent:Object.freeze({submitted:false,submissionIntent:true,submissionUncertain:false,preSubmissionFailure:true}),
+  uncertain:Object.freeze({submitted:true,submissionIntent:true,submissionUncertain:true,preSubmissionFailure:false}),
+  submittedKnown:Object.freeze({submitted:true,submissionIntent:true,submissionUncertain:false,preSubmissionFailure:false}),
+});
+
+function quote(value){return JSON.stringify(String(value));}
+function flag(value){return value?'true':'false';}
+
+export function manifestCommand(stage,{manifestFile,helperFile=DEFAULT_HELPER,args=''}={}){
+  if(!manifestFile)throw new Error('manifestFile is required');
+  return `node ${quote(path.resolve(helperFile))} ${stage} --manifest-file ${quote(path.resolve(manifestFile))}${args}`;
+}
+
+export function failureArguments({submitted,submissionIntent,submissionUncertain,preSubmissionFailure,errorCode='<错误代码>',error='<简短原始错误>'}={}){
+  return ` --error-code ${quote(errorCode)} --error ${quote(error)} --submitted ${flag(Boolean(submitted))} --submission-intent ${flag(Boolean(submissionIntent))} --submission-uncertain ${flag(Boolean(submissionUncertain))} --pre-submission-failure ${flag(Boolean(preSubmissionFailure))}`;
+}
+
+export function failureCommand(manifestFile,flags){
+  return manifestCommand('failed',{manifestFile,args:failureArguments(flags)});
+}
+
+export function buildManifestCommands(manifestFile,{helperFile=DEFAULT_HELPER}={}){
+  const command=(stage,args='')=>manifestCommand(stage,{manifestFile,helperFile,args});
+  return Object.freeze({
+    accepted:command('accepted'),
+    ready:command('ready',' --conversation-url "<当前会话地址>" --reference-count <已确认附件数>'),
+    submissionIntent:command('submission-intent'),
+    submitted:command('submitted',' --conversation-url "<当前会话地址>" --submission-confirmed-by "new_user_message_and_stop_generation_control"'),
+    downloaded:command('downloaded',' --conversation-url "<当前会话地址>"'),
+    failed:command('failed',' --error-code "<错误代码>" --error "<简短原始错误>" --submitted <true或false> --submission-intent <true或false> --submission-uncertain <true或false> --pre-submission-failure <true或false>'),
+    loginFailed:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'CHATGPT_LOGIN_REQUIRED',error:'ChatGPT 登录状态不可用'}),
+    navigationFailed:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'CHATGPT_NAVIGATION_FAILED',error:'既有会话导航和同一标签页复查均未确认可用聊天输入框'}),
+    uploadFailed:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'FILE_UPLOAD_CHROME_UNAVAILABLE',error:'附件入口或文件选择器未能完成'}),
+    originPermissionDenied:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'BROWSER_ORIGIN_PERMISSION_DENIED',error:'chatgpt.com 站点源访问权限被拒绝'}),
+    chromeUnavailable:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'BROWSER_CHROME_UNAVAILABLE',error:'Chrome extension 不可用'}),
+    focusUnavailable:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'BROWSER_FOCUS_UNAVAILABLE',error:'Chrome 专用标签页焦点能力不可用'}),
+    confirmedUnsentUploadFailed:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.confirmedUnsent,errorCode:'FILE_UPLOAD_CHROME_UNAVAILABLE',error:'已记录发送意图但页面确认未发送'}),
+    submissionUncertain:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.uncertain,errorCode:'SUBMISSION_UNCERTAIN',error:'点击发送后无法确认是否送达'}),
+  });
+}
