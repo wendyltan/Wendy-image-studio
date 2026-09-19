@@ -66,6 +66,22 @@ test('post-submit uncertainty is persisted as submitted and never as pre-submiss
   assert.equal(value.preSubmissionFailure,false);
 });
 
+test('downloaded recovery clears stale failure markers from the durable manifest',()=>{
+  const run=readyRun();
+  patchManifest({stage:'submission-intent',manifestFile:run.manifestFile});
+  patchManifest({stage:'submitted',manifestFile:run.manifestFile,args:{submissionConfirmedBy:'fixture'}});
+  const before=manifest(run);
+  write(run.manifestFile,{...before,errorCode:'DOWNLOAD_CHROME_UNAVAILABLE',error:'fixture download failure',failedAt:'2026-01-01T00:00:00.000Z'});
+  fs.writeFileSync(before.outputFile,'fixture-original-image');
+  patchManifest({stage:'downloaded',manifestFile:run.manifestFile,args:{conversationUrl:'https://chatgpt.com/c/failure-matrix'}});
+  const value=manifest(run);
+  assert.equal(value.state,'downloaded');
+  assert.equal(value.errorCode,null);
+  assert.equal(value.error,null);
+  assert.equal(value.failedAt,null);
+  assert.equal(value.artifactPath,before.outputFile);
+});
+
 test('contradictory failure flags are rejected before they can corrupt the manifest',()=>{
   const run=readyRun();
   assert.throws(()=>patchManifest({stage:'failed',manifestFile:run.manifestFile,args:{submitted:'false',submissionUncertain:'true',preSubmissionFailure:'true',errorCode:'CHATGPT_LOGIN_REQUIRED'}}),/submissionUncertain/);
@@ -90,6 +106,20 @@ test('executor instructions carry explicit stage flags and only the image_prompt
   assert.equal((instruction.match(/\n<\/image_prompt>/g)||[]).length,1);
   assert.match(instruction,/只复制 <image_prompt> 与 <\/image_prompt> 之间的文本/);
   assert.match(instruction,/node "[^"]+server\/run-manifest\.mjs"/);
+});
+
+test('executor retrieves the original generated media through page assets',()=>{
+  const instruction=chatGptWebImagePrompt({
+    outputFile:'/tmp/out.png',
+    manifestFile:'/tmp/run/web-generation.json',
+    prompt:'fixture',
+  });
+  assert.match(instruction,/tab\.capabilities\.get\("pageAssets"\)/);
+  assert.match(instruction,/pageAssets\.list\(\)/);
+  assert.match(instruction,/pageAssets\.bundle\(/);
+  assert.match(instruction,/contentType/);
+  assert.match(instruction,/downloadedCount/);
+  assert.doesNotMatch(instruction,/tab\.playwright\.waitForEvent\("download"\)/);
 });
 
 test('manifest command matrix uses the absolute helper and typed login failure flags',()=>{

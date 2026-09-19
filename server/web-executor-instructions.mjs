@@ -57,7 +57,11 @@ export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceF
 5. 发送前再次核对 worker-request.json 的 authorization.confirmed 和 requestId；授权撤销则停止。点击前且只在一次已确认可用的发送按钮点击之前执行：
    ${commands.submissionIntent}
    只有 ok=true 后才能点击一次。点击后必须用新 DOM 正向证明至少一项：输入框已清空并出现本次新的用户消息，或页面已出现本次生成进度/停止生成控件。只有正向证据出现后，执行 ${commands.submitted}；只有 ok=true 才算 submitted。若点击返回但无法证明既未发送也未送达，执行 ${commands.submissionUncertain}；保留未知结果并绝不再点击。页面显示生成中时只等待，绝不再次发送。
-6. 页面显示生成完成后，从下载控件取得原始 PNG/JPG/WebP，复制到准确路径 ${path.resolve(outputFile)}。不得把缩略图或截图当成原图。
+6. 页面显示生成完成后，必须从当前结果图片本身取得原始 PNG/JPG/WebP。不要只点击“保存”并等待 waitForEvent("download")：ChatGPT 的媒体保存按钮可能不产生浏览器 download 事件。先从当前这条最新生成结果的图片查看器读取可见 img 的 src，确认它不是参考附件缩略图；然后使用当前公开的页面资产能力取得原文件：
+   - 执行 const pageAssets=await tab.capabilities.get("pageAssets")，再执行 const inventory=await pageAssets.list()；不得导航到媒体 URL、不得用 curl/fetch 绕过页面资产能力。
+   - 在 inventory.assets 中按该可见结果图片的完整 src 精确匹配 kind === "image" 的资产；必须只得到一个对应资产，并确认 URL 是当前 ChatGPT 会话结果的 backend-api/estuary/content 媒体 URL，而不是附件缩略图。若没有精确匹配、资产能力不可用或结果仍不明确，执行失败 helper，错误码为 DOWNLOAD_CHROME_UNAVAILABLE，并保留 submitted=true、submission-intent=true、submission-uncertain=false、pre-submission-failure=false；绝不发送或重试。
+   - 执行 const bundle=await pageAssets.bundle({inventoryId:inventory.id,assetIds:[asset.id]})，要求 bundle.summary.downloadedCount === 1、bundle.failures.length === 0、返回资产 contentType 为 image/png、image/jpeg 或 image/webp。把返回资产的本地 path 原样复制到准确路径 ${path.resolve(outputFile)}；不得把截图、DOM 截图、缩略图或页面预览作为结果。
+   - 复制后检查目标文件存在、普通文件、内容类型和可解码性；若资产 bundle 成功但复制/校验失败，仍按已确认送达的下载失败记录 typed failure，绝不重发。
 7. 验证目标文件存在且可读取，然后执行 ${commands.downloaded}。helper 会核对目标文件必须是本次 worker-request.json 的 outputFile，并原子写入 state=downloaded、submitted=true、artifactPath、conversationUrl 和 downloadedAt；只有 ok=true 才算下载完成。公开 CUA 没有焦点恢复接口，不报告焦点已恢复，最后只返回真实原图绝对路径和会话 URL。
 8. 如果已有正向送达证据后发生任何错误，仍须执行失败 helper 并明确传入 --submitted true、--submission-intent true、--submission-uncertain true（如果无法判断是否送达）或 false（如果已确认送达）、--pre-submission-failure false；提交前且已执行 submission-intent 后失败则明确传入 --submitted false、--submission-intent true、--submission-uncertain false、--pre-submission-failure true。提交后的不确定结果绝不能标记为 pre-submission failure。不要重发；无论导航、登录、上传、发送或下载在哪一步失败，都由外层 finally 统一关闭本次自己创建的专用 tab；不得退回 IAB 或其他浏览器重试。除上述 helper 外，不得直接写入、删除、替换或格式化 web-generation.json；helper 失败就停止并保留原记录。
 

@@ -107,7 +107,7 @@ function stagePatch(stage,args,record){
     if(current.submitted!==true)throw usageError('downloaded 前必须已经 submitted。');
     const artifact=outputPath(record);
     if(!artifact||!fs.existsSync(artifact)||!fs.statSync(artifact).isFile()||fs.statSync(artifact).size===0)throw usageError('目标原图不存在或为空，不能写入 downloaded。');
-    patch.state='downloaded';patch.accepted=true;patch.submitted=true;patch.artifactPath=artifact;patch.downloadedAt=now();
+    patch.state='downloaded';patch.accepted=true;patch.submitted=true;patch.artifactPath=artifact;patch.downloadedAt=now();patch.errorCode=null;patch.error=null;patch.failedAt=null;
     if(args.conversationUrl)patch.conversationUrl=validateUrl(args.conversationUrl);
   }else if(stage==='failed'){
     const flags=failureFlags(args,current),{submitted,submissionIntent,submissionUncertain,preSubmissionFailure}=flags;
