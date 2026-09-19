@@ -5,7 +5,7 @@ import {execFile,spawn} from 'node:child_process';
 import {APP,ROOT,REFS,CHECKS,inside,digest} from './workflow.mjs';
 import {connectionStatus,appServerSnapshot,normalizeRateLimits} from './bridge.mjs';
 import {WEB_IMAGE_PROVIDER,readWebManifest,webWorkerStatus} from './chatgpt-web-provider.mjs';
-import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,decidePanel,resume,reviseImage,repairPageLayout,unifyPageLayouts,recoverImage,reviewImage,retryMissingImage,imageRetryState,accept,recover,projectDir,syncRunningProject,refreshQuotaPauses} from './engine.mjs';
+import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,decidePanel,rejectPanel,resume,reviseImage,repairPageLayout,unifyPageLayouts,recoverImage,reviewImage,retryMissingImage,imageRetryState,accept,recover,projectDir,syncRunningProject,refreshQuotaPauses} from './engine.mjs';
 import {CATEGORIES,listDocuments,listAssets,discoverArchiveStories,archiveStory,stageUpload,readCandidate,inspectStagedCandidate,saveManualAsset,searchAssets,analyzeAsset,saveAssetProposal,applyAssetProposal,saveDocument,suggestDocument,deleteProjectFolder,deleteArchiveStory} from './library.mjs';
 const PORT=Number(process.env.PORT||4318);const HOST='127.0.0.1';
 const INSTANCE_ID=`${process.pid}-${Date.now()}`;let restartRequested=false;
@@ -70,7 +70,7 @@ function publicProject(p){
     const isCurrentSample=Number.isInteger(sampleNumber)&&p.status==='samples_decision'&&p.samplesDecision?.sampleIndexes?.includes(sampleNumber)&&userDecision?.action!=='accept_current';
     return {...safe,url:media(displayFile),artifactId:artifact?.id||fallbackId,contentHash:digest({artifactId:artifact?.id||fallbackId,file,at:record.at||artifact?.at||null}),review:record.qa||null,decision:userDecision||null,availableActions:isCurrentSample?['accept_current','regenerate_current']:[]};
   };
-  const publicTask=task=>task?{id:task.id,kind:task.kind,target:task.target,status:task.status,attempt:task.attempt,providerInvocationLimit:task.providerInvocationLimit,providerInvocations:task.providerInvocations,startedAt:task.startedAt,lastProgressAt:task.lastProgressAt,completedAt:task.completedAt,qa:task.qa,errorCode:task.errorCode,webState:task.webState,webTimings:task.webTimings||null}:null;
+  const publicTask=task=>task?{id:task.id,kind:task.kind,target:task.target,status:task.status,attempt:task.attempt,providerInvocationLimit:task.providerInvocationLimit,providerInvocations:task.providerInvocations,startedAt:task.startedAt,lastProgressAt:task.lastProgressAt,completedAt:task.completedAt,qa:task.qa,errorCode:task.errorCode,webState:task.webState,webTimings:task.webTimings||null,role:task.role||null,creativeModel:task.creativeModel||null,creativeReasoningEffort:task.creativeReasoningEffort||null,executorModel:task.executorModel||null,executorReasoningEffort:task.executorReasoningEffort||null,revisionBase:task.revisionBase||null}:null;
   const {pending,history=[],samples=[],panels={},pages=[],bundle,artifacts:ignoredArtifacts,tasks:ignoredTasks,currentTask,previewDecisionCommands:ignoredCommands,panelDecisionCommands:ignoredPanelCommands,...safe}=p;
   void ignoredArtifacts;void ignoredTasks;void ignoredCommands;void ignoredPanelCommands;
   const retryState=imageRetryState(p);
@@ -243,6 +243,11 @@ const server=http.createServer(async(req,res)=>{
         try{const {expectedRevision:_expectedRevision,...decisionInput}=input;void _expectedRevision;await decidePanel(p,{...decisionInput,key:input.panelKey,action:input.decision});}catch(error){const latest=readProject(p.id);latest.panelDecisionCommands=(latest.panelDecisionCommands||[]).filter(record=>record.key!==input.idempotencyKey);saveProject(latest);throw error;}
         return send(res,{...publicProject(p),idempotent:false,command:{key:input.idempotencyKey,acceptedAt:new Date().toISOString(),continueProduction:input.continueProduction}});
       }
+      if(['reject-panel','panel-review','manual-panel-review'].includes(action)){
+        const commandKey=String(b.idempotencyKey||'manual-panel-review:'+p.id+':'+String(b.panelKey||b.key||b.target||'')),duplicate=(p.panelReviewCommands||[]).find(item=>item.key===commandKey);
+        rejectPanel(p,b);
+        return send(res,{...publicProject(p),idempotent:Boolean(duplicate),command:{key:commandKey,acceptedAt:duplicate?.at||new Date().toISOString()}});
+      }
       if(action==='retry-missing'){
         const command=retryCommand(p,b);
         // If the response was lost, returning the persisted state is safer than
@@ -263,7 +268,7 @@ const server=http.createServer(async(req,res)=>{
       else if(action==='approve-plan')approvePlan(p,b.hash);
       else if(action==='approve-samples')approveSamples(p,b.hash);
       else if(action==='resume')resume(p);
-      else if(action==='revise-image')reviseImage(p,b.key,b.note);
+      else if(action==='revise-image')reviseImage(p,b.key,b.note,{baseFile:b.baseFile,basePath:b.basePath,baseArtifactId:b.baseArtifactId});
       else if(action==='repair-page-layout')repairPageLayout(p,b.pageNumber);
       else if(action==='unify-page-layouts')unifyPageLayouts(p);
       else if(action==='recover-image')recoverImage(p);

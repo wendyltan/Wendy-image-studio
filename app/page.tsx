@@ -1,6 +1,18 @@
 'use client';
 import Link from 'next/link';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Children,
+  cloneElement,
+  isValidElement,
+  type CSSProperties,
+  type ReactElement,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
   AlertCircle,
   ArrowRight,
@@ -61,6 +73,7 @@ type Picture = {
     status?: string;
     summary: string;
     issues: string[];
+    repairPrompt?: string;
     issueDetails?: {
       id?: string;
       description?: string;
@@ -156,7 +169,12 @@ type Project = {
     target: string;
   } | null;
   lastFailure?: {
-    kind: 'network' | 'no-output' | 'browser-unavailable';
+    kind:
+      | 'network'
+      | 'no-output'
+      | 'browser-unavailable'
+      | 'browser-origin-permission-denied'
+      | 'browser-upload-unavailable';
     definiteNoOutput: boolean;
     key: string;
     attempts: number;
@@ -190,7 +208,7 @@ type ProgressStage = {
   label: string;
   tone: string;
   state: string;
-  startedAt: string;
+  startedAt?: string;
   completedAt?: string;
   durationMs?: number;
 };
@@ -379,19 +397,56 @@ function timestampMs(value?: string | null) {
 function stageElapsedMs(
   start?: string | null,
   end?: string | null,
-  fallbackEnd = Date.now(),
+  fallbackEnd?: number | null,
 ) {
   const from = timestampMs(start);
-  const to = end ? timestampMs(end) : fallbackEnd;
+  const to = end ? timestampMs(end) : (fallbackEnd ?? null);
   if (from === null || to === null || to < from) return null;
   return to - from;
 }
-function elapsed(start?: string | null, end?: string | null) {
+function elapsed(
+  start?: string | null,
+  end?: string | null,
+  fallbackEnd?: number | null,
+) {
   if (!start) return '尚未开始';
-  const measured = stageElapsedMs(start, end);
+  const measured = stageElapsedMs(start, end, fallbackEnd);
   if (measured === null) return '时间待校准';
   const n = Math.floor(measured / 1000);
   return n < 60 ? `${n} 秒` : `${Math.floor(n / 60)} 分 ${n % 60} 秒`;
+}
+function pendingKeepsClockRunning(pending?: Pending | null) {
+  return Boolean(
+    pending && !['failed', 'downloaded'].includes(pending.webState || ''),
+  );
+}
+function workflowClockActive(project: Project | null) {
+  const taskRunning = project?.currentTask?.status === 'running';
+  return Boolean(
+    project &&
+      (project.busy ||
+        (pendingKeepsClockRunning(project.pending) &&
+          (!project.currentTask || taskRunning)) ||
+        taskRunning ||
+        project.progress?.activeStage?.state === 'running'),
+  );
+}
+function terminalTime(
+  task?: Task | null,
+  progress?: Project['progress'],
+  failureAt?: string | null,
+) {
+  const candidates = [
+    task?.completedAt,
+    progress?.completedAt,
+    task?.lastProgressAt,
+    failureAt,
+  ];
+  return (
+    candidates.find(
+      (candidate): candidate is string => timestampMs(candidate) !== null,
+    ) || null
+  );
 }
 function resetText(timestamp?: number) {
   return timestamp
@@ -412,6 +467,122 @@ function observedAccountText(timestamp?: string | null) {
         minute: '2-digit',
       })
     : '时间未知';
+}
+function qaLabel(qa: Picture['qa']) {
+  if (qa.status === 'deferred')
+    return { className: 'deferred', text: '待检查/未校对' };
+  if (qa.pass === true) return { className: 'good', text: '已校对' };
+  return { className: '', text: '待修订' };
+}
+function QaBadge({ qa }: { qa: Picture['qa'] }) {
+  const state = qaLabel(qa);
+  return <span className={'qa-label ' + state.className}>{state.text}</span>;
+}
+function finitePixel(
+  value: string | null | undefined,
+  fallback: number,
+  positive = false,
+) {
+  const parsed = Number.parseFloat(value || '');
+  return Number.isFinite(parsed) && (positive ? parsed > 0 : parsed >= 0)
+    ? parsed
+    : fallback;
+}
+function MeasuredMasonryGrid({
+  className,
+  children,
+}: {
+  className: string;
+  children: ReactNode;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [spans, setSpans] = useState<number[]>([]);
+  const items = Children.toArray(children);
+  const itemCount = items.length;
+  const itemSignature = items
+    .map((item, index) =>
+      isValidElement(item) ? String(item.key ?? index) : String(index),
+    )
+    .join('|');
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || itemCount === 0) {
+      setSpans((previous) => (previous.length ? [] : previous));
+      return;
+    }
+    let disposed = false;
+    let frame: number | null = null;
+    const measure = () => {
+      frame = null;
+      if (disposed) return;
+      const styles = window.getComputedStyle(container);
+      const rowSize = finitePixel(
+        styles.getPropertyValue('--masonry-row-size'),
+        8,
+        true,
+      );
+      const rowGap = finitePixel(styles.rowGap, 18);
+      const cards = Array.from(container.children).slice(0, itemCount);
+      const next = cards.map((item) => {
+        const height = item?.getBoundingClientRect().height || 0;
+        const safeHeight = Number.isFinite(height) && height > 0 ? height : 0;
+        const span = Math.max(
+          1,
+          Math.ceil((safeHeight + rowGap) / (rowSize + rowGap)),
+        );
+        return Number.isFinite(span) ? span : 1;
+      });
+      setSpans((previous) =>
+        previous.length === next.length &&
+        previous.every((span, index) => span === next[index])
+          ? previous
+          : next,
+      );
+    };
+    const schedule = () => {
+      if (disposed || frame !== null) return;
+      frame = window.requestAnimationFrame(measure);
+    };
+    const observer =
+      typeof ResizeObserver === 'undefined'
+        ? null
+        : new ResizeObserver(schedule);
+    Array.from(container.children)
+      .slice(0, itemCount)
+      .forEach((item) => observer?.observe(item));
+    observer?.observe(container);
+    const images = Array.from(container.querySelectorAll('img'));
+    images.forEach((image) => image.addEventListener('load', schedule));
+    window.addEventListener('resize', schedule);
+    schedule();
+    return () => {
+      disposed = true;
+      if (frame !== null) window.cancelAnimationFrame(frame);
+      observer?.disconnect();
+      images.forEach((image) => image.removeEventListener('load', schedule));
+      window.removeEventListener('resize', schedule);
+    };
+  }, [itemCount, itemSignature]);
+
+  const ready = itemCount === 0 || spans.length === itemCount;
+  return (
+    <div
+      ref={containerRef}
+      className={`${className} masonry-grid${ready ? ' masonry-ready' : ''}`}
+    >
+      {items.map((item, index) => {
+        if (!isValidElement(item)) return item;
+        const element = item as ReactElement<{ style?: CSSProperties }>;
+        return cloneElement(element, {
+          style: {
+            ...element.props.style,
+            '--masonry-row-span': String(spans[index] || 1),
+          } as CSSProperties,
+        });
+      })}
+    </div>
+  );
 }
 export default function Studio() {
   const [data, setData] = useState<Bootstrap | null>(null),
@@ -482,6 +653,7 @@ export default function Studio() {
     models = data?.account.models || [],
     selectedModel = models.find((m) => m.id === model) || models[0],
     limits = data?.account.rateLimits,
+    clockActive = workflowClockActive(project),
     assets = useMemo(
       () =>
         (assetResults || data?.assets || []).filter(
@@ -552,9 +724,12 @@ export default function Studio() {
     return () => clearTimeout(t);
   }, [idea, special, pages, cat, xiaolin, preset]);
   useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 1000);
+    const tick = () => setNow(Date.now());
+    tick();
+    if (!clockActive) return;
+    const t = setInterval(tick, 1000);
     return () => clearInterval(t);
-  }, []);
+  }, [clockActive]);
   useEffect(() => {
     if (!current) return;
     let gone = false,
@@ -1505,6 +1680,7 @@ export default function Studio() {
                 action={action}
                 setZoom={setZoom}
                 setEdit={setEdit}
+                setEditNote={setEditNote}
                 analyze={analyze}
                 now={now}
               />
@@ -1516,7 +1692,12 @@ export default function Studio() {
                 <article className="work-card" key={p.id}>
                   <button className="cover-button" onClick={() => select(p)}>
                     {p.pages[0] ? (
-                      <img src={p.pages[0].url} alt={p.title} />
+                      <img
+                        src={p.pages[0].url}
+                        alt={p.title}
+                        loading="lazy"
+                        decoding="async"
+                      />
                     ) : (
                       <span className="work-placeholder">
                         <BookOpen />
@@ -1553,7 +1734,12 @@ export default function Studio() {
               {data.archiveStories.map((s) => (
                 <article className="work-card" key={s.id}>
                   <button className="cover-button" onClick={() => setStory(s)}>
-                    <img src={s.coverUrl} alt={s.title} />
+                    <img
+                      src={s.coverUrl}
+                      alt={s.title}
+                      loading="lazy"
+                      decoding="async"
+                    />
                   </button>
                   <div>
                     <span className="eyebrow">
@@ -1734,6 +1920,8 @@ export default function Studio() {
                                 <img
                                   src={a.url}
                                   alt={a.displayName || a.name}
+                                  loading="lazy"
+                                  decoding="async"
                                 />
                                 <span>
                                   {a.displayName ||
@@ -1830,7 +2018,12 @@ export default function Studio() {
                   })
                 }
               >
-                <img src={p.url} alt={`第${i + 1}页`} />
+                <img
+                  src={p.url}
+                  alt={`第${i + 1}页`}
+                  loading="lazy"
+                  decoding="async"
+                />
                 <span>第 {i + 1} 页</span>
               </button>
             ))}
@@ -2158,6 +2351,7 @@ function ProjectView({
   action,
   setZoom,
   setEdit,
+  setEditNote,
   analyze,
   now,
 }: {
@@ -2178,6 +2372,7 @@ function ProjectView({
   action: (n: string, b?: unknown) => void;
   setZoom: (x: { url: string; title: string } | null) => void;
   setEdit: (x: { key: string; title: string } | null) => void;
+  setEditNote: (x: string) => void;
   analyze: (kind: 'page' | 'panel' | 'sample', key: string | number) => void;
   now: number;
 }) {
@@ -2209,9 +2404,29 @@ function ProjectView({
         (item.image.qa.pass === false &&
           item.key === project.panelDecision?.panelKey)),
   );
-  const panelDecisionTarget = project.panelDecision?.panelKey
-    ? project.panels[project.panelDecision.panelKey]
+  const panelDecisionKey = project.panelDecision?.panelKey;
+  const panelDecisionTarget = panelDecisionKey
+    ? project.panels[panelDecisionKey]
     : null;
+  const panelDecisionRequired = Boolean(
+    panelDecisionTarget &&
+      project.panelDecision?.state === 'required' &&
+      !project.busy,
+  );
+  // One recovery/decision card is the primary action. Unknown results keep
+  // their safety boundary; a known missing result yields to an existing panel
+  // decision so the previous image remains the only actionable surface.
+  const primaryCard = unknownResult
+    ? 'unknown'
+    : panelDecisionRequired
+      ? 'panel'
+      : noOutput
+        ? 'no-output'
+        : reviewable
+          ? 'review'
+          : project.pending && !project.busy
+            ? 'recovery'
+            : null;
   return (
     <>
       <div className="steps">
@@ -2246,15 +2461,6 @@ function ProjectView({
           </div>
         </div>
       )}
-      {imageReady && imageMessage && project.status !== 'complete' && (
-        <div className="recovery-card">
-          <AlertCircle />
-          <div>
-            <h3>专用 Chrome 标签页会短暂取得焦点</h3>
-            <p>{imageMessage}</p>
-          </div>
-        </div>
-      )}
       <WorkflowStatus
         project={project}
         progress={progress}
@@ -2263,42 +2469,43 @@ function ProjectView({
         disabled={disabled}
         action={action}
         noOutput={noOutput}
+        panelDecisionPrimary={primaryCard === 'panel'}
         recoveryPending={Boolean(project.imageRetry)}
         now={now}
       />
-      {project.pending && !project.busy && !noOutput && (
+      {primaryCard === 'recovery' && (
         <RecoveryCard action={action} />
       )}
-      {noOutput && (
+      {primaryCard === 'no-output' && (
         <NoOutputCard project={project} disabled={disabled} action={action} />
       )}
-      {unknownResult && (
+      {primaryCard === 'unknown' && (
         <UnknownResultCard
           project={project}
           disabled={disabled}
           action={action}
         />
       )}
-      {reviewable && !project.busy && (
+      {primaryCard === 'review' && reviewable && (
         <ReviewCard target={reviewable} disabled={disabled} action={action} />
       )}
-      {panelDecisionTarget &&
-        project.panelDecision?.state === 'required' &&
-        !project.busy && (
-          <PanelDecisionCard
+      {primaryCard === 'panel' && panelDecisionTarget && panelDecisionKey && (
+        <PanelDecisionCard
             project={project}
-            panelKey={project.panelDecision.panelKey}
+            panelKey={panelDecisionKey}
             image={panelDecisionTarget}
             disabled={disabled}
             action={action}
-            onEdit={() =>
+            previousAttemptNoOutput={noOutput}
+            onEdit={(repairPrompt) => {
+              setEditNote(repairPrompt || '');
               setEdit({
-                key: project.panelDecision!.panelKey,
-                title: `分镜 ${project.panelDecision!.panelKey}`,
-              })
-            }
-          />
-        )}
+                key: panelDecisionKey,
+                title: `分镜 ${panelDecisionKey}`,
+              });
+            }}
+        />
+      )}
       {project.metrics && <ModelUsagePanel project={project} />}
       <div className="tabs">
         <button
@@ -2477,10 +2684,18 @@ function ProjectView({
                           setZoom({ url: sample.url, title: '样张' })
                         }
                       >
-                        <img src={sample.url} alt="样张" />
+                        <img
+                          src={sample.url}
+                          alt="样张"
+                          loading="lazy"
+                          decoding="async"
+                        />
                       </button>
                       <div className="image-meta">
-                        <h3>{i ? '02 · 主场景' : '01 · 人物脸部'}</h3>
+                        <h3>
+                          {i ? '02 · 主场景' : '01 · 人物脸部'}
+                          <QaBadge qa={sample.qa} />
+                        </h3>
                         <p>{sample.qa.summary}</p>
                         {needsDecision ? (
                           <SampleDecisionActions
@@ -2565,7 +2780,7 @@ function ProjectView({
             )}
           </div>
           {project.pages.length ? (
-            <div className="finished-grid">
+            <MeasuredMasonryGrid className="finished-grid">
               {project.pages.map((p) => (
                 <div className="image-card" key={p.number}>
                   <button
@@ -2574,14 +2789,17 @@ function ProjectView({
                       setZoom({ url: p.url, title: `第 ${p.number} 页` })
                     }
                   >
-                    <img src={p.url} alt={`第${p.number}页`} />
+                    <img
+                      src={p.url}
+                      alt={`第${p.number}页`}
+                      loading="lazy"
+                      decoding="async"
+                    />
                   </button>
                   <div className="image-meta">
                     <h3>
                       第 {p.number} 页{' '}
-                      <span className={'qa-label ' + (p.qa.pass ? 'good' : '')}>
-                        {p.qa.pass ? '已校对' : '待修订'}
-                      </span>
+                      <QaBadge qa={p.qa} />
                     </h3>
                     <p>{p.qa.summary}</p>
                     <div className="inline-actions">
@@ -2613,7 +2831,7 @@ function ProjectView({
                   </div>
                 </div>
               ))}
-            </div>
+            </MeasuredMasonryGrid>
           ) : Object.keys(project.panels).length === 0 ? (
             <div className="empty-state">
               <BookOpen />
@@ -2623,7 +2841,7 @@ function ProjectView({
           {Object.keys(project.panels).length > 0 && (
             <details className="source-panels" open={!project.pages.length}>
               <summary>查看原始分镜 · 局部修改</summary>
-              <div className="source-grid">
+              <MeasuredMasonryGrid className="source-grid">
                 {Object.entries(project.panels).map(([k, p]) => (
                   <div key={k}>
                     <button
@@ -2632,10 +2850,16 @@ function ProjectView({
                         setZoom({ url: p.url, title: `分镜 ${k}` })
                       }
                     >
-                      <img src={p.url} alt={`分镜${k}`} />
+                      <img
+                        src={p.url}
+                        alt={`分镜${k}`}
+                        loading="lazy"
+                        decoding="async"
+                      />
                     </button>
                     <div>
                       <span>分镜 {k}</span>
+                      <QaBadge qa={p.qa} />
                       <button
                         aria-label={`修改分镜 ${k}`}
                         title={`修改分镜 ${k}`}
@@ -2653,7 +2877,7 @@ function ProjectView({
                     </div>
                   </div>
                 ))}
-              </div>
+              </MeasuredMasonryGrid>
             </details>
           )}
           {project.status === 'ready' && (
@@ -2725,36 +2949,39 @@ function ModelUsagePanel({ project }: { project: Project }) {
           {(metrics.outputTokens || 0).toLocaleString()} tokens
         </span>
       </header>
-      <div className="model-usage-rows">
-        {rows.map((row) => (
-          <div key={`${row.model}:${row.reasoningEffort}`}>
-            <span>
-              <b>{row.model}</b>
-              <small>
-                {effortLabels[row.reasoningEffort] || row.reasoningEffort}思考
-              </small>
-            </span>
-            <strong>{row.runs} 次</strong>
-            <span>
-              输入 {row.inputTokens.toLocaleString()}
-              {!!row.cachedInputTokens && (
-                <small>其中缓存 {row.cachedInputTokens.toLocaleString()}</small>
-              )}
-            </span>
-            <span>
-              输出 {row.outputTokens.toLocaleString()}
-              {!!row.reasoningOutputTokens && (
+      <details className="model-usage-details">
+        <summary>查看模型明细</summary>
+        <div className="model-usage-rows">
+          {rows.map((row) => (
+            <div key={`${row.model}:${row.reasoningEffort}`}>
+              <span>
+                <b>{row.model}</b>
                 <small>
-                  其中思考 {row.reasoningOutputTokens.toLocaleString()}
+                  {effortLabels[row.reasoningEffort] || row.reasoningEffort}思考
                 </small>
-              )}
-            </span>
-          </div>
-        ))}
-        {!!metrics.unattributedRuns && (
-          <p>另有 {metrics.unattributedRuns} 次旧记录缺少可核对的模型明细。</p>
-        )}
-      </div>
+              </span>
+              <strong>{row.runs} 次</strong>
+              <span>
+                输入 {row.inputTokens.toLocaleString()}
+                {!!row.cachedInputTokens && (
+                  <small>其中缓存 {row.cachedInputTokens.toLocaleString()}</small>
+                )}
+              </span>
+              <span>
+                输出 {row.outputTokens.toLocaleString()}
+                {!!row.reasoningOutputTokens && (
+                  <small>
+                    其中思考 {row.reasoningOutputTokens.toLocaleString()}
+                  </small>
+                )}
+              </span>
+            </div>
+          ))}
+          {!!metrics.unattributedRuns && (
+            <p>另有 {metrics.unattributedRuns} 次旧记录缺少可核对的模型明细。</p>
+          )}
+        </div>
+      </details>
     </section>
   );
 }
@@ -2766,6 +2993,7 @@ function WorkflowStatus({
   disabled,
   action,
   noOutput,
+  panelDecisionPrimary,
   recoveryPending,
   now,
 }: {
@@ -2776,6 +3004,7 @@ function WorkflowStatus({
   disabled: boolean;
   action: (name: string, body?: unknown) => void;
   noOutput: boolean;
+  panelDecisionPrimary: boolean;
   recoveryPending: boolean;
   now: number;
 }) {
@@ -2824,6 +3053,10 @@ function WorkflowStatus({
       '后台已接单，但专用 Chrome 标签页在恢复创作室焦点后无法继续读取；没有上传附件或发送消息。当前请求已失败，记录仍保留。',
     BROWSER_CHROME_UNAVAILABLE:
       '后台已接单，但 Chrome Computer Use 扩展不可用；没有上传附件或发送消息。当前请求已失败，记录仍保留。',
+    FILE_UPLOAD_CHROME_UNAVAILABLE:
+      '专用 Chrome 标签页的附件入口未能打开浏览器文件选择器；本次未上传附件或发送消息，上一版原图仍保留。修复附件入口后只重试这一张。',
+    BROWSER_ORIGIN_PERMISSION_DENIED:
+      'Chrome 已连接，但 chatgpt.com 访问权限被拒绝；下次重试出现浏览器访问询问时请选择“允许”。本次没有上传附件或发送消息，当前请求已失败，记录仍保留。',
     BROWSER_BACKGROUND_UNAVAILABLE:
       '这是旧请求记录中的后台浏览器能力失败；没有上传附件或发送消息。当前生产链路不会使用隐藏 IAB，请确认 Chrome 焦点管理能力后再重试。',
   };
@@ -2840,6 +3073,10 @@ function WorkflowStatus({
     (task?.status === 'not_accepted'
       ? '后台尚未确认接单，已停止本机等待；请求已保留，不会自动重试。'
       : webText || project.message);
+  const uploadUnavailable =
+    project.lastFailure?.kind === 'browser-upload-unavailable' ||
+    task?.errorCode === 'browser-upload-unavailable' ||
+    project.pending?.errorCode === 'FILE_UPLOAD_CHROME_UNAVAILABLE';
   const layoutPage = project.pages.find(
     (page) =>
       !page.qa.pass &&
@@ -2850,8 +3087,18 @@ function WorkflowStatus({
     !recoveryPending &&
     !layoutPage &&
     ['attention', 'paused', 'draft'].includes(project.status);
+  const clockActive = workflowClockActive(project);
+  const terminalAt = clockActive
+    ? null
+    : terminalTime(task, progress, project.lastFailure?.at);
+  const terminalAtMs = timestampMs(terminalAt);
+  const stageFallbackEnd = clockActive ? now : terminalAtMs;
+  const taskFailed =
+    ['failed', 'failed_no_output', 'unknown_result', 'paused', 'review_failed', 'not_accepted'].includes(
+      task?.status || '',
+    ) || project.pending?.webState === 'failed';
   const liveTone =
-    project.error || recoveryPending
+    project.error || recoveryPending || taskFailed
       ? 'error'
       : project.pending?.webState === 'submitted'
         ? 'creating'
@@ -2883,19 +3130,28 @@ function WorkflowStatus({
     startedAt?: string | null,
     completedAt?: string | null,
   ) => {
-    if (!startedAt) return;
-    const measured = completedAt
-      ? stageElapsedMs(startedAt, completedAt)
-      : null;
+    if (!startedAt) {
+      browserStages.push({ id, label, tone, state: 'not_reached' });
+      return;
+    }
+    const stageEnd = completedAt || (!clockActive ? terminalAt : null);
+    const measured = stageElapsedMs(startedAt, stageEnd);
+    const failed = !completedAt && !clockActive && taskFailed;
     browserStages.push({
       id,
       label,
-      tone,
-      state: completedAt ? 'completed' : 'running',
+      tone: failed ? 'error' : tone,
+      state: completedAt
+        ? 'completed'
+        : failed
+          ? 'failed'
+          : clockActive
+            ? 'running'
+            : 'completed',
       startedAt,
-      ...(completedAt
+      ...(stageEnd
         ? {
-            completedAt,
+            completedAt: stageEnd,
             ...(measured === null ? {} : { durationMs: measured }),
           }
         : {}),
@@ -2917,15 +3173,13 @@ function WorkflowStatus({
       browserClock.readyAt ||
         (!browserClock.readyAt ? browserClock.submittedAt : null),
     );
-    if (browserClock.readyAt) {
-      addBrowserStage(
-        'browser-submitted',
-        '发送生图请求',
-        'creating',
-        browserClock.readyAt,
-        browserClock.submittedAt,
-      );
-    }
+    addBrowserStage(
+      'browser-submitted',
+      '发送生图请求',
+      'creating',
+      browserClock.readyAt,
+      browserClock.submittedAt,
+    );
     addBrowserStage(
       'browser-downloaded',
       '等待生成并下载原图',
@@ -2943,7 +3197,7 @@ function WorkflowStatus({
     .map((stage) =>
       stage.durationMs !== undefined && Number.isFinite(stage.durationMs)
         ? Math.max(0, stage.durationMs)
-        : stageElapsedMs(stage.startedAt, stage.completedAt, now),
+        : stageElapsedMs(stage.startedAt, stage.completedAt, stageFallbackEnd),
     )
     .filter((duration): duration is number => duration !== null);
   const maxDuration = Math.max(1, ...stageDurations);
@@ -2953,16 +3207,27 @@ function WorkflowStatus({
         <div>
         {project.busy ? (
           <LoaderCircle className="spin" />
-        ) : project.error || recoveryPending ? (
+        ) : project.error || recoveryPending || taskFailed ? (
           <AlertCircle />
         ) : (
           <CircleCheck />
         )}
         <span>
-          {noOutput ? '本次没有取得图片，可重试这一张。' : statusMessage}
+          {noOutput
+            ? panelDecisionPrimary
+              ? '本次修改未取得新图，上一版原图仍保留。'
+              : uploadUnavailable
+                ? '附件上传没有完成，未上传附件、未发送消息；上一版原图仍保留。'
+              : '本次没有取得图片，可重试这一张。'
+            : statusMessage}
           <small>
-            <Clock /> 已用时{' '}
-            {elapsed(progress?.startedAt, progress?.completedAt)} ·{' '}
+          <Clock /> 已用时{' '}
+            {elapsed(
+              progress?.startedAt,
+              progress?.completedAt || terminalAt,
+              stageFallbackEnd,
+            )}{' '}
+            ·{' '}
             {progress?.current || 0}/{progress?.total || 1}{' '}
             {progress?.unit || '步骤'} · {project.brief.model} /{' '}
             {effortLabels[project.brief.reasoningEffort] ||
@@ -3008,7 +3273,11 @@ function WorkflowStatus({
             const duration =
               stage.durationMs !== undefined && Number.isFinite(stage.durationMs)
                 ? Math.max(0, stage.durationMs)
-                : stageElapsedMs(stage.startedAt, stage.completedAt, now);
+                : stageElapsedMs(
+                    stage.startedAt,
+                    stage.completedAt,
+                    stageFallbackEnd,
+                  );
             return (
               <div key={stage.id} className={`tone-${stage.tone}`}>
                 <span title={stage.label}>{stage.label}</span>
@@ -3019,7 +3288,15 @@ function WorkflowStatus({
                     }}
                   />
                 </i>
-                <b>{elapsed(stage.startedAt, stage.completedAt)}</b>
+                <b>
+                  {stage.state === 'not_reached'
+                    ? '未到达'
+                    : elapsed(
+                        stage.startedAt,
+                        stage.completedAt,
+                        stageFallbackEnd,
+                      )}
+                </b>
               </div>
             );
           })}
@@ -3063,13 +3340,21 @@ function NoOutputCard({
     retryToken =
       project.currentTask?.id ||
       `${project.revision ?? project.version}:${target}`;
+  const uploadUnavailable =
+    project.lastFailure?.kind === 'browser-upload-unavailable' ||
+    project.currentTask?.errorCode === 'browser-upload-unavailable';
   return (
     <div className="recovery-card">
       <div>
-        <h3>本次没有取得图片，可重试这一张</h3>
+        <h3>
+          {uploadUnavailable
+            ? '附件上传未完成，上一版原图仍保留'
+            : '本次没有取得图片，可重试这一张'}
+        </h3>
         <p>
-          {target}{' '}
-          没有保存到本地，也没有可找回的原图。系统不会自行重试；重新生成会发起一次新的生图并消耗创作额度。
+          {uploadUnavailable
+            ? `${target} 的附件入口没有打开浏览器文件选择器；本次未上传附件、未发送消息，也未生成新图。系统不会自行重试，修复附件入口后可只重试这一张。`
+            : `${target} 没有保存到本地，也没有可找回的原图。系统不会自行重试；重新生成会发起一次新的生图并消耗创作额度。`}
         </p>
       </div>
       <div>
@@ -3180,6 +3465,7 @@ function PanelDecisionCard({
   image,
   disabled,
   action,
+  previousAttemptNoOutput = false,
   onEdit,
 }: {
   project: Project;
@@ -3187,7 +3473,8 @@ function PanelDecisionCard({
   image: Picture;
   disabled: boolean;
   action: (name: string, body?: unknown) => void;
-  onEdit: () => void;
+  previousAttemptNoOutput?: boolean;
+  onEdit: (repairPrompt?: string) => void;
 }) {
   const revision = project.revision ?? project.version,
     issueIds = (image.qa.issueDetails || [])
@@ -3198,12 +3485,18 @@ function PanelDecisionCard({
       .map((issue) => String(issue.id)),
     ready = Boolean(project.planHash && image.artifactId && image.contentHash);
   return (
-    <div className="approval-card">
+    <div className="approval-card panel-decision-card">
       <h2>正式分镜需要你来决定</h2>
-      <p>
-        第 {panelKey.split('-')[0]} 页第 {panelKey.split('-')[1]} 格的模型质检没有通过。
-        请先查看原图和问题，再选择采用当前图片或修改这一张。
-      </p>
+      {previousAttemptNoOutput ? (
+        <p>
+          本次修改未取得新图，上一版原图仍保留。请查看上一版原图和问题，再决定是否采用。
+        </p>
+      ) : (
+        <p>
+          第 {panelKey.split('-')[0]} 页第 {panelKey.split('-')[1]} 格的模型质检没有通过。
+          请先查看原图和问题，再选择采用当前图片或修改这一张。
+        </p>
+      )}
       {image.qa.issues.length > 0 && (
         <small>检查问题：{image.qa.issues.join('；')}</small>
       )}
@@ -3231,11 +3524,15 @@ function PanelDecisionCard({
           }}
         >
           <Check />
-          采用当前图片
+          {previousAttemptNoOutput ? '采用上一版' : '采用当前图片'}
         </button>
-        <button className="secondary" disabled={disabled} onClick={onEdit}>
+        <button
+          className="secondary"
+          disabled={disabled}
+          onClick={() => onEdit(image.qa.repairPrompt)}
+        >
           <Pencil />
-          修改这一张
+          {previousAttemptNoOutput ? '继续修改这一张' : '修改这一张'}
         </button>
       </div>
       {!ready && <small>当前图片版本信息尚未刷新，请重新打开这篇作品后再决定。</small>}

@@ -5,7 +5,7 @@ import readline from 'node:readline';
 import {APP} from './workflow.mjs';
 
 const IMAGE_PATH = /(?:^|[\s"'`(])((?:\/[^\n<>"'`]+?)\.(?:png|webp|jpe?g))(?:$|[\s"'`,)])/gi;
-const CLEAR_NO_IMAGE = /(?:未产生(?:任何)?图片|未产出(?:任何)?图片|未能生成(?:图片)?|没有生成(?:替代品|图片)|没有(?:任何)?图片(?:产出|生成)?|目标路径尚不存在|未写入目标路径|Browser is not available:\s*(?:iab|chrome)|隐藏\s*IAB.*不可用|BROWSER_(?:FOCUS|TAB_BACKGROUND|CHROME)_(?:UNAVAILABLE|RESTORE_FAILED)|Chrome management capability is not advertised|焦点(?:恢复|管理)能力(?:不可用|未提供|未广告)|无法恢复创作室焦点|no image (?:was )?(?:generated|produced|created)|image generation (?:did not|failed to) (?:produce|create))/i;
+const CLEAR_NO_IMAGE = /(?:未产生(?:任何)?图片|未产出(?:任何)?图片|未能生成(?:图片)?|没有生成(?:替代品|图片)|没有(?:任何)?图片(?:产出|生成)?|目标路径尚不存在|未写入目标路径|Browser is not available:\s*(?:iab|chrome)|隐藏\s*IAB.*不可用|BROWSER_(?:FOCUS|TAB_BACKGROUND|CHROME)_(?:UNAVAILABLE|RESTORE_FAILED)|BROWSER_ORIGIN_PERMISSION_DENIED|The user declined permission(?: for this action)?|Browser use cannot access\s+https?:\/\/chatgpt\.com\b[^\n]*(?:denied permission|permission denied)|https?:\/\/chatgpt\.com\b[^\n]*browser security policy|browser security policy[^\n]*https?:\/\/chatgpt\.com\b|browser security policy|Chrome management capability is not advertised|焦点(?:恢复|管理)能力(?:不可用|未提供|未广告)|无法恢复创作室焦点|no image (?:was )?(?:generated|produced|created)|image generation (?:did not|failed to) (?:produce|create))/i;
 const NETWORK_INTERRUPTION = /(?:network|connection|connect(?:ion)? (?:reset|refused|failed|closed)|websocket|tls|ssl|tunnel|econn(?:reset|refused|timeout)|enotfound|连接(?:错误|中断|失败|超时)?|网络(?:错误|中断|失败|超时)?|代理|隧道)/i;
 
 function eventObjects(value){
@@ -161,8 +161,17 @@ export function extractRateLimits(value){
   if(response?.primary||response?.secondary)return response;
   return response&&typeof response==='object'&&Object.values(response).some(item=>item&&typeof item==='object'&&('usedPercent' in item||'windowDurationMins' in item))?response:null;
 }
+function rawRateLimitBuckets(value){
+  if(!value||typeof value!=='object')return {};
+  const response=value.rateLimits&&typeof value.rateLimits==='object'?value.rateLimits:value;
+  const byLimitId=value.rateLimitsByLimitId||value.byLimitId||response.rateLimitsByLimitId||response.byLimitId;
+  if(byLimitId&&typeof byLimitId==='object'&&!Array.isArray(byLimitId))return byLimitId;
+  const selected=value.rateLimits&&typeof value.rateLimits==='object'?value.rateLimits:value;
+  const limitId=typeof selected.limitId==='string'&&selected.limitId?selected.limitId:'codex';
+  return selected&&typeof selected==='object'&&(selected.primary||selected.secondary)?{[limitId]:selected}:{};
+}
 export function normalizeRateLimits(value){
-  const raw=extractRateLimits(value)||{};
+  const buckets=rawRateLimitBuckets(value),raw=buckets.codex||extractRateLimits(value)||{};
   const clean=window=>{
     if(!window||typeof window!=='object'||Array.isArray(window))return null;
     const parseNumber=value=>{
@@ -174,13 +183,20 @@ export function normalizeRateLimits(value){
     const used=Math.min(100,Math.max(0,usedValue)),durationValue=parseNumber(window.windowDurationMins),resetValue=parseNumber(window.resetsAt);
     return {usedPercent:used,remainingPercent:Math.max(0,100-used),windowDurationMins:durationValue&&durationValue>0?durationValue:null,resetsAt:resetValue};
   };
-  const windows=Object.entries(raw).map(([key,source])=>({key,source,value:clean(source)})).filter(x=>x.value);
-  const explicitPrimary=windows.find(x=>x.key==='primary')||null,explicitSecondary=windows.find(x=>x.key==='secondary')||null;
-  const primaryEntry=explicitPrimary||(!explicitSecondary?windows.find(x=>x.value.windowDurationMins&&x.value.windowDurationMins<=360)||(!windows.some(x=>x.value.windowDurationMins&&x.value.windowDurationMins>360)?windows[0]||null:null):null);
-  const primary=primaryEntry?.value||null;
-  const secondaryEntry=(explicitSecondary&&explicitSecondary!==primaryEntry&&explicitSecondary.source!==primaryEntry?.source?explicitSecondary:null)||windows.find(x=>x!==primaryEntry&&x.source!==primaryEntry?.source&&x.value.windowDurationMins&&x.value.windowDurationMins>360)||(!primaryEntry?windows.find(x=>x.key!=='primary'&&x.source!==explicitPrimary?.source)||null:windows.find(x=>x!==primaryEntry&&x.source!==primaryEntry?.source)||null);
-  const secondary=secondaryEntry?.value||null;
-  return {primary,secondary,planType:raw.planType||null,credits:raw.credits?{balance:raw.credits.balance,hasCredits:raw.credits.hasCredits}:null};
+  const normalizeBucket=bucket=>{
+    const windows=Object.entries(bucket||{}).map(([key,source])=>({key,source,value:clean(source)})).filter(x=>x.value);
+    const explicitPrimary=windows.find(x=>x.key==='primary')||null,explicitSecondary=windows.find(x=>x.key==='secondary')||null;
+    const primaryEntry=explicitPrimary||(!explicitSecondary?windows.find(x=>x.value.windowDurationMins&&x.value.windowDurationMins<=360)||(!windows.some(x=>x.value.windowDurationMins&&x.value.windowDurationMins>360)?windows[0]||null:null):null);
+    const primary=primaryEntry?.value||null;
+    const secondaryEntry=(explicitSecondary&&explicitSecondary!==primaryEntry&&explicitSecondary.source!==primaryEntry?.source?explicitSecondary:null)||windows.find(x=>x!==primaryEntry&&x.source!==primaryEntry?.source&&x.value.windowDurationMins&&x.value.windowDurationMins>360)||(!primaryEntry?windows.find(x=>x.key!=='primary'&&x.source!==explicitPrimary?.source)||null:windows.find(x=>x!==primaryEntry&&x.source!==primaryEntry?.source)||null);
+    return {primary,secondary:secondaryEntry?.value||null,planType:bucket?.planType||null,credits:bucket?.credits?{balance:bucket.credits.balance,hasCredits:bucket.credits.hasCredits}:null};
+  };
+  const normalized=normalizeBucket(raw),primary=normalized.primary,secondary=normalized.secondary;
+  const byLimitId=Object.fromEntries(Object.entries(buckets).map(([id,bucket])=>{
+    const normalizedBucket=normalizeBucket(bucket);
+    return [id,{...normalizedBucket,limitId:bucket?.limitId||id,limitName:bucket?.limitName||null,normalModelSlug:bucket?.normalModelSlug||null}];
+  }));
+  return {...normalized,primary,secondary,byLimitId};
 }
 const rateLimitCache={value:null,observedAt:0,inFlight:null};
 /**
@@ -191,7 +207,7 @@ const rateLimitCache={value:null,observedAt:0,inFlight:null};
  */
 export function rateLimitSnapshot(timeoutMs=12000,{force=false}={}){
   const bin=findCodex();if(!bin)return Promise.resolve(null);
-  if(process.env.WENDI_TEST_PLAN_FILE)return Promise.resolve({primary:{usedPercent:1,windowDurationMins:300},secondary:{usedPercent:2,windowDurationMins:10080}});
+  if(process.env.WENDI_TEST_PLAN_FILE)return Promise.resolve({primary:{usedPercent:1,remainingPercent:99,windowDurationMins:300},secondary:{usedPercent:2,remainingPercent:98,windowDurationMins:10080},byLimitId:{codex:{limitId:'codex',primary:{usedPercent:1,remainingPercent:99,windowDurationMins:300},secondary:{usedPercent:2,remainingPercent:98,windowDurationMins:10080}},base_model_inference:{limitId:'base_model_inference',normalModelSlug:'fixture-model',primary:{usedPercent:1,remainingPercent:99,windowDurationMins:10080}}},status:'fresh',observedAt:Date.now()});
   const age=Date.now()-rateLimitCache.observedAt;
   if(!force&&rateLimitCache.value&&age<60_000)return Promise.resolve({...rateLimitCache.value,status:'cached',observedAt:rateLimitCache.observedAt});
   if(rateLimitCache.inFlight)return rateLimitCache.inFlight;
@@ -206,15 +222,24 @@ export function rateLimitSnapshot(timeoutMs=12000,{force=false}={}){
   });
   return rateLimitCache.inFlight.finally(()=>{rateLimitCache.inFlight=null;});
 }
-export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},image=false,browserMode=null,writableDirs=[],model=null,reasoningEffort='low',timeoutMs=900000,codexBin=null}) {
+export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},image=false,browserMode=null,writableDirs=[],model=null,reasoningEffort='low',timeoutMs=900000,codexBin=null,role='creative'}) {
   const bin=codexBin||findCodex();if(!bin)throw new Error('请先打开 Codex 并登录。');
   fs.mkdirSync(dir,{recursive:true});
   const resultPath=path.join(dir,'response.txt');
   const runId=path.basename(dir),startedAt=new Date().toISOString();
+  const executionFile=path.join(dir,'execution.json');
+  const execution={schemaVersion:1,role,model:model||null,reasoningEffort,browserMode:browserMode||null,image:Boolean(image),runId,startedAt};
+  const saveExecution=patch=>{try{fs.writeFileSync(executionFile,JSON.stringify({...execution,...patch},null,2),{mode:0o600});}catch{}};
+  saveExecution({state:'running'});
   const args=['exec','--ephemeral','--skip-git-repo-check'];
-  if(browserMode==='chrome')args.push('--disable','image_generation');
+  if(browserMode==='chrome')args.push('--disable','image_generation','--approve-for-me');
   else args.push('--ignore-user-config','--disable','plugins','--disable','apps','--disable','multi_agent');
-  args.push('-c',`model_reasoning_effort="${reasoningEffort}"`,'-s',image?'workspace-write':'read-only','--json','-o',resultPath);
+  args.push('-c',`model_reasoning_effort="${reasoningEffort}"`);
+  // --approve-for-me is intentionally incompatible with the sandbox. Browser
+  // workers need the explicit non-interactive permission approval, while every
+  // other execution keeps the existing read-only/workspace-write sandbox.
+  if(browserMode!=='chrome')args.push('-s',image?'workspace-write':'read-only');
+  args.push('--json','-o',resultPath);
   if(model)args.push('-m',model);
   if(schema){const s=path.join(dir,'response.schema.json');fs.writeFileSync(s,JSON.stringify(schema));args.push('--output-schema',s);}
   for(const dir of writableDirs)args.push('--add-dir',dir);
@@ -234,6 +259,7 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
     const timer=setTimeout(()=>{timedOut=true;stop();},timeoutMs);
     const finish=(err,result,{responseText='',exitCode=null}={})=>{
       if(settled)return;settled=true;clearTimeout(timer);signal?.removeEventListener('abort',abort);log.end();
+      saveExecution({state:err?'failed':'completed',endedAt:new Date().toISOString(),exitCode,durationMs:Math.max(0,Date.now()-Date.parse(startedAt)),error:err?String(err.message||err).slice(0,500):null});
       const runEvidence=evidence(responseText,exitCode);
       if(err){Object.defineProperty(err,'generationEvidence',{value:runEvidence,enumerable:false});return reject(err);}
       if(result&&typeof result==='object'){

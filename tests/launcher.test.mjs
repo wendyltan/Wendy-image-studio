@@ -37,3 +37,24 @@ test('每次打开入口都会替换旧后台服务',async()=>{
     fs.rmSync(temp,{recursive:true,force:true});
   }
 });
+
+test('launcher reaches health when startup recovery sees a legacy usage record',async()=>{
+  const temp=fs.mkdtempSync(path.join(os.tmpdir(),'wendi-launcher-legacy-'));
+  const port=47000+(process.pid%1000),id='11111111-1111-4111-8111-111111111111',env={WENDI_PORT:String(port),WENDI_NO_OPEN:'1',WENDI_RUNTIME_DIR:path.join(temp,'runtime'),WENDI_DATA_DIR:path.join(temp,'data')};
+  const projectDir=path.join(env.WENDI_DATA_DIR,id),runDir=path.join(projectDir,'.制作记录','1780000000000-legacy-run');
+  fs.mkdirSync(runDir,{recursive:true});
+  fs.writeFileSync(path.join(projectDir,'project.json'),JSON.stringify({id,title:'启动恢复夹具',status:'draft',updatedAt:new Date().toISOString(),brief:{},metrics:{inputTokens:1,cachedInputTokens:0,outputTokens:2,reasoningOutputTokens:0,totalRuns:1},tasks:[],currentTask:null,pending:null,lastFailure:null}));
+  fs.writeFileSync(path.join(runDir,'events.jsonl'),JSON.stringify({type:'turn.completed',usage:{input_tokens:1,output_tokens:2}})+'\n');
+  let livePid=null;
+  try{
+    await runLauncher(env);
+    livePid=Number(fs.readFileSync(path.join(env.WENDI_RUNTIME_DIR,'server.pid'),'utf8'));
+    const response=await fetch(`http://127.0.0.1:${port}/api/health`);
+    assert.equal(response.status,200);
+    assert.equal((await response.json()).app,'wendi-studio');
+  }finally{
+    if(livePid){try{process.kill(livePid,'SIGTERM');}catch{ /* Process may already have exited. */ }}
+    await wait(150);
+    fs.rmSync(temp,{recursive:true,force:true});
+  }
+});

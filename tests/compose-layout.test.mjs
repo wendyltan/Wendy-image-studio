@@ -1,0 +1,94 @@
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {execFileSync} from 'node:child_process';
+import test from 'node:test';
+
+const temp=fs.mkdtempSync(path.join(os.tmpdir(),'wendi-compose-tests-'));
+process.env.WENDI_DATA_DIR=path.join(temp,'stories');
+const W=await import('../server/workflow.mjs');
+const B=await import('../server/bridge.mjs');
+const E=await import('../server/engine.mjs');
+
+function fixturePage(title='页标题像素回归'){
+  return {number:1,title,layout:'solo',panels:[{caption:'',captionKind:'narration'}]};
+}
+function sourceImage(){
+  const file=path.join(temp,'source.png');
+  const script='from PIL import Image; import sys; Image.new("RGB",(760,1000),(18,52,86)).save(sys.argv[1])';
+  requireChild('python',B.python(),['-c',script,file]);
+  return file;
+}
+function requireChild(label,command,args){
+  try{return execFileSync(command,args,{stdio:'pipe'});}catch(error){
+    throw new Error(`${label} fixture failed: ${error.stderr?.toString()||error.message}`);
+  }
+}
+async function compose(page,output,image){
+  const spec=path.join(temp,`${path.basename(output)}.json`);
+  W.jsonWrite(spec,{page,total:1,images:[image],output});
+  await B.pythonRun(['compose',spec]);
+}
+function pixel(file,x,y){
+  const script='from PIL import Image; import sys; im=Image.open(sys.argv[1]).convert("RGB"); print(*im.getpixel((int(sys.argv[2]),int(sys.argv[3]))),sep=",")';
+  return execFileSync(B.python(),['-c',script,file,String(x),String(y)],{encoding:'utf8'}).trim();
+}
+
+test('final page composition does not paint the plan page title over the first panel',async()=>{
+  const image=sourceImage(),output=path.join(temp,'no-title.png');
+  await compose(fixturePage(),output,image);
+  // The old renderer painted a cream title card at (38,38)-(…) on top of the
+  // first panel. A fixed-color source makes that historical pixel observable.
+  assert.equal(pixel(output,65,65),'18,52,86');
+});
+
+test('changing a plan page title does not change final page pixels',async()=>{
+  const image=sourceImage(),first=path.join(temp,'title-a.png'),second=path.join(temp,'title-b.png');
+  await compose(fixturePage('标题甲'),first,image);
+  await compose(fixturePage('标题乙'),second,image);
+  assert.equal(crypto.createHash('sha256').update(fs.readFileSync(first)).digest('hex'),crypto.createHash('sha256').update(fs.readFileSync(second)).digest('hex'));
+});
+
+test('composition keeps the 1080x1440 canvas, caption box, and footer page number',async()=>{
+  const image=sourceImage(),first=path.join(temp,'page-seven.png'),second=path.join(temp,'page-eight.png');
+  const page=fixturePage('方案标题不入成稿');page.number=7;page.panels[0].caption='文字框仍保留';
+  await compose(page,first,image);
+  page.number=8;await compose(page,second,image);
+  assert.deepEqual(JSON.parse(await B.pythonRun(['info',first])),{width:1080,height:1440,mode:'RGB',format:'PNG'});
+  assert.notEqual(pixel(first,50,1320),'18,52,86');
+  assert.notEqual(crypto.createHash('sha256').update(fs.readFileSync(first)).digest('hex'),crypto.createHash('sha256').update(fs.readFileSync(second)).digest('hex'));
+});
+
+test('old page records are stale while the new composition version is current',()=>{
+  const project={plan:{pages:[{number:1,panels:[{}]}]},panels:{'1-1':{file:'v1/source.png'}},artifacts:[
+    {id:'image:第1页-第1格',file:'v1/source.png',valid:true},
+    {id:'page:1',file:'v1/page.png',compositionVersion:E.COMPOSITION_VERSION,valid:true},
+  ]};
+  const oldPage={number:1,file:'v1/page.png',qa:{pass:true},dependsOn:['image:第1页-第1格']};
+  assert.equal(E.pageIsCurrent(project,oldPage),false);
+  const currentPage={...oldPage,compositionVersion:E.COMPOSITION_VERSION};
+  assert.equal(E.pageIsCurrent(project,currentPage),true);
+});
+
+test('accept refuses a legacy titled page and accepts a re-composed current page',async()=>{
+  const source=sourceImage(),pageFile=path.join(temp,'accepted-page.png');
+  await compose(fixturePage(),pageFile,source);
+  const project=E.createProject({idea:'排版版本验收回归',pageCount:1,allowXiaolin:false,tangyuan:'不出现'});
+  project.version=1;project.plan={pages:[{number:1,panels:[{}]}]};project.approved={version:1,hash:'plan-hash'};project.status='ready';project.storyQA={pass:true};
+  const projectPage=path.join(E.projectDir(project.id),'v1','候选成稿.png'),sourcePanel=path.join(E.projectDir(project.id),'v1','素材','source.png');
+  fs.mkdirSync(path.dirname(projectPage),{recursive:true});fs.mkdirSync(path.dirname(sourcePanel),{recursive:true});fs.copyFileSync(pageFile,projectPage);fs.copyFileSync(source,sourcePanel);fs.writeFileSync(path.join(E.projectDir(project.id),'v1','已确认分镜.md'),'fixture');
+  const pageRelative=path.relative(E.projectDir(project.id),projectPage),panelRelative=path.relative(E.projectDir(project.id),sourcePanel);
+  project.panels={'1-1':{file:panelRelative,qa:{pass:true}}};project.pages=[{number:1,file:pageRelative,qa:{pass:true},dependsOn:['image:第1页-第1格']}];project.artifacts=[
+    {id:'image:第1页-第1格',kind:'image',file:panelRelative,valid:true},
+    {id:'page:1',kind:'page',file:pageRelative,compositionVersion:E.COMPOSITION_VERSION,valid:true},
+    {id:'story:audit',kind:'story-audit',file:null,valid:true,dependsOn:['page:1']},
+  ];E.saveProject(project);
+  await assert.rejects(E.accept(project,W.CHECKS),/全篇制作和校对/);
+  assert(fs.existsSync(projectPage));
+  assert.equal(fs.existsSync(path.join(E.projectDir(project.id),'v1','成品','01.png')),false);
+  project.pages[0].compositionVersion=E.COMPOSITION_VERSION;
+  await E.accept(project,W.CHECKS);
+  assert.equal(project.accepted,true);assert(fs.existsSync(path.join(E.projectDir(project.id),'v1','成品','01.png')));
+});

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {test} from 'node:test';
-import {dispatchChatGptWebJob,readWebManifest} from '../server/chatgpt-web-provider.mjs';
+import {dispatchChatGptWebJob,resumeChatGptWebJob,readWebManifest,WEB_IMAGE_PROVIDER} from '../server/chatgpt-web-provider.mjs';
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'wendi-direct-worker-'));
 function setup(mode){
  const dir=fs.mkdtempSync(path.join(root,'run-')),bin=path.join(dir,'worker.mjs');
@@ -15,11 +15,18 @@ fs.writeFileSync(path.join(dir,'argv.json'),JSON.stringify(args));
 let input='';process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>{
  const req=JSON.parse(fs.readFileSync(path.join(dir,'worker-request.json'),'utf8'));
  const mode=${JSON.stringify(mode)};
- const base={provider:req.provider,transport:req.transport,browser:req.browser,focusPolicy:req.focusPolicy,requestId:req.requestId,accepted:true,acceptedAt:new Date().toISOString(),submitted:false};
+ const base={schemaVersion:2,provider:req.provider,transport:req.transport,browser:req.browser,focusPolicy:req.focusPolicy,requestId:req.requestId,runId:req.runId,projectId:req.projectId,projectVersion:req.projectVersion,taskId:req.taskId,target:req.target,accepted:true,acceptedAt:new Date().toISOString(),submitted:false};
  const write=m=>fs.writeFileSync(req.manifestFile,JSON.stringify(m));
  if(mode==='hang'){setInterval(()=>{},100);return;}
  if(mode==='empty')return;
+ if(mode==='usage-limit-once'){const marker=path.join(dir,'usage-limit-once');if(!fs.existsSync(marker)){fs.writeFileSync(marker,'1');console.log(JSON.stringify({type:'error',message:"You've hit your usage limit. Try again later."}));process.exitCode=1;return;}}
+ if(mode==='legacy-confirmed-unsent-once'){const marker=path.join(dir,'legacy-confirmed-unsent-once');if(!fs.existsSync(marker)){fs.writeFileSync(marker,'1');write({...base,state:'failed',submitted:true,submissionIntent:true,referenceCount:2,readyAt:new Date().toISOString(),submittedAt:new Date().toISOString(),conversationUrl:'https://chatgpt.com/c/fixture-conversation',errorCode:'FILE_UPLOAD_CHROME_UNAVAILABLE',error:'upload wait remained disabled; no user message appeared'});process.exitCode=1;return;}}
  if(mode==='focus-unavailable'){process.stderr.write('BROWSER_FOCUS_UNAVAILABLE: Chrome management capability is not advertised');process.exitCode=1;return;}
+ if(mode==='origin-permission-denied'){console.log(JSON.stringify({type:'item.completed',item:{type:'mcp_tool_call',server:'cua_repl',tool:'js',result:{content:[{type:'text',text:'The user declined permission for this action. Browser use cannot access https://chatgpt.com because the user denied permission for this request.'}]}}}));write({...base,state:'accepted'});process.stderr.write('The user declined permission for this action. Browser use cannot access https://chatgpt.com because the user denied permission for this request.');process.exitCode=1;return;}
+ if(mode==='origin-permission-denied-exit0'){write({...base,state:'failed',errorCode:'BROWSER_CHROME_UNAVAILABLE',error:'Chrome extension unavailable'});process.stderr.write('The user declined permission for this action. Browser use cannot access https://chatgpt.com because the user denied permission for this request.');return;}
+ if(mode==='origin-permission-denied-exit0-mismatch'){write({...base,state:'failed',projectId:'different-project',errorCode:'BROWSER_CHROME_UNAVAILABLE',error:'Chrome extension unavailable'});process.stderr.write('The user declined permission for this action. Browser use cannot access https://chatgpt.com because the user denied permission for this request.');return;}
+ if(mode==='structured-origin-permission-denied'){console.log(JSON.stringify({type:'item.completed',item:{type:'mcp_tool_call',server:'cua_repl',tool:'js',result:{content:[{type:'text',text:'The user declined permission for this action. Browser use cannot access https://chatgpt.com because the user denied permission for this request.'}]}}}));write({...base,state:'accepted'});process.exitCode=1;return;}
+ if(mode==='explicit-upload-with-permission-noise'){console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'permission denied browser security policy'}}));console.log(JSON.stringify({type:'item.completed',item:{type:'command_execution',command:'echo user declined permission',aggregated_output:'browser security policy denied'}}));write({...base,state:'failed',errorCode:'FILE_UPLOAD_CHROME_UNAVAILABLE',error:'FILE_UPLOAD_CHROME_UNAVAILABLE: attachment control did not open file chooser'});return;}
  if(mode==='failed'){write({...base,state:'failed',errorCode:'CHATGPT_LOGIN_REQUIRED',error:'请在专用 Chrome 页面登录 ChatGPT。'});return;}
  if(mode==='submitted'){write({...base,state:'submitted',submitted:true});process.exitCode=1;return;}
  fs.writeFileSync(req.outputFile,'mock image');
@@ -30,17 +37,81 @@ let input='';process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>{
 }
 test('direct execution starts once, retains identity, and records the Chrome focus boundary',async()=>{
  const args=setup('success'),result=await dispatchChatGptWebJob(args);assert.equal(result.manifest.state,'downloaded');
- assert.equal(result.manifest.transport,'direct-chrome');assert.equal(result.manifest.browser,'chrome');assert.equal(result.manifest.focusPolicy,'may-focus-at-create-without-public-focus-api');
+ assert.equal(result.manifest.transport,'direct-chrome');assert.equal(result.manifest.browser,'chrome');assert.equal(result.manifest.focusPolicy,'may-focus-at-create-without-public-focus-api');assert.equal(result.manifest.role,'browser-executor');assert.equal(result.manifest.executorReasoningEffort,'low');
+ const request=JSON.parse(fs.readFileSync(path.join(args.dir,'worker-request.json')));assert.equal(request.role,'browser-executor');assert.equal(request.executorReasoningEffort,'low');
  const argv=JSON.parse(fs.readFileSync(path.join(args.dir,'argv.json')));assert.equal(argv[0],'exec');assert(!argv.includes('queue'));assert(!argv.includes('--ignore-user-config'));assert(!argv.includes('browser_use_external'));assert(argv.includes('image_generation'));
  const env=JSON.parse(fs.readFileSync(path.join(args.dir,'env.json')));assert.equal(env.backend,'chrome');assert.equal(env.surfaces,'browser');
- const instruction=fs.readFileSync(path.join(args.dir,'prompt.txt'),'utf8');assert.match(instruction,/createBrowserTab\("chrome","https:\/\/chatgpt\.com",\{sessionName:"🎨 温蒂生图"\}\)/);assert.doesNotMatch(instruction,/createBrowserTab\("chrome"[^\n]*visible:false/);assert.doesNotMatch(instruction,/visible\s*:/);assert.doesNotMatch(instruction,/createBrowserTab\("iab"/);assert.match(instruction,/BROWSER_FOCUS_UNAVAILABLE/);assert.match(instruction,/没有窗口\/标签页 active 或 focused 更新接口/);assert.match(instruction,/可能短暂取得焦点/);assert.match(instruction,/无法严格保证零焦点切换/);assert.match(instruction,/只绑定返回的自有 tab/);assert.doesNotMatch(instruction,/不创建标签页、不上传、不发送/);assert.match(instruction,/tab\.close\(\)/);assert.doesNotMatch(instruction,/cua\.getTab\(/);
+ const instruction=fs.readFileSync(path.join(args.dir,'prompt.txt'),'utf8');assert.match(instruction,/createBrowserTab\("chrome",undefined,\{sessionName:"🎨 温蒂生图"\}\)/);assert.match(instruction,/tab\.goto\("https:\/\/chatgpt\.com"\)/);assert.match(instruction,/try\s*\{/);assert.match(instruction,/finally\s*\{/);assert.doesNotMatch(instruction,/createBrowserTab\("chrome"[^\n]*visible:false/);assert.doesNotMatch(instruction,/visible\s*:/);assert.doesNotMatch(instruction,/createBrowserTab\("iab"/);assert.match(instruction,/BROWSER_FOCUS_UNAVAILABLE/);assert.match(instruction,/没有窗口\/标签页 active 或 focused 更新接口/);assert.match(instruction,/可能短暂取得焦点/);assert.match(instruction,/无法严格保证零焦点切换/);assert.match(instruction,/只绑定返回的自有 tab/);assert.doesNotMatch(instruction,/不创建标签页、不上传、不发送/);assert.equal((instruction.match(/await tab\.close\(\)/g)||[]).length,1);assert.doesNotMatch(instruction,/第?7\.?.*tab\.close\(\)/);assert.doesNotMatch(instruction,/第?8\.?.*tab\.close\(\)/);assert.doesNotMatch(instruction,/cua\.getTab\(/);assert.match(instruction,/禁止读取仓库、memory、历史任务/);assert.match(instruction,/禁止自行调研、搜索或改写提示词/);assert.match(instruction,/立即按下列步骤执行/);assert.match(instruction,/读取当前 DOM/);assert.match(instruction,/添加照片和文件/);assert.match(instruction,/从电脑上传/);assert.match(instruction,/filechooser/);assert.match(instruction,/短时有界/);assert.match(instruction,/chooser\.isMultiple\(\)/);assert.match(instruction,/逐项/);assert.match(instruction,/悬挂 chooser promise/);
+ assert.match(instruction,/worker\.referenceFiles/);
+ assert.match(instruction,/submissionIntent=true[^\n]*submitted=false/);
+ assert.match(instruction,/新的用户消息|输入框已清空/);
+ assert.doesNotMatch(instruction,/先原子记录 state=submitted、submitted=true[^\n]*再一次性提交/);
+ const execution=JSON.parse(fs.readFileSync(path.join(args.dir,'execution.json')));assert.equal(execution.role,'browser-executor');assert.equal(execution.reasoningEffort,'low');assert.equal(execution.state,'completed');
  await assert.rejects(dispatchChatGptWebJob(args),/请求已存在/);
+});
+test('existing conversation navigation timeout is checked before pre-submission failure',async()=>{
+ const args={...setup('success'),timeoutMs:5000};
+ await dispatchChatGptWebJob({...args,conversationUrl:'https://chatgpt.com/c/existing-conversation'});
+ const instruction=fs.readFileSync(path.join(args.dir,'prompt.txt'),'utf8');
+ assert.match(instruction,/既有会话.*导航.*超时/);
+ assert.match(instruction,/同一.*owned tab.*URL.*DOM.*composer|同一.*自有 tab.*URL.*DOM.*composer/);
+ assert.match(instruction,/Page\.navigate|navigation timeout/i);
+ assert.match(instruction,/CHATGPT_NAVIGATION_FAILED/);
+ assert.match(instruction,/这个 tab.*完成聊天模式/);
+ assert.match(instruction,/新聊天继续/);
+ assert.match(instruction,/不得再次 createBrowserTab|不得盲目再次调用 createBrowserTab/);
+});
+test('a proven pre-acceptance usage limit resumes the same request and archives the first attempt',async()=>{
+ const args=setup('usage-limit-once'),identity={provider:WEB_IMAGE_PROVIDER,projectId:'11111111-1111-4111-8111-111111111111',projectVersion:3,taskId:'22222222-2222-4222-8222-222222222222',target:'第5页-第1格'};
+ fs.writeFileSync(path.join(args.dir,'request.json'),JSON.stringify(identity));
+ await assert.rejects(dispatchChatGptWebJob({...args,model:'gpt-5.6-luna'}),/usage limit/i);
+ const before=readWebManifest(path.join(args.dir,'web-generation.json')),requestId=before.requestId;
+ assert.equal(before.state,'queued');assert.equal(before.accepted,false);assert.equal(before.submitted,false);assert.equal(before.referenceCount,0);
+ const result=await resumeChatGptWebJob({...args,model:'gpt-5.6-luna',expected:{...identity,requestId}});
+ assert.equal(result.manifest.requestId,requestId);assert.equal(result.manifest.state,'downloaded');assert.equal(result.manifest.submitted,true);assert.equal(result.manifest.resumeCount,1);
+ const archives=fs.readdirSync(path.join(args.dir,'attempts'));assert.deepEqual(archives,['001-preaccept-usage-limit']);
+ const attempt=JSON.parse(fs.readFileSync(path.join(args.dir,'attempts',archives[0],'attempt.json'),'utf8'));assert.equal(attempt.requestId,requestId);assert.equal(attempt.accepted,false);assert.equal(attempt.submitted,false);assert.match(attempt.error,/usage limit/i);
+});
+test('a separately audited legacy false submission resumes the same request only once',async()=>{
+ const args=setup('legacy-confirmed-unsent-once'),identity={provider:WEB_IMAGE_PROVIDER,projectId:'33333333-3333-4333-8333-333333333333',projectVersion:4,taskId:'44444444-4444-4444-8444-444444444444',target:'第5页-第1格'};
+ fs.writeFileSync(path.join(args.dir,'request.json'),JSON.stringify(identity));
+ await assert.rejects(dispatchChatGptWebJob({...args,model:'gpt-5.6-luna'}));
+ const before=readWebManifest(path.join(args.dir,'web-generation.json')),requestId=before.requestId;
+ assert.equal(before.submitted,true);assert.equal(before.submissionIntent,true);
+ fs.writeFileSync(path.join(args.dir,'web-audit.json'),JSON.stringify({schemaVersion:1,...identity,requestId,result:'confirmed_unsent',conversationUrl:before.conversationUrl,auditedAt:new Date(Date.now()+1000).toISOString(),evidence:{composerContainsPrompt:true,newUserMessagePresent:false,generatedResultPresent:false,sendButtonPresent:true,executorOwnedTabClosed:true}}));
+ const instruction=fs.readFileSync(path.join(args.dir,'prompt.txt'),'utf8');
+ const result=await resumeChatGptWebJob({...args,model:'gpt-5.6-luna',instruction,expected:{...identity,requestId}});
+ assert.equal(result.manifest.requestId,requestId);assert.equal(result.manifest.state,'downloaded');assert.equal(result.manifest.submitted,true);assert.equal(result.manifest.resumeCount,1);
+ assert.equal(result.manifest.lastConfirmedUnsentAttempt,'attempts/001-confirmed-unsent');
+ const attempt=JSON.parse(fs.readFileSync(path.join(args.dir,'attempts','001-confirmed-unsent','attempt.json'),'utf8'));assert.equal(attempt.requestId,requestId);assert.equal(attempt.auditResult,'confirmed_unsent');
 });
 test('wrong request download is never acknowledged as success',async()=>{await assert.rejects(dispatchChatGptWebJob(setup('wrong')),/没有取得已核实原图/);});
 test('login failure is returned immediately as its actual error',async()=>{await assert.rejects(dispatchChatGptWebJob(setup('failed')),e=>e.code==='CHATGPT_LOGIN_REQUIRED'&&e.webManifest.submitted===false);});
 test('a reported Chrome focus error stops before upload or submission',async()=>{
  const args=setup('focus-unavailable');await assert.rejects(dispatchChatGptWebJob(args),error=>error.code==='BROWSER_FOCUS_UNAVAILABLE'&&error.webManifest?.submitted===false);
  const manifest=readWebManifest(path.join(args.dir,'web-generation.json'));assert.equal(manifest.state,'failed');assert.equal(manifest.errorCode,'BROWSER_FOCUS_UNAVAILABLE');assert.equal(manifest.submitted,false);assert.equal(manifest.referenceCount,0);assert.equal(fs.existsSync(args.outputFile),false);
+});
+test('origin permission denial is distinct, explicit, and safely pre-submission',async()=>{
+ const args=setup('origin-permission-denied');await assert.rejects(dispatchChatGptWebJob(args),error=>error.code==='BROWSER_ORIGIN_PERMISSION_DENIED'&&error.webManifest?.accepted===true&&error.webManifest?.submitted===false);
+ const manifest=readWebManifest(path.join(args.dir,'web-generation.json'));assert.equal(manifest.state,'failed');assert.equal(manifest.errorCode,'BROWSER_ORIGIN_PERMISSION_DENIED');assert.equal(manifest.accepted,true);assert.equal(manifest.submitted,false);assert.equal(manifest.submissionIntent,false);assert.equal(manifest.preSubmissionFailure,true);assert.equal(manifest.referenceCount,0);assert.match(manifest.error,/Chrome 已连接，但 chatgpt\.com 访问权限被拒绝/);assert.match(manifest.error,/选择“允许”/);assert.equal(fs.existsSync(args.outputFile),false);
+});
+test('explicit Chrome error code is not overwritten by unstructured permission text',async()=>{
+ const args=setup('origin-permission-denied-exit0');await assert.rejects(dispatchChatGptWebJob(args),error=>error.code==='BROWSER_CHROME_UNAVAILABLE'&&error.webManifest?.submitted===false);
+ const manifest=readWebManifest(path.join(args.dir,'web-generation.json'));assert.equal(manifest.state,'failed');assert.equal(manifest.errorCode,'BROWSER_CHROME_UNAVAILABLE');assert.equal(manifest.submitted,false);assert.equal(manifest.submissionIntent,false);assert.equal(manifest.preSubmissionFailure,true);assert.equal(manifest.referenceCount,0);assert.equal(fs.existsSync(args.outputFile),false);
+ const calls=JSON.parse(fs.readFileSync(path.join(args.dir,'argv.json')));assert.equal(calls.filter(item=>item==='exec').length,1);await assert.rejects(dispatchChatGptWebJob(args),/请求已存在/);
+});
+test('structured terminal browser origin denial is still classified',async()=>{
+ const args=setup('structured-origin-permission-denied');await assert.rejects(dispatchChatGptWebJob(args),error=>error.code==='BROWSER_ORIGIN_PERMISSION_DENIED'&&error.webManifest?.submitted===false);
+ const manifest=readWebManifest(path.join(args.dir,'web-generation.json'));assert.equal(manifest.errorCode,'BROWSER_ORIGIN_PERMISSION_DENIED');assert.equal(manifest.submitted,false);assert.equal(manifest.referenceCount,0);
+});
+test('explicit file-upload failure wins over permission words in prompt and commands',async()=>{
+ const args=setup('explicit-upload-with-permission-noise');await assert.rejects(dispatchChatGptWebJob(args),error=>error.code==='FILE_UPLOAD_CHROME_UNAVAILABLE'&&error.webManifest?.submitted===false);
+ const manifest=readWebManifest(path.join(args.dir,'web-generation.json'));assert.equal(manifest.errorCode,'FILE_UPLOAD_CHROME_UNAVAILABLE');assert.equal(manifest.submitted,false);assert.equal(manifest.referenceCount,0);assert.match(manifest.error,/附件入口未能打开|FILE_UPLOAD_CHROME_UNAVAILABLE/);
+});
+test('exit-zero origin evidence from another project cannot be normalized',async()=>{
+ const args=setup('origin-permission-denied-exit0-mismatch');fs.writeFileSync(path.join(args.dir,'request.json'),JSON.stringify({provider:'chatgpt-web-iab',projectId:'current-project',projectVersion:3,taskId:'current-task',target:'第1页-第1格'}));
+ await assert.rejects(dispatchChatGptWebJob(args),error=>error.code==='BROWSER_CHROME_UNAVAILABLE'&&error.webManifest?.errorCode==='BROWSER_CHROME_UNAVAILABLE');
+ const manifest=readWebManifest(path.join(args.dir,'web-generation.json'));assert.equal(manifest.errorCode,'BROWSER_CHROME_UNAVAILABLE');assert.equal(manifest.submitted,false);assert.equal(manifest.preSubmissionFailure,undefined);assert.equal(fs.existsSync(args.outputFile),false);
 });
 test('process exit without a result is unknown, not queued forever',async()=>{await assert.rejects(dispatchChatGptWebJob(setup('empty')),/执行已结束/);});
 test('submission survives executor failure without a new execution',async()=>{const args=setup('submitted');await assert.rejects(dispatchChatGptWebJob(args));assert.equal(readWebManifest(path.join(args.dir,'web-generation.json')).submitted,true);await assert.rejects(dispatchChatGptWebJob(args),/请求已存在/);});

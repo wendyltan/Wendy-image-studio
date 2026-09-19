@@ -62,15 +62,6 @@ def caption_box(canvas,panel,lines,box,index,anchor=None):
     ld.rounded_rectangle((bx,by,bx+bw,by+bh),radius=16,fill=fill,outline=(105,82,66,155),width=1)
     for i,line in enumerate(lines):ld.text((bx+18,by+9+i*line_h),line,font=f,fill=(65,49,40,255))
     canvas.paste(layer,(0,0),layer)
-def page_title(canvas,page):
-    title=str(page.get('title','')).strip()
-    if not title:return
-    x,y,w,_=boxes(page)[0];f=medium(25)
-    while f.getlength(title)>min(520,w-72) and f.size>19:f=medium(f.size-1)
-    bw=math.ceil(f.getlength(title))+34;bh=48
-    layer=Image.new('RGBA',canvas.size,(0,0,0,0));d=ImageDraw.Draw(layer,'RGBA')
-    d.rounded_rectangle((x+16,y+16,x+16+bw,y+16+bh),radius=15,fill=(250,247,239,236),outline=(105,82,66,145),width=1)
-    d.text((x+33,y+24),title,font=f,fill=(65,49,40,255));canvas.paste(layer,(0,0),layer)
 def compose(spec):
     page=spec['page'];hints=spec.get('layoutHints') or {};anchors=hints.get('captionAnchors') or [];canvas=Image.new('RGB',(1080,1440),BG);d=ImageDraw.Draw(canvas)
     for index,(p,g,file) in enumerate(zip(page['panels'],geometry(page,hints),spec['images'])):
@@ -80,7 +71,6 @@ def compose(spec):
         if discrepancy>.18:raise ValueError(f'原图比例不适合分镜（目标 {w}:{h}），请重新生成合适比例的画面。')
         x,y,bw,bh=g['box'];rounded_paste(canvas,im,(x,y,bw,bh));d.rounded_rectangle((x,y,x+bw,y+bh),radius=23,outline=BORDER,width=2)
         caption_box(canvas,p,g['lines'],(x,y,bw,bh),index,anchors[index] if index<len(anchors) else None)
-    page_title(canvas,page)
     d=ImageDraw.Draw(canvas);num=f"{page['number']:02d}";nf=font(16)
     d.rounded_rectangle((1004,1389,1058,1427),radius=16,fill='#f7f1e7',outline='#a58c78',width=1)
     d.text((1031-nf.getlength(num)/2,1397),num,font=nf,fill='#765f50')

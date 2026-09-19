@@ -28,7 +28,7 @@ fs.appendFileSync(process.env.WENDI_TEST_CALLS,'call\\n');
 const out=a[a.indexOf('-o')+1];let text='';
 if(a.includes('--output-schema')){const s=JSON.parse(fs.readFileSync(a[a.indexOf('--output-schema')+1]));const marker=process.env.WENDI_TEST_FAIL_SAMPLE_ONCE,crash=process.env.WENDI_TEST_CRASH_QA_ONCE,panelCrash=process.env.WENDI_TEST_CRASH_PANEL_QA_ONCE,panelFailure=process.env.WENDI_TEST_FAIL_PANEL_QA_ONCE;const shouldCrash=!s.properties.pages&&((crash&&p.includes('脸部近景')&&!fs.existsSync(crash))||(panelCrash&&p.includes('用户已确认本次修改')&&!fs.existsSync(panelCrash)));if(shouldCrash){fs.writeFileSync(crash||panelCrash,'1');process.exit(42);}else if(!s.properties.pages&&panelFailure&&p.includes('待检原始分镜')&&!fs.existsSync(panelFailure)){fs.writeFileSync(panelFailure,'1');text=JSON.stringify({pass:false,summary:'TEST FORMAL PANEL FAILURE',issues:['手部需要调整'],issueDetails:[{id:'formal-hand',category:'anatomy',severity:'review',location:'右手',description:'手部需要调整',repairAction:'review'}],repairPrompt:'请人工确认是否采用当前图'});}else if(!s.properties.pages&&marker&&p.includes('脸部近景')&&!fs.existsSync(marker)){fs.writeFileSync(marker,'1');text=JSON.stringify({pass:false,summary:'TEST FIXTURE REPAIR',issues:['前臂与提带关系不自然'],issueDetails:[{id:'arm-strap',category:'anatomy',severity:'blocking',location:'左前臂',description:'前臂与提带关系不自然',repairAction:'regenerate'}],repairPrompt:'修正前臂与提带关系'});}else text=JSON.stringify(s.properties.pages?JSON.parse(fs.readFileSync(process.env.WENDI_TEST_PLAN_FILE)): {pass:true,summary:'TEST FIXTURE CHECK ONLY',issues:[],issueDetails:[],repairPrompt:''});}
 else {const noImage=process.env.WENDI_TEST_NO_IMAGE_ONCE;if(noImage&&!fs.existsSync(noImage)){fs.writeFileSync(noImage,'1');text=process.env.WENDI_TEST_NO_IMAGE_TEXT||'未能生成：ChatGPT 网页连接错误，目标路径尚不存在。';}else{const m=p.match(/复制到准确路径 ([^\\n]+?\\.png)/)||p.match(/再输出 ([^\\n]+?\\.png)/);if(!m)process.exit(2);const file=m[1];fs.mkdirSync(path.dirname(file),{recursive:true});const r=p.match(/目标原始画面宽高比 (\\d+):(\\d+)/);const w=r?+r[1]:750,h=r?+r[2]:1000;execFileSync('/Library/Frameworks/Python.framework/Versions/3.10/bin/python3',['-c','from PIL import Image,ImageDraw; import sys; im=Image.new("RGB",(int(sys.argv[2]),int(sys.argv[3])),"#d8dfce"); ImageDraw.Draw(im).text((20,20),"PIPELINE TEST ONLY",fill="black"); im.save(sys.argv[1])',file,String(w),String(h)]);text=file;const pause=process.env.WENDI_TEST_PAUSE_AFTER_IMAGE;if(pause&&!fs.existsSync(pause)){fs.writeFileSync(pause,'1');await new Promise(resolve=>setTimeout(resolve,10000));}}}
-fs.writeFileSync(out,text);console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text}}));console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:100,cached_input_tokens:40,output_tokens:10,reasoning_output_tokens:2}}));
+const usageLimit=process.env.WENDI_TEST_USAGE_LIMIT_ONCE;if(usageLimit&&!fs.existsSync(usageLimit)){fs.writeFileSync(usageLimit,'1');console.log(JSON.stringify({type:'error',message:text}));process.exit(1);}if(usageLimit&&fs.existsSync(usageLimit)&&fs.existsSync(path.join(process.cwd(),'worker-request.json'))){const req=JSON.parse(fs.readFileSync(path.join(process.cwd(),'worker-request.json'),'utf8'));const manifest=JSON.parse(fs.readFileSync(req.manifestFile,'utf8'));fs.writeFileSync(req.manifestFile,JSON.stringify({...manifest,state:'downloaded',accepted:true,acceptedAt:new Date().toISOString(),readyAt:new Date().toISOString(),submitted:true,submittedAt:new Date().toISOString(),referenceCount:req.referenceFiles.length,downloadedAt:new Date().toISOString(),artifactPath:req.outputFile,conversationUrl:'https://chatgpt.com/c/test-resume'}));}fs.writeFileSync(out,text);console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text}}));if(/Browser use cannot access\\s+https:\\/\\/chatgpt\\.com|FILE_UPLOAD_CHROME_UNAVAILABLE|UPLOAD_ERROR/i.test(text))console.log(JSON.stringify({type:'item.completed',item:{type:'mcp_tool_call',server:'cua_repl',tool:'js',result:{content:[{type:'text',text}]}}}));console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:100,cached_input_tokens:40,output_tokens:10,reasoning_output_tokens:2}}));
 `,{mode:0o700});
 async function done(id){for(let i=0;i<200;i++){if(!E.active.has(id))return E.readProject(id);await new Promise(r=>setTimeout(r,50));}throw new Error('test job timed out');}
 function callCount(){return fs.existsSync(process.env.WENDI_TEST_CALLS)?fs.readFileSync(process.env.WENDI_TEST_CALLS,'utf8').split('\n').filter(Boolean).length:0;}
@@ -45,6 +45,7 @@ test('input validation and restricted references',()=>{
   assert.equal(B.extractRateLimits({rateLimits:{rateLimitsByLimitId:{codex:{primary:{usedPercent:64}}}}}).primary.usedPercent,64);
   const normalized=B.normalizeRateLimits({rateLimits:{primary:{usedPercent:64,windowDurationMins:300,resetsAt:123},secondary:{usedPercent:42,windowDurationMins:10080}}});
   assert.deepEqual(normalized.primary,{usedPercent:64,remainingPercent:36,windowDurationMins:300,resetsAt:123});assert.equal(normalized.secondary.remainingPercent,58);
+  const modelBuckets=B.normalizeRateLimits({rateLimitsByLimitId:{codex:{limitId:'codex',primary:{usedPercent:4,windowDurationMins:300}},base_model_inference:{limitId:'base_model_inference',normalModelSlug:'gpt-5.6-luna',primary:{usedPercent:65,windowDurationMins:10080}}}});assert.equal(modelBuckets.byLimitId.base_model_inference.normalModelSlug,'gpt-5.6-luna');assert.equal(modelBuckets.byLimitId.base_model_inference.primary.remainingPercent,35);
   assert.equal(B.normalizeRateLimits({rateLimits:{primary:{usedPercent:'unknown'}}}).primary,null);
   assert.throws(()=>E.createProject({...brief,pageCount:99}),/1—12/);
   assert.throws(()=>E.createProject({...brief,idea:'x'}));
@@ -66,7 +67,10 @@ test('web image provider records the dedicated Chrome focus boundary',()=>{
   assert.match(text,/web-generation\.json/);
   assert.match(text,/禁止调用 image_gen/);
   assert.match(text,/禁止接管用户已有标签页/);
-  assert.match(text,/createBrowserTab\("chrome","https:\/\/chatgpt\.com",\{sessionName:"🎨 温蒂生图"\}\)/);
+  assert.match(text,/createBrowserTab\("chrome",undefined,\{sessionName:"🎨 温蒂生图"\}\)/);
+  assert.match(text,/tab\.goto\("https:\/\/chatgpt\.com"\)/);
+  assert.match(text,/try\s*\{/);
+  assert.match(text,/finally\s*\{/);
   assert.doesNotMatch(text,/createBrowserTab\("chrome"[^\n]*visible:false/);
   assert.doesNotMatch(text,/visible\s*:/);
   assert.doesNotMatch(text,/createBrowserTab\("iab"/);
@@ -80,25 +84,32 @@ test('web image provider records the dedicated Chrome focus boundary',()=>{
   assert.doesNotMatch(text,/cua\.getTab\(/);
   assert.match(text,/tab\.close\(\)/);
   assert.match(text,/waitForEvent\("filechooser"\)/);
-  assert.match(text,/chooser\.setFiles\(\)/);
+  assert.match(text,/chooser\.setFiles\(worker\.referenceFiles\)/);
   assert.match(text,/禁止调用 cua\.getApp/);
   assert.match(text,/不得重复提交/);
   assert.match(text,/authorization 是该操作发生后的持久证据/);
   assert.match(text,/当前同一个回合完成/);
 });
 test('web executor availability reports the direct Chrome focus boundary',()=>{
-  const worker=G.webWorkerStatus();assert.equal(worker.transport,'direct-chrome');assert.equal(worker.browser,'chrome');assert.equal(worker.state,'focus-unavailable');assert.equal(worker.focusRestoration,'unsupported');assert.equal(worker.focusSafe,false);assert.equal(worker.ready,true);assert.match(worker.message,/可能短暂取得焦点/);assert.match(worker.message,/无法严格保证零焦点切换/);
+  const worker=G.webWorkerStatus();assert.equal(worker.transport,'direct-chrome');assert.equal(worker.browser,'chrome');assert.equal(worker.state,'available');assert.equal(worker.focusRestoration,'unsupported');assert.equal(worker.focusSafe,false);assert.equal(worker.ready,true);assert.equal(worker.message,'执行器可用，站点访问权限将在任务中验证。');
 });
-test('UI names concrete Chrome focus failures and keeps old IAB records historical',()=>{
+test('UI keeps real image errors and removes the non-blocking Chrome focus notice',()=>{
   const text=fs.readFileSync(path.join(W.APP,'app/page.tsx'),'utf8');
   assert.match(text,/IAB_UNAVAILABLE/);
   assert.match(text,/BROWSER_FOCUS_UNAVAILABLE/);
+  assert.match(text,/BROWSER_ORIGIN_PERMISSION_DENIED/);
+  assert.match(text,/FILE_UPLOAD_CHROME_UNAVAILABLE/);
+  assert.match(text,/附件上传没有完成/);
+  assert.match(text,/上一版原图仍保留/);
+  assert.match(text,/chatgpt\.com 访问权限被拒绝/);
   assert.match(text,/公开 CUA 没有 Chrome/);
   assert.match(text,/无法零焦点切换/);
   assert.match(text,/当前生产链路使用专用 Chrome 标签页/);
   assert.match(text,/imageReady=\{data\?\.connection\.imageWorker\?\.ready !== false\}/);
   assert.doesNotMatch(text,/imageWorker\?\.focusSafe !== false/);
-  assert.match(text,/专用 Chrome 标签页会短暂取得焦点/);
+  assert.match(text,/网页生图当前不可用/);
+  assert.match(text,/!imageReady && project\.status === 'review'/);
+  assert.doesNotMatch(text,/专用 Chrome 标签页会短暂取得焦点/);
   assert.doesNotMatch(text,/隐藏网页浏览器能力不可用；没有上传附件或发送消息。请恢复 Codex 内嵌浏览器 IAB/);
 });
 test('missing hidden IAB is definite pre-submission no-output evidence',()=>{
@@ -110,8 +121,14 @@ test('browser generation enables Chrome while disabling image API',async()=>{
   const argvFile=path.join(temp,'browser-argv.json'),dir=path.join(temp,'browser-run');process.env.WENDI_TEST_ARGV=argvFile;
   const output=path.join(temp,'browser-result.png');await B.runCodex({dir,image:true,browserMode:'chrome',prompt:`复制到准确路径 ${output}`});delete process.env.WENDI_TEST_ARGV;
   const argv=JSON.parse(fs.readFileSync(argvFile,'utf8'));
-  assert(argv.includes('image_generation'));assert(!argv.includes('browser_use_external'));
+  assert(argv.includes('image_generation'));assert(argv.includes('--approve-for-me'));assert(!argv.includes('-s'));assert(!argv.includes('--sandbox'));assert(!argv.includes('browser_use_external'));
   assert.equal(argv.includes('--ignore-user-config'),false);
+});
+test('non-browser execution keeps its existing sandbox mode',async()=>{
+  const argvFile=path.join(temp,'non-browser-argv.json'),dir=path.join(temp,'non-browser-run');process.env.WENDI_TEST_ARGV=argvFile;
+  await B.runCodex({dir,schema:{type:'object',properties:{},additionalProperties:false},prompt:'只返回测试 JSON，不调用工具。'});delete process.env.WENDI_TEST_ARGV;
+  const argv=JSON.parse(fs.readFileSync(argvFile,'utf8')),sandboxIndex=argv.indexOf('-s');
+  assert(sandboxIndex>=0);assert.equal(argv[sandboxIndex+1],'read-only');assert.equal(argv.includes('--approve-for-me'),false);
 });
 test('manual title is retained when a later plan is saved',async()=>{
   let named=E.createProject(brief);named.title='用户指定名称';named.titleLocked=true;E.saveProject(named);
@@ -165,7 +182,7 @@ test('planning, frozen approval, samples gate and production',async()=>{
   const imageRuns=fs.readdirSync(path.join(E.projectDir(p.id),'.制作记录')).filter(name=>name.includes('样张-'));
   assert(imageRuns.length>=2);const manifestDir=path.join(E.projectDir(p.id),'.制作记录',imageRuns[0]);
   const request=JSON.parse(fs.readFileSync(path.join(manifestDir,'request.json'),'utf8')),result=JSON.parse(fs.readFileSync(path.join(manifestDir,'result.json'),'utf8'));
-  assert.equal(request.schemaVersion,2);assert.equal(request.provider,G.WEB_IMAGE_PROVIDER);assert.equal(request.target.startsWith('样张-'),true);assert.equal(result.provider,G.WEB_IMAGE_PROVIDER);assert.equal(result.outcome,'artifact_saved');assert.equal(typeof result.integrity.sha256,'string');
+  assert.equal(request.schemaVersion,2);assert.equal(request.provider,G.WEB_IMAGE_PROVIDER);assert.equal(request.target.startsWith('样张-'),true);assert.equal(request.role,'browser-executor');assert.equal(request.executorReasoningEffort,'low');assert.equal(request.creativeReasoningEffort,p.brief.reasoningEffort);assert.equal(result.provider,G.WEB_IMAGE_PROVIDER);assert.equal(result.outcome,'artifact_saved');assert.equal(typeof result.integrity.sha256,'string');assert(p.metrics.byRole.some(item=>item.role==='browser-executor'&&item.reasoningEffort==='low'));
   assert.throws(()=>E.generatePages(p),/样张/);
   E.approveSamples(p,p.approved.hash);p=await done(p.id);assert.equal(p.status,'ready');assert.equal(p.pages.length,1);assert.equal(p.accepted,false);
   const file=W.inside(E.projectDir(p.id),p.pages[0].file);const info=JSON.parse(await B.pythonRun(['info',file]));assert.deepEqual(info,{width:1080,height:1440,mode:'RGB',format:'PNG'});
@@ -197,6 +214,19 @@ test('panel revision invalidates stale page before QA resume and export',async()
   E.reviewImage(revised,'1-1');revised=await done(revised.id);assert.equal(revised.panels['1-1'].qa.pass,true);
   E.resume(revised);revised=await done(revised.id);assert.equal(revised.status,'ready');assert.equal(revised.pages.length,1);assert.notEqual(revised.pages[0].file,oldPage.file);
   await E.accept(revised,W.CHECKS);const exported=W.inside(E.projectDir(revised.id),revised.pages[0].finalFile);assert.deepEqual(fs.readFileSync(exported),fs.readFileSync(W.inside(E.projectDir(revised.id),revised.pages[0].file)));
+});
+test('panel revisions keep an independent delta and return to the selected stable base after a failed draft',async()=>{
+  const revised=E.createProject({...brief,idea:'独立修订差异与稳定基图测试',workflowPreset:'quick'});revised.plan=structuredClone(plan);revised.version=1;revised.approved={version:1,hash:W.digest(revised.plan)};revised.samplesApproved=true;revised.status='ready';
+  const root=E.projectDir(revised.id),file=path.join(root,'v1','素材','稳定基图.png'),relative=path.relative(root,file),at=new Date().toISOString(),integrity={sha256:sha256File(W.inside(W.REFS,W.FACE[0])),sizeBytes:fs.statSync(W.inside(W.REFS,W.FACE[0])).size};fs.mkdirSync(path.dirname(file),{recursive:true});fs.copyFileSync(W.inside(W.REFS,W.FACE[0]),file);integrity.sha256=sha256File(file);integrity.sizeBytes=fs.statSync(file).size;
+  revised.panels={'1-1':{key:'第1页第1格',file:relative,prompt:'LEGACY_PROMPT_WITH_OLD_DELTA',basePrompt:'BASE_PROMPT',refs:panel.references,integrity,qa:{pass:true,status:'passed',summary:'fixture',issues:[],issueDetails:[],repairPrompt:''},at}};revised.artifacts=[{id:'image:第1页-第1格',kind:'image',file:relative,dependsOn:[],valid:true,at,integrity}];E.saveProject(revised);
+  const marker=path.join(temp,'revision-qa-failure-once');process.env.WENDI_TEST_FAIL_PANEL_QA_ONCE=marker;E.reviseImage(revised,'1-1','把书放下并看向窗外。');const first=await done(revised.id);delete process.env.WENDI_TEST_FAIL_PANEL_QA_ONCE;
+  assert.equal(first.status,'attention');assert.equal(first.panels['1-1'].qa.pass,false);assert.equal(first.panels['1-1'].revisionBase.selectedBy,'current-image');
+  const records=path.join(root,'.制作记录'),firstDir=fs.readdirSync(records).map(name=>path.join(records,name)).find(dir=>dir.includes('1-1-局部修订'));assert(firstDir);const firstRequest=JSON.parse(fs.readFileSync(path.join(firstDir,'request.json'),'utf8')),firstPrompt=fs.readFileSync(path.join(firstDir,'prompt.txt'),'utf8');assert.equal(firstRequest.executorReasoningEffort,'low');assert.equal(firstRequest.referenceFiles.length,4);assert.match(firstPrompt,/BASE_PROMPT/);assert.match(firstPrompt,/把书放下并看向窗外/);assert.doesNotMatch(firstPrompt,/LEGACY_PROMPT_WITH_OLD_DELTA/);
+  E.reviseImage(first,'1-1','把咖啡杯移到右侧。');const second=await done(first.id);assert.equal(second.status,'paused');assert.equal(second.panels['1-1'].revisionBase.selectedBy,'previous-stable-base');
+  const revisionDirs=fs.readdirSync(records).filter(name=>name.includes('1-1-局部修订')).map(name=>path.join(records,name)).sort(),secondDir=revisionDirs.at(-1),secondRequest=JSON.parse(fs.readFileSync(path.join(secondDir,'request.json'),'utf8')),secondPrompt=fs.readFileSync(path.join(secondDir,'prompt.txt'),'utf8');assert.equal(revisionDirs.length,2);assert.equal(secondRequest.editTarget.sha256,firstRequest.editTarget.sha256);assert.equal(secondRequest.preparation.reusedCount,4);assert.match(secondPrompt,/BASE_PROMPT/);assert.match(secondPrompt,/把咖啡杯移到右侧/);assert.doesNotMatch(secondPrompt,/把书放下并看向窗外/);assert.doesNotMatch(secondPrompt,/LEGACY_PROMPT_WITH_OLD_DELTA/);
+});
+test('layout-only panel edits stop at the local recompose path',()=>{
+  const fixture=panelDecisionFixture('文字问题不消耗生图额度'),before=fixture.project.tasks.length;assert.throws(()=>E.reviseImage(fixture.project,'1-1','把旁白文字框移到右上角，重新排版。'),error=>error.code==='LOCAL_LAYOUT_REQUIRED');assert.equal(fixture.project.tasks.length,before);assert.equal(E.active.has(fixture.project.id),false);
 });
 test('inner-screen postprocess becomes the page dependency without repeating on resume',async()=>{
   const screenPlan=structuredClone(plan);screenPlan.pages[0].panels[0].screenText='现在播放';screenPlan.pages[0].panels[0].screenDirection='输入框可发送';
@@ -247,6 +277,56 @@ test('unknown quota values stay unknown and stale reads keep their observation t
   assert.equal(B.normalizeRateLimits({rateLimits:{primary:{usedPercent:10,windowDurationMins:300}}}).secondary,null);assert.equal(B.normalizeRateLimits({rateLimits:{secondary:{usedPercent:10,windowDurationMins:10080}}}).primary,null);assert.equal(B.normalizeRateLimits({rateLimits:{secondary:{usedPercent:10,windowDurationMins:10080}}}).secondary.remainingPercent,90);assert.equal(B.normalizeRateLimits({rateLimits:{short:{usedPercent:10,windowDurationMins:300},long:{usedPercent:20,windowDurationMins:10080}}}).secondary.usedPercent,20);assert.equal(B.normalizeRateLimits({rateLimits:{}}).primary,null);assert.equal(B.normalizeRateLimits({rateLimits:{}}).secondary,null);
   const previousPlan=process.env.WENDI_TEST_PLAN_FILE;delete process.env.WENDI_TEST_PLAN_FILE;process.env.WENDI_TEST_RATE_LIMIT_RESPONSE=JSON.stringify({primary:{usedPercent:20,windowDurationMins:300,resetsAt:123}});delete process.env.WENDI_TEST_RATE_LIMIT_FAIL;const fresh=await B.rateLimitSnapshot(1000,{force:true});assert.equal(fresh.status,'fresh');const observedAt=fresh.observedAt;assert.equal(fresh.secondary,null);process.env.WENDI_TEST_RATE_LIMIT_FAIL='1';const stale=await B.rateLimitSnapshot(1000,{force:true});assert.equal(stale.status,'stale');assert.equal(stale.observedAt,observedAt);assert.equal(stale.primary.remainingPercent,80);if(previousPlan)process.env.WENDI_TEST_PLAN_FILE=previousPlan;else delete process.env.WENDI_TEST_PLAN_FILE;delete process.env.WENDI_TEST_RATE_LIMIT_RESPONSE;delete process.env.WENDI_TEST_RATE_LIMIT_FAIL;
 });
+test('paid image quota guard refreshes cached-high limits before any upload',async()=>{
+  const previousPlan=process.env.WENDI_TEST_PLAN_FILE,previousResponse=process.env.WENDI_TEST_RATE_LIMIT_RESPONSE,previousFailure=process.env.WENDI_TEST_RATE_LIMIT_FAIL;
+  try{
+    delete process.env.WENDI_TEST_PLAN_FILE;delete process.env.WENDI_TEST_RATE_LIMIT_FAIL;
+    process.env.WENDI_TEST_RATE_LIMIT_RESPONSE=JSON.stringify({primary:{usedPercent:20,windowDurationMins:300,resetsAt:123},byLimitId:{codex:{limitId:'codex',primary:{usedPercent:20,windowDurationMins:300,resetsAt:123}},base_model_inference:{limitId:'base_model_inference',normalModelSlug:'fixture-model',primary:{usedPercent:20,windowDurationMins:10080,resetsAt:456}}}});
+    const cachedHigh=await B.rateLimitSnapshot(1000,{force:true});assert.equal(cachedHigh.status,'fresh');assert.equal(cachedHigh.primary.remainingPercent,80);
+    process.env.WENDI_TEST_RATE_LIMIT_RESPONSE=JSON.stringify({primary:{usedPercent:90,windowDurationMins:300,resetsAt:456},byLimitId:{codex:{limitId:'codex',primary:{usedPercent:90,windowDurationMins:300,resetsAt:456}},base_model_inference:{limitId:'base_model_inference',normalModelSlug:'fixture-model',primary:{usedPercent:20,windowDurationMins:10080,resetsAt:789}}}});
+    let guarded=E.createProject({...brief,idea:'额度强制刷新停止上传测试',model:'fixture-model'});guarded.plan=structuredClone(plan);guarded.version=1;guarded.approved={version:1,hash:W.digest(guarded.plan)};guarded.samplesApproved=true;guarded.status='ready';E.saveProject(guarded);
+    const beforeCalls=callCount();E.generatePages(guarded);guarded=await done(guarded.id);
+    assert.equal(guarded.status,'paused');assert.match(guarded.message,/5小时创作额度只剩 10%/);assert.equal(guarded.lastQuotaCheck.status,'fresh');assert.notEqual(guarded.lastQuotaCheck.observedAt,cachedHigh.observedAt);
+    assert.equal(guarded.tasks.filter(task=>task.kind==='image').length,0);assert.equal(callCount(),beforeCalls);
+    const records=path.join(E.projectDir(guarded.id),'.制作记录');const sent=fs.existsSync(records)&&fs.readdirSync(records).some(name=>fs.existsSync(path.join(records,name,'worker-request.json')));assert.equal(sent,false);
+  }finally{
+    if(previousPlan===undefined)delete process.env.WENDI_TEST_PLAN_FILE;else process.env.WENDI_TEST_PLAN_FILE=previousPlan;
+    if(previousResponse===undefined)delete process.env.WENDI_TEST_RATE_LIMIT_RESPONSE;else process.env.WENDI_TEST_RATE_LIMIT_RESPONSE=previousResponse;
+    if(previousFailure===undefined)delete process.env.WENDI_TEST_RATE_LIMIT_FAIL;else process.env.WENDI_TEST_RATE_LIMIT_FAIL=previousFailure;
+  }
+});
+test('paid image quota guard fails closed when forced refresh is stale',async()=>{
+  const previousPlan=process.env.WENDI_TEST_PLAN_FILE,previousResponse=process.env.WENDI_TEST_RATE_LIMIT_RESPONSE,previousFailure=process.env.WENDI_TEST_RATE_LIMIT_FAIL;
+  try{
+    delete process.env.WENDI_TEST_PLAN_FILE;delete process.env.WENDI_TEST_RATE_LIMIT_FAIL;
+    process.env.WENDI_TEST_RATE_LIMIT_RESPONSE=JSON.stringify({primary:{usedPercent:20,windowDurationMins:300,resetsAt:123},byLimitId:{codex:{limitId:'codex',primary:{usedPercent:20,windowDurationMins:300,resetsAt:123}},base_model_inference:{limitId:'base_model_inference',normalModelSlug:'fixture-model',primary:{usedPercent:20,windowDurationMins:10080,resetsAt:456}}}});
+    const cachedHigh=await B.rateLimitSnapshot(1000,{force:true});assert.equal(cachedHigh.status,'fresh');assert.equal(cachedHigh.primary.remainingPercent,80);
+    process.env.WENDI_TEST_RATE_LIMIT_FAIL='1';
+    let guarded=E.createProject({...brief,idea:'额度旧缓存失败关闭测试'});guarded.plan=structuredClone(plan);guarded.version=1;guarded.approved={version:1,hash:W.digest(guarded.plan)};guarded.samplesApproved=true;guarded.status='ready';E.saveProject(guarded);
+    const beforeCalls=callCount();E.generatePages(guarded);guarded=await done(guarded.id);
+    assert.equal(guarded.status,'paused');assert.match(guarded.message,/无法确认最新的 5 小时创作额度/);assert.equal(guarded.lastQuotaCheck.status,'stale');assert.equal(guarded.lastQuotaCheck.remaining,80);assert.equal(guarded.lastQuotaCheck.observedAt,cachedHigh.observedAt);
+    assert.equal(guarded.tasks.filter(task=>task.kind==='image').length,0);assert.equal(callCount(),beforeCalls);
+    const records=path.join(E.projectDir(guarded.id),'.制作记录'),prepared=fs.existsSync(records)&&fs.readdirSync(records).some(name=>fs.existsSync(path.join(records,name,'上传素材.json'))),sent=fs.existsSync(records)&&fs.readdirSync(records).some(name=>fs.existsSync(path.join(records,name,'worker-request.json')));assert.equal(prepared,false);assert.equal(sent,false);
+  }finally{
+    if(previousPlan===undefined)delete process.env.WENDI_TEST_PLAN_FILE;else process.env.WENDI_TEST_PLAN_FILE=previousPlan;
+    if(previousResponse===undefined)delete process.env.WENDI_TEST_RATE_LIMIT_RESPONSE;else process.env.WENDI_TEST_RATE_LIMIT_RESPONSE=previousResponse;
+    if(previousFailure===undefined)delete process.env.WENDI_TEST_RATE_LIMIT_FAIL;else process.env.WENDI_TEST_RATE_LIMIT_FAIL=previousFailure;
+  }
+});
+test('image quota guard uses only the fresh five-hour Codex window',async()=>{
+  const previousPlan=process.env.WENDI_TEST_PLAN_FILE,previousResponse=process.env.WENDI_TEST_RATE_LIMIT_RESPONSE,previousFailure=process.env.WENDI_TEST_RATE_LIMIT_FAIL;
+  try{
+    delete process.env.WENDI_TEST_PLAN_FILE;delete process.env.WENDI_TEST_RATE_LIMIT_FAIL;
+    process.env.WENDI_TEST_RATE_LIMIT_RESPONSE=JSON.stringify({primary:{usedPercent:20,windowDurationMins:300,resetsAt:123},byLimitId:{codex:{limitId:'codex',primary:{usedPercent:20,windowDurationMins:300,resetsAt:123}},base_model_inference:{limitId:'base_model_inference',normalModelSlug:'gpt-5.6-luna',primary:{usedPercent:95,windowDurationMins:10080,resetsAt:789}}}});
+    let low=E.createProject({...brief,idea:'模型额度仅作信息展示',model:'gpt-5.6-luna'});low.plan=structuredClone(plan);low.version=1;low.approved={version:1,hash:W.digest(low.plan)};low.samplesApproved=true;low.status='ready';E.saveProject(low);const before=callCount();E.generatePages(low);low=await done(low.id);assert.equal(low.lastQuotaCheck.remaining,80);assert.equal(low.lastQuotaCheck.executorLimitId,'base_model_inference');assert.equal(low.lastQuotaCheck.executorRemaining,5);assert(low.tasks.some(task=>task.kind==='image'));assert(callCount()>before);assert.doesNotMatch(String(low.message||''),/生图执行器.*额度/);
+    process.env.WENDI_TEST_RATE_LIMIT_RESPONSE=JSON.stringify({primary:{usedPercent:20,windowDurationMins:300,resetsAt:123},byLimitId:{codex:{limitId:'codex',primary:{usedPercent:20,windowDurationMins:300,resetsAt:123}}}});
+    let unknown=E.createProject({...brief,idea:'模型额度桶缺失不阻断生图',model:'gpt-5.6-luna'});unknown.plan=structuredClone(plan);unknown.version=1;unknown.approved={version:1,hash:W.digest(unknown.plan)};unknown.samplesApproved=true;unknown.status='ready';E.saveProject(unknown);const beforeUnknown=callCount();E.generatePages(unknown);unknown=await done(unknown.id);assert.equal(unknown.lastQuotaCheck.remaining,80);assert.equal(unknown.lastQuotaCheck.executorLimitId,null);assert.equal(unknown.lastQuotaCheck.executorRemaining,null);assert(unknown.tasks.some(task=>task.kind==='image'));assert(callCount()>beforeUnknown);assert.doesNotMatch(String(unknown.message||''),/无法确认生图执行器/);
+  }finally{
+    if(previousPlan===undefined)delete process.env.WENDI_TEST_PLAN_FILE;else process.env.WENDI_TEST_PLAN_FILE=previousPlan;
+    if(previousResponse===undefined)delete process.env.WENDI_TEST_RATE_LIMIT_RESPONSE;else process.env.WENDI_TEST_RATE_LIMIT_RESPONSE=previousResponse;
+    if(previousFailure===undefined)delete process.env.WENDI_TEST_RATE_LIMIT_FAIL;else process.env.WENDI_TEST_RATE_LIMIT_FAIL=previousFailure;
+  }
+});
 test('legacy version snapshots restore missing prompt capsule and references before retrying',async()=>{
   let legacy=E.createProject(brief);E.planProject(legacy);legacy=await done(legacy.id);E.approvePlan(legacy,W.digest(legacy.plan));legacy=await done(legacy.id);
   const version=path.join(E.projectDir(legacy.id),'v1');const reference=path.join(version,'参考',W.FACE[0]);
@@ -273,6 +353,27 @@ test('a network interruption remains recoverable instead of becoming definite no
   assert.equal(failed.status,'attention');assert.equal(failed.lastFailure,null);assert.equal(failed.pending.key,'样张-1');
   assert.match(failed.message,/检查已有原图|保存结果前中断/);assert.equal(failed.currentTask.status,'unknown_result');assert.equal(failed.currentTask.providerInvocations,1);
 });
+test('a usage limit before accepted keeps the same queued request resumable',async()=>{
+  const previousPlan=process.env.WENDI_TEST_PLAN_FILE,previousResponse=process.env.WENDI_TEST_RATE_LIMIT_RESPONSE,previousNoImage=process.env.WENDI_TEST_NO_IMAGE_ONCE,previousNoImageText=process.env.WENDI_TEST_NO_IMAGE_TEXT,previousUsage=process.env.WENDI_TEST_USAGE_LIMIT_ONCE;
+  const noImage=path.join(temp,'usage-limit-no-image'),usage=path.join(temp,'usage-limit-execution');
+  try{
+    delete process.env.WENDI_TEST_PLAN_FILE;delete process.env.WENDI_TEST_RATE_LIMIT_FAIL;process.env.WENDI_TEST_RATE_LIMIT_RESPONSE=JSON.stringify({rateLimits:{primary:{usedPercent:20,windowDurationMins:300,resetsAt:123},secondary:{usedPercent:1,windowDurationMins:10080,resetsAt:456}},rateLimitsByLimitId:{codex:{limitId:'codex',primary:{usedPercent:20,windowDurationMins:300,resetsAt:123},secondary:{usedPercent:1,windowDurationMins:10080,resetsAt:456}},base_model_inference:{limitId:'base_model_inference',normalModelSlug:'gpt-5.6-luna',primary:{usedPercent:65,windowDurationMins:10080,resetsAt:789}}}});
+    process.env.WENDI_TEST_NO_IMAGE_ONCE=noImage;process.env.WENDI_TEST_NO_IMAGE_TEXT="You've hit your usage limit before image submission.";process.env.WENDI_TEST_USAGE_LIMIT_ONCE=usage;
+    let limited=E.createProject({...brief,idea:'接受前额度限制续接测试',model:'gpt-5.6-luna'});limited.plan=structuredClone(plan);limited.version=1;limited.approved={version:1,hash:W.digest(limited.plan)};limited.samplesApproved=true;limited.status='ready';E.saveProject(limited);E.generatePages(limited);limited=await done(limited.id);
+    const pending=limited.pending,dir=pending?.dir,manifest=pending&&JSON.parse(fs.readFileSync(path.join(dir,'web-generation.json'),'utf8')),worker=JSON.parse(fs.readFileSync(path.join(dir,'worker-request.json'),'utf8')),request=JSON.parse(fs.readFileSync(path.join(dir,'request.json'),'utf8'));
+    assert.equal(limited.status,'paused');assert.equal(limited.currentTask.status,'paused');assert.notEqual(limited.currentTask.status,'unknown_result');assert.equal(limited.currentTask.errorCode,'USAGE_LIMIT_BEFORE_START');assert.equal(limited.currentTask.providerInvocations,0);assert.equal(limited.currentTask.projectId,limited.id);assert.equal(limited.currentTask.projectVersion,1);assert.equal(pending.taskId,limited.currentTask.id);assert.equal(pending.projectId,limited.id);assert.equal(pending.projectVersion,1);assert.equal(pending.requestId,worker.requestId);assert.equal(worker.requestId,manifest.requestId);assert.equal(request.taskId,pending.taskId);assert.equal(request.projectId,limited.id);assert.equal(request.projectVersion,1);assert.equal(manifest.state,'queued');assert.equal(manifest.accepted,false);assert.equal(manifest.submitted,false);assert.equal(manifest.referenceCount,0);assert.match(limited.message,/不会创建第二个图片请求/);
+    const originalRequestId=manifest.requestId,originalTaskId=limited.currentTask.id,imageTaskCount=limited.tasks.filter(task=>task.kind==='image').length,runDir=limited.pending.dir;
+    E.resume(limited);limited=await done(limited.id);
+    const resumed=JSON.parse(fs.readFileSync(path.join(runDir,'web-generation.json'),'utf8'));
+    assert.equal(limited.pending,null);assert.equal(limited.currentTask.id,originalTaskId);assert.equal(limited.tasks.filter(task=>task.kind==='image').length,imageTaskCount);assert.equal(resumed.requestId,originalRequestId);assert.equal(resumed.state,'downloaded');assert.equal(resumed.accepted,true);assert.equal(resumed.submitted,true);assert.equal(resumed.resumeCount,1);assert(limited.panels['1-1']);assert.equal(limited.currentTask.status,'completed');assert.equal(limited.currentTask.webState,'downloaded');assert.equal(fs.readdirSync(path.join(runDir,'attempts')).length,1);
+  }finally{
+    if(previousPlan===undefined)delete process.env.WENDI_TEST_PLAN_FILE;else process.env.WENDI_TEST_PLAN_FILE=previousPlan;
+    if(previousResponse===undefined)delete process.env.WENDI_TEST_RATE_LIMIT_RESPONSE;else process.env.WENDI_TEST_RATE_LIMIT_RESPONSE=previousResponse;
+    if(previousNoImage===undefined)delete process.env.WENDI_TEST_NO_IMAGE_ONCE;else process.env.WENDI_TEST_NO_IMAGE_ONCE=previousNoImage;
+    if(previousNoImageText===undefined)delete process.env.WENDI_TEST_NO_IMAGE_TEXT;else process.env.WENDI_TEST_NO_IMAGE_TEXT=previousNoImageText;
+    if(previousUsage===undefined)delete process.env.WENDI_TEST_USAGE_LIMIT_ONCE;else process.env.WENDI_TEST_USAGE_LIMIT_ONCE=previousUsage;
+  }
+});
 test('only non-connection no-image evidence becomes retryable',async()=>{
   const text='本次请求未产出任何图片。',marker=path.join(temp,'pure-no-output');process.env.WENDI_TEST_NO_IMAGE_ONCE=marker;process.env.WENDI_TEST_NO_IMAGE_TEXT=text;
   let failed=E.createProject(brief);E.planProject(failed);failed=await done(failed.id);E.approvePlan(failed,W.digest(failed.plan));failed=await done(failed.id);
@@ -293,10 +394,36 @@ test('an unavailable Chrome focus capability stops before any provider submissio
   assert.equal(failed.pending,null);assert.equal(failed.lastFailure.kind,'browser-unavailable');assert.equal(failed.lastFailure.attempts,0);assert.equal(failed.currentTask.providerInvocations,0);assert.equal(failed.currentTask.status,'failed_no_output');assert.match(failed.message,/公开 Chrome 焦点恢复能力|未提交图片请求/);
   delete process.env.WENDI_TEST_NO_IMAGE_ONCE;delete process.env.WENDI_TEST_NO_IMAGE_TEXT;
 });
+test('origin permission denial is a confirmed pre-submission failure with a safe retry boundary',async()=>{
+  const marker=path.join(temp,'chrome-origin-permission-denied');process.env.WENDI_TEST_NO_IMAGE_ONCE=marker;process.env.WENDI_TEST_NO_IMAGE_TEXT='The user declined permission for this action. Browser use cannot access https://chatgpt.com because the user denied permission for this request.';
+  let failed=E.createProject({...brief,idea:'Chrome 站点访问权限拒绝测试'});E.planProject(failed);failed=await done(failed.id);E.approvePlan(failed,W.digest(failed.plan));failed=await done(failed.id);
+  assert.equal(failed.pending,null);assert.equal(failed.lastFailure.kind,'browser-origin-permission-denied');assert.equal(failed.lastFailure.attempts,0);assert.equal(failed.currentTask.providerInvocations,0);assert.equal(failed.currentTask.status,'failed_no_output');assert.match(failed.message,/Chrome 已连接，但 chatgpt\.com 访问权限被拒绝/);assert.match(failed.message,/选择“允许”/);assert.equal(E.imageRetryState(failed).certainty,'confirmed_missing');
+  delete process.env.WENDI_TEST_NO_IMAGE_ONCE;delete process.env.WENDI_TEST_NO_IMAGE_TEXT;
+});
+test('file chooser failure is a distinct confirmed pre-submission kind',async()=>{
+  const marker=path.join(temp,'chrome-upload-unavailable');process.env.WENDI_TEST_NO_IMAGE_ONCE=marker;process.env.WENDI_TEST_NO_IMAGE_TEXT='FILE_UPLOAD_CHROME_UNAVAILABLE: attachment control did not open a browser file chooser; user declined permission text is only prompt noise';
+  let failed=E.createProject({...brief,idea:'Chrome 附件选择器不可用测试'});E.planProject(failed);failed=await done(failed.id);E.approvePlan(failed,W.digest(failed.plan));failed=await done(failed.id);
+  assert.equal(failed.pending,null);assert.equal(failed.lastFailure.kind,'browser-upload-unavailable');assert.equal(failed.lastFailure.attempts,0);assert.equal(failed.currentTask.providerInvocations,0);assert.equal(failed.currentTask.status,'failed_no_output');assert.match(failed.message,/附件入口未能打开浏览器文件选择器/);assert.match(failed.message,/未上传附件或发送消息/);assert.equal(E.imageRetryState(failed).certainty,'confirmed_missing');
+  delete process.env.WENDI_TEST_NO_IMAGE_ONCE;delete process.env.WENDI_TEST_NO_IMAGE_TEXT;
+});
+test('restart migrates only an identity-matched legacy browser permission failure',()=>{
+  const make=(idea,match)=>{
+    const project=E.createProject({...brief,idea}),task={id:crypto.randomUUID(),kind:'image',target:'样张-1',projectId:project.id,projectVersion:project.version,status:'failed_no_output',errorCode:'browser-unavailable',providerInvocations:0,startedAt:new Date().toISOString(),completedAt:new Date().toISOString()};
+    const dir=path.join(E.projectDir(project.id),'.制作记录','legacy-origin-permission'),requestId=crypto.randomUUID(),runId=path.basename(dir),outputFile=path.join(E.projectDir(project.id),'v0','素材','样张-1.png');fs.mkdirSync(dir,{recursive:true});
+    fs.writeFileSync(path.join(dir,'request.json'),JSON.stringify({schemaVersion:2,provider:G.WEB_IMAGE_PROVIDER,taskId:task.id,projectId:project.id,projectVersion:project.version,target:task.target,expectedOutput:path.relative(E.projectDir(project.id),outputFile)}));
+    fs.writeFileSync(path.join(dir,'worker-request.json'),JSON.stringify({schemaVersion:2,provider:G.WEB_IMAGE_PROVIDER,requestId,runId,projectId:project.id,projectVersion:project.version,taskId:task.id,target:task.target,outputFile,manifestFile:path.join(dir,'web-generation.json')}));
+    fs.writeFileSync(path.join(dir,'execution.json'),JSON.stringify({schemaVersion:1,runId,state:'completed'}));
+    fs.writeFileSync(path.join(dir,'web-generation.json'),JSON.stringify({schemaVersion:2,provider:G.WEB_IMAGE_PROVIDER,state:'failed',accepted:true,requestId,runId,projectId:project.id,projectVersion:project.version,taskId:task.id,target:task.target,submitted:false,referenceCount:0,errorCode:match?'BROWSER_ORIGIN_PERMISSION_DENIED':'BROWSER_CHROME_UNAVAILABLE',error:match?'Chrome 已连接，但 chatgpt.com 访问权限被拒绝':'Chrome extension unavailable'}));
+    const browserResult=match?{type:'item.completed',item:{type:'mcp_tool_call',server:'cua_repl',tool:'js',result:{content:[{type:'text',text:'The user declined permission for this action. Browser use cannot access https://chatgpt.com because the user denied permission for this request.'}]}}}:{type:'item.completed',item:{type:'mcp_tool_call',server:'cua_repl',tool:'js',result:{content:[{type:'text',text:'BROWSER_CHROME_UNAVAILABLE'}]}}};fs.writeFileSync(path.join(dir,'events.jsonl'),JSON.stringify(browserResult)+'\n');
+    project.tasks=[task];project.currentTask=task;project.lastFailure={kind:'browser-unavailable',definiteNoOutput:true,key:task.target,attempts:0,taskId:task.id,at:task.completedAt};project.status='attention';E.saveProject(project);return project;
+  };
+  let migrated=make('重启迁移站点权限拒绝',true),untouched=make('重启不误迁移扩展失败',false);const beforeCalls=callCount();E.recover();migrated=E.readProject(migrated.id);untouched=E.readProject(untouched.id);
+  assert.ok(!migrated.pending);assert.equal(migrated.currentTask.errorCode,'browser-origin-permission-denied');assert.equal(migrated.tasks[0].errorCode,'browser-origin-permission-denied');assert.equal(migrated.lastFailure.kind,'browser-origin-permission-denied');assert.equal(migrated.lastFailure.attempts,0);assert.match(migrated.message,/Chrome 已连接，但 chatgpt\.com 访问权限被拒绝/);assert.equal(untouched.currentTask.errorCode,'browser-unavailable');assert.equal(untouched.lastFailure.kind,'browser-unavailable');assert.equal(callCount(),beforeCalls);
+});
 test('manual retry keeps the direct Chrome path when focus restoration is unavailable',async()=>{
   let project=E.createProject({...brief,idea:'手动重试允许已知焦点边界'});project.plan=structuredClone(plan);project.version=1;project.approved={version:1,hash:W.digest(project.plan)};project.samplesApproved=true;project.status='attention';project.currentTask={id:'focus-retry-task',kind:'image',target:'第1页-第1格',status:'failed_no_output',errorCode:'browser-unavailable',providerInvocations:0};project.lastFailure={kind:'browser-unavailable',definiteNoOutput:true,key:'第1页-第1格',attempts:0,taskId:'focus-retry-task',at:new Date().toISOString()};E.saveProject(project);
   E.retryMissingImage(project,'第1页-第1格');project=await done(project.id);
-  assert.ok(!project.pending);assert.equal(project.currentTask.providerInvocations,1);assert.ok(project.panels['1-1']);assert.match(G.webWorkerStatus().message,/可能短暂取得焦点/);
+  assert.ok(!project.pending);assert.equal(project.currentTask.providerInvocations,1);assert.ok(project.panels['1-1']);assert.match(G.webWorkerStatus().message,/站点访问权限将在任务中验证/);
 });
 test('a durable pre-submission web failure is safely retryable after restart',()=>{
   let failed=E.createProject({...brief,idea:'网页提交前失败恢复测试'});const dir=path.join(E.projectDir(failed.id),'.制作记录','pre-submit');
@@ -316,6 +443,17 @@ test('legacy network failures migrate to unknown results instead of confirmed no
   E.recover();legacy=E.readProject(legacy.id);
   assert.equal(legacy.currentTask.status,'unknown_result');assert.equal(legacy.lastFailure,null);assert.equal(E.retryableImageFailure(legacy),null);assert.equal(E.imageRetryState(legacy).certainty,'unknown_result');
 });
+test('legacy usage records with null or non-object request metadata remain readable during startup recovery',()=>{
+  const legacy=E.createProject({...brief,idea:'缺少执行元数据的旧记录读取测试'}),records=path.join(E.projectDir(legacy.id),'.制作记录');
+  for(const [suffix,metadata] of [['null',null],['scalar',42]]){
+    const dir=path.join(records,`178000000000${suffix==='null'?'0':'1'}-legacy-${suffix}`);fs.mkdirSync(dir,{recursive:true});
+    fs.writeFileSync(path.join(dir,'events.jsonl'),JSON.stringify({type:'turn.completed',usage:{input_tokens:1,output_tokens:2}})+'\n');
+    fs.writeFileSync(path.join(dir,'request.json'),JSON.stringify(metadata));
+  }
+  legacy.metrics={inputTokens:2,cachedInputTokens:0,outputTokens:4,reasoningOutputTokens:0,totalRuns:2};E.saveProject(legacy);
+  assert.doesNotThrow(()=>E.recover());
+  const restored=E.readProject(legacy.id),creative=restored.metrics.byRole.find(item=>item.role==='creative');assert(creative);assert.equal(creative.runs,2);
+});
 test('a legacy network lastFailure also remains an unknown result',()=>{
   let legacy=E.createProject({...brief,idea:'旧网络记录迁移测试'});legacy.status='paused';legacy.message='旧额度提示';legacy.lastFailure={kind:'network',definiteNoOutput:true,key:'第1页-第1格',attempts:1,at:new Date().toISOString()};legacy.currentTask={id:'legacy-network-record',kind:'image',target:'第1页-第1格',status:'failed_no_output',errorCode:'network',providerInvocations:1,completedAt:new Date().toISOString()};E.saveProject(legacy);
   E.recover();legacy=E.readProject(legacy.id);
@@ -332,7 +470,23 @@ test('an explicitly approved unknown pending image is archived before one retry'
 test('retrying a failed panel stops after that one panel',async()=>{
   let single=E.createProject({...brief,idea:'只重试一个分镜的流程'});const duo=structuredClone(plan);duo.pages[0].layout='duo';duo.pages[0].panels=[structuredClone(panel),structuredClone(panel)];single.plan=duo;single.version=1;single.approved={version:1,hash:W.digest(duo)};single.samplesApproved=true;single.status='attention';single.lastFailure={kind:'no-output',definiteNoOutput:true,key:'第1页-第1格',attempts:1,at:new Date().toISOString()};E.saveProject(single);
   E.retryMissingImage(single,'第1页-第1格');single=await done(single.id);
-  assert.deepEqual(Object.keys(single.panels),['1-1']);assert.equal(single.pages.length,0);assert.equal(single.status,'paused');assert.equal(single.tasks.filter(task=>task.kind==='image').length,1);assert.match(single.message,/不会继续生成其他分镜/);
+  assert.deepEqual(Object.keys(single.panels),['1-1']);assert.equal(single.pages.length,0);assert.equal(single.status,'paused');assert.equal(single.tasks.filter(task=>task.kind==='image').length,1);assert.equal(single.panels['1-1'].qa.pass,true);assert.equal(single.panels['1-1'].qa.status,'qa_pass');assert.match(single.message,/不会继续生成其他分镜/);
+});
+test('deferred file checks are not visual QA passes',()=>{
+  const fixture=panelDecisionFixture('区分延迟文件检查与真实质检');fixture.project.panels['1-1'].qa={pass:true,status:'deferred',summary:'仅文件检查',issues:[],repairPrompt:''};E.saveProject(fixture.project);
+  const restored=E.readProject(fixture.project.id);assert.equal(restored.panels['1-1'].qa.pass,null);assert.equal(restored.panels['1-1'].qa.status,'deferred');assert.equal(restored.panels['1-1'].qa.summary,'仅文件检查');
+});
+test('manual panel rejection is local, identity-checked, and idempotent',()=>{
+  const fixture=panelDecisionFixture('人工打回不触发生图');const project=fixture.project,artifactId=fixture.artifactId,oldPage={number:1,file:fixture.relative,qa:{pass:true,status:'qa_pass',issues:[],issueDetails:[],repairPrompt:''},at:fixture.at,dependsOn:[artifactId]};project.panels['1-1'].qa={pass:true,status:'deferred',summary:'仅文件检查',issues:[],repairPrompt:''};project.pages=[oldPage];project.artifacts.push({id:'page:1',kind:'page',file:fixture.relative,dependsOn:[artifactId],valid:true,at:fixture.at},{id:'story:audit',kind:'story-audit',file:null,dependsOn:['page:1'],valid:true,at:fixture.at},{id:'export:bundle',kind:'export',file:'v1/温蒂漫画成品.zip',dependsOn:['story:audit'],valid:true,at:fixture.at});project.status='paused';E.saveProject(project);
+  const expectedRevision=project.revision,issue='意式机萃取头、手柄与出液口/液流位置关系不正确',repairPrompt='只修正萃取头、portafilter 手柄卡口、双出液嘴与液流起点的功能连接，其他内容保持不变。',body={panelKey:'1-1',expectedRevision,artifactId,contentHash:W.digest({artifactId,file:fixture.relative,at:fixture.at}),issue,repairPrompt,idempotencyKey:`manual:${project.id}:1-1`},beforeBytes=fs.readFileSync(fixture.file),beforeCalls=callCount();
+  E.rejectPanel(project,body);assert.equal(project.panels['1-1'].qa.pass,false);assert.equal(project.panels['1-1'].qa.status,'needs_review');assert.deepEqual(project.panels['1-1'].qa.issues,[issue]);assert.equal(project.panels['1-1'].qa.repairPrompt,repairPrompt);assert.equal(project.panelDecision.state,'required');assert.equal(project.panelDecision.panelKey,'1-1');assert.equal(project.manualPanelReview.userIssue,issue);assert.equal(project.pages.length,0);assert.equal(project.artifacts.find(item=>item.id==='page:1').valid,false);assert.equal(project.artifacts.find(item=>item.id==='story:audit').valid,false);assert.equal(project.artifacts.find(item=>item.id==='export:bundle').valid,false);assert.deepEqual(fs.readFileSync(fixture.file),beforeBytes);assert.equal(callCount(),beforeCalls);
+  const revisionAfter=project.revision,commandCount=project.panelReviewCommands.length;E.rejectPanel(project,body);assert.equal(project.revision,revisionAfter);assert.equal(project.panelReviewCommands.length,commandCount);assert.equal(project.panels['1-1'].qa.pass,false);
+  assert.throws(()=>E.rejectPanel(project,{...body,idempotencyKey:`manual:${project.id}:stale`,expectedRevision:expectedRevision}),/作品已更新|当前版本/);
+});
+test('QA prompt calls out impossible espresso connections without flagging style differences',async()=>{
+  const coffeePlan=structuredClone(plan);coffeePlan.pages[0].panels[0].references=['08-咖啡与器具参考/05-萃取出液.png'];coffeePlan.pages[0].panels[0].objects='意式咖啡机、portafilter 手柄、双出液嘴与咖啡液流';
+  const coffee=E.createProject({...brief,idea:'意式器具功能连接质检提示测试'});coffee.plan=coffeePlan;coffee.version=1;coffee.approved={version:1,hash:W.digest(coffeePlan)};coffee.samplesApproved=true;coffee.status='paused';const file=path.join(E.projectDir(coffee.id),'v1','素材','coffee-qa.png'),relative=path.relative(E.projectDir(coffee.id),file),at=new Date().toISOString();fs.mkdirSync(path.dirname(file),{recursive:true});fs.copyFileSync(W.inside(W.REFS,W.FACE[0]),file);const integrity={sha256:sha256File(file),sizeBytes:fs.statSync(file).size};coffee.panels={'1-1':{key:'第1页第1格',file:relative,prompt:'意式咖啡机正在萃取，portafilter 手柄连接萃取头，双出液嘴流出咖啡',refs:coffeePlan.pages[0].panels[0].references,integrity,qa:{pass:null,status:'unavailable',issues:[],issueDetails:[],repairPrompt:''},at}};coffee.artifacts=[{id:'image:第1页-第1格',kind:'image',file:relative,dependsOn:[],valid:true,at,integrity}];E.saveProject(coffee);E.reviewImage(coffee,'1-1');await done(coffee.id);
+  const reviewDir=fs.readdirSync(path.join(E.projectDir(coffee.id),'.制作记录')).map(name=>path.join(E.projectDir(coffee.id),'.制作记录',name)).find(dir=>dir.includes('画面校对'));assert(reviewDir);const promptText=fs.readFileSync(path.join(reviewDir,'prompt.txt'),'utf8');assert.match(promptText,/萃取头/);assert.match(promptText,/portafilter/);assert.match(promptText,/出液嘴/);assert.match(promptText,/液流.*起点/);assert.match(promptText,/severity=blocking/);assert.match(promptText,/repairAction.*regenerate/);assert.match(promptText,/风格差异/);
 });
 test('sample resume never redraws a failed sample without an explicit decision',async()=>{
   let continued=E.createProject(brief);E.planProject(continued);continued=await done(continued.id);E.approvePlan(continued,W.digest(continued.plan));continued=await done(continued.id);
@@ -478,8 +632,8 @@ test('HTTP service serves built app and blocks foreign writes and unlisted files
     assert(ready,output);const base=`http://127.0.0.1:${port}`;
     const health=await (await fetch(base+'/api/health')).json();assert.equal(typeof health.instanceId,'string');assert(health.instanceId.length>3);
     const boot=await (await fetch(base+'/api/bootstrap')).json();assert(boot.connection.ready);assert(boot.references.length>=20);
-  assert.equal(boot.connection.imageWorker.transport,'direct-chrome');assert.equal(boot.connection.imageWorker.browser,'chrome');assert.equal(boot.connection.imageWorker.state,'focus-unavailable');assert.equal(boot.connection.imageWorker.focusRestoration,'unsupported');assert.equal(boot.connection.imageWorker.focusSafe,false);
-  const refreshed=await (await fetch(base+'/api/connection',{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:'{}'})).json();assert.equal(refreshed.imageWorker.state,'focus-unavailable');assert.equal(refreshed.imageWorker.transport,'direct-chrome');assert.equal(refreshed.imageWorker.browser,'chrome');
+    assert.equal(boot.connection.imageWorker.transport,'direct-chrome');assert.equal(boot.connection.imageWorker.browser,'chrome');assert.equal(boot.connection.imageWorker.state,'available');assert.equal(boot.connection.imageWorker.focusRestoration,'unsupported');assert.equal(boot.connection.imageWorker.focusSafe,false);assert.match(boot.connection.imageWorker.message,/站点访问权限将在任务中验证/);
+    const refreshed=await (await fetch(base+'/api/connection',{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:'{}'})).json();assert.equal(refreshed.imageWorker.state,'available');assert.equal(refreshed.imageWorker.transport,'direct-chrome');assert.equal(refreshed.imageWorker.browser,'chrome');
     const terminalProject=E.createProject({...brief,idea:'HTTP 迟到接单终态一致性测试'});terminalProject.plan=structuredClone(plan);terminalProject.version=2;terminalProject.approved={version:2,hash:W.digest(terminalProject.plan)};terminalProject.samplesApproved=true;terminalProject.status='attention';
     const terminalDir=path.join(E.projectDir(terminalProject.id),'.制作记录','迟到终态'),terminalFile=path.join(E.projectDir(terminalProject.id),'v2','素材','终态占位.png'),terminalTaskId='http-late-terminal-task',terminalRequestId=crypto.randomUUID(),terminalAcceptedAt='2026-09-11T09:36:41+08:00';fs.mkdirSync(terminalDir,{recursive:true});fs.mkdirSync(path.dirname(terminalFile),{recursive:true});fs.writeFileSync(terminalFile,'fixture placeholder');
     fs.writeFileSync(path.join(terminalDir,'request.json'),JSON.stringify({schemaVersion:2,provider:G.WEB_IMAGE_PROVIDER,taskId:terminalTaskId,projectId:terminalProject.id,projectVersion:2,target:'第1页-第1格'}));fs.writeFileSync(path.join(terminalDir,'worker-request.json'),JSON.stringify({schemaVersion:2,provider:G.WEB_IMAGE_PROVIDER,requestId:terminalRequestId,projectId:terminalProject.id,projectVersion:2}));fs.writeFileSync(path.join(terminalDir,'web-generation.json'),JSON.stringify({provider:G.WEB_IMAGE_PROVIDER,state:'failed',accepted:true,requestId:terminalRequestId,acceptedAt:terminalAcceptedAt,submitted:false,errorCode:'IAB_UNAVAILABLE',error:'Codex IAB unavailable'}));
@@ -490,6 +644,7 @@ test('HTTP service serves built app and blocks foreign writes and unlisted files
     const switched=await (await fetch(base+`/api/projects/${p.id}/settings`,{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:JSON.stringify({model:'fixture-model',reasoningEffort:'low'})})).json();assert.equal(switched.brief.model,'fixture-model');assert.equal(switched.modelHistory.at(-1).to.model,'fixture-model');
     const renamed=await (await fetch(base+`/api/projects/${p.id}/title`,{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:JSON.stringify({title:'已改名的流程测试'})})).json();assert.equal(renamed.title,'已改名的流程测试');
     const panelAPI=E.createProject({...brief,idea:'正式分镜决定 API 幂等测试'});panelAPI.plan=structuredClone(plan);panelAPI.version=1;panelAPI.approved={version:1,hash:W.digest(panelAPI.plan)};panelAPI.samplesApproved=true;panelAPI.status='attention';const panelFile=path.join(E.projectDir(panelAPI.id),'v1','素材','api-panel.png'),panelRel=path.relative(E.projectDir(panelAPI.id),panelFile),panelAt=new Date().toISOString();fs.mkdirSync(path.dirname(panelFile),{recursive:true});fs.copyFileSync(W.inside(W.REFS,W.FACE[0]),panelFile);const panelIntegrity={sha256:sha256File(panelFile),sizeBytes:fs.statSync(panelFile).size};panelAPI.panels={'1-1':{key:'1-1',file:panelRel,prompt:'看书，手脚完整',refs:[],integrity:panelIntegrity,qa:{pass:false,status:'needs_review',summary:'API 测试失败质检',issues:['手部需要调整'],issueDetails:[{id:'formal-hand',category:'anatomy',severity:'review',description:'手部需要调整',repairAction:'review'}],repairPrompt:'人工确认'},at:panelAt}};panelAPI.artifacts=[{id:'image:第1页-第1格',kind:'image',file:panelRel,dependsOn:[],valid:true,at:panelAt,integrity:panelIntegrity}];panelAPI.panelDecision={state:'required',panelKey:'1-1',artifactId:'image:第1页-第1格',projectVersion:1,at:panelAt};E.saveProject(panelAPI);const panelBody={panelKey:'1-1',expectedRevision:panelAPI.revision,planHash:panelAPI.approved.hash,artifactId:'image:第1页-第1格',contentHash:W.digest({artifactId:'image:第1页-第1格',file:panelRel,at:panelAt}),decision:'accept_current',acknowledgedIssueIds:['formal-hand'],continueProduction:true,idempotencyKey:`panel:${panelAPI.id}:accept`},panelURL=base+`/api/projects/${panelAPI.id}/panel-decision`,panelResponse=await fetch(panelURL,{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:JSON.stringify(panelBody)}),panelResponseBody=await panelResponse.json();assert.equal(panelResponse.status,200,JSON.stringify(panelResponseBody));const adopted=panelResponseBody;assert.equal(adopted.panels['1-1'].decision.action,'accept_current');const panelReplay=await fetch(panelURL,{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:JSON.stringify(panelBody)});assert.equal(panelReplay.status,200);assert.equal((await panelReplay.json()).idempotent,true);const stale=await fetch(panelURL,{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:JSON.stringify({...panelBody,idempotencyKey:`panel:${panelAPI.id}:stale`})});assert.equal(stale.status,409);
+    const manualAPI=panelDecisionFixture('人工打回 API 本地幂等测试');manualAPI.project.panels['1-1'].qa={pass:true,status:'deferred',summary:'仅文件检查',issues:[],repairPrompt:''};E.saveProject(manualAPI.project);const manualIssue='意式机萃取头、手柄与出液口/液流位置关系不正确',manualBody={panelKey:'1-1',expectedRevision:manualAPI.project.revision,artifactId:manualAPI.artifactId,contentHash:W.digest({artifactId:manualAPI.artifactId,file:manualAPI.relative,at:manualAPI.at}),issue:manualIssue,repairPrompt:'只修正萃取头、portafilter 手柄卡口、双出液嘴与液流起点的功能连接，其他内容保持不变。',idempotencyKey:`manual:${manualAPI.project.id}:reject`},manualURL=base+`/api/projects/${manualAPI.project.id}/panel-review`,manualResponse=await fetch(manualURL,{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:JSON.stringify(manualBody)}),manualResponseBody=await manualResponse.json();assert.equal(manualResponse.status,200,JSON.stringify(manualResponseBody));assert.equal(manualResponseBody.panels['1-1'].review.pass,false);assert.equal(manualResponseBody.panels['1-1'].review.status,'needs_review');assert.equal(manualResponseBody.panelDecision.state,'required');const manualReplay=await fetch(manualURL,{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:JSON.stringify(manualBody)});assert.equal(manualReplay.status,200);assert.equal((await manualReplay.json()).idempotent,true);
     const missingHTTP=panelDecisionFixture('HTTP 缺失文件拒绝采用');fs.unlinkSync(missingHTTP.file);const missingHTTPResponse=await fetch(base+`/api/projects/${missingHTTP.project.id}/panel-decision`,{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:JSON.stringify({...panelDecisionBody(missingHTTP),idempotencyKey:`panel:${missingHTTP.project.id}:missing`})});assert.equal(missingHTTPResponse.status,400);assert.equal(E.readProject(missingHTTP.project.id).panelDecisionCommands?.length||0,0);assert.equal(E.readProject(missingHTTP.project.id).panels['1-1'].userDecision,undefined);
     const corruptHTTP=panelDecisionFixture('HTTP 损坏文件拒绝采用');fs.writeFileSync(corruptHTTP.file,'not an image');const corruptHTTPResponse=await fetch(base+`/api/projects/${corruptHTTP.project.id}/panel-decision`,{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:JSON.stringify({...panelDecisionBody(corruptHTTP),idempotencyKey:`panel:${corruptHTTP.project.id}:corrupt`})});assert.equal(corruptHTTPResponse.status,400);assert.equal(E.readProject(corruptHTTP.project.id).panelDecisionCommands?.length||0,0);assert.equal(E.readProject(corruptHTTP.project.id).panels['1-1'].userDecision,undefined);
     const retryable=E.createProject(brief);retryable.plan=structuredClone(plan);retryable.version=1;retryable.approved={version:1,hash:W.digest(retryable.plan)};retryable.samplesApproved=true;retryable.status='attention';retryable.pending=null;retryable.lastFailure=null;retryable.currentTask={id:'legacy-failed-task',kind:'image',target:'第1页-第1格',status:'failed_no_output',errorCode:'no-output',providerInvocations:1,completedAt:new Date().toISOString()};E.saveProject(retryable);
