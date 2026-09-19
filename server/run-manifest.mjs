@@ -99,6 +99,7 @@ function stagePatch(stage,args,record){
     if(args.submissionIntent!==undefined)patch.submissionIntent=bool(args.submissionIntent,'submissionIntent');
     if(args.submissionUncertain!==undefined)patch.submissionUncertain=bool(args.submissionUncertain,'submissionUncertain');
     if(args.preSubmissionFailure!==undefined)patch.preSubmissionFailure=bool(args.preSubmissionFailure,'preSubmissionFailure');
+    if(submitted&&(patch.preSubmissionFailure===true||patch.preSubmissionFailure===undefined&&current.preSubmissionFailure===true))throw usageError('已提交或提交不确定的请求不能标记为 preSubmissionFailure。');
     if(args.conversationUrl)patch.conversationUrl=validateUrl(args.conversationUrl);
     if(submitted)patch.submissionUncertain=args.submissionUncertain===undefined?current.submissionUncertain===true:patch.submissionUncertain;
   }else if(stage==='resume'){

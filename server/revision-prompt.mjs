@@ -137,14 +137,34 @@ function keepLines(narrative,flags,fallback=''){
   return lines;
 }
 
+const SAFE_ANCHORS=[
+  ['character','人物身份',/(?:人物身份|人物与角色|角色身份)\s*[:：]\s*([^。！？!?；;\n]+)/],
+  ['clothing','服装与穿着',/(?:服装与穿着|服装|穿着)\s*[:：]\s*([^。！？!?；;\n]+)/],
+  ['scene','场景与环境',/(?:场景与环境|场景|环境)\s*[:：]\s*([^。！？!?；;\n]+)/],
+  ['lighting','光线',/光线\s*[:：]\s*([^。！？!?；;\n]+)/],
+  ['composition','构图',/(?:构图与画面|构图)\s*[:：]\s*([^。！？!?；;\n]+)/],
+  ['style','绘画风格与质感',/(?:绘画风格与质感|风格与质感|绘画风格|风格|画风)\s*[:：]\s*([^。！？!?；;\n]+)/],
+];
+const UNSAFE_ANCHOR=/(?:用户已确认|本次明确选定|编辑身份|安全约束|目标分镜|历史任务|历史失败|之前失败|基图|布局|排版|上方主格|下方从左|本地|执行器|manifest|requestId|projectId|taskId|runId|\/Volumes\/|\/Users\/|v\d+\/素材\/)/i;
+
+function safeFallback(basePrompt,flags){
+  const source=String(basePrompt||''),anchors=[];
+  for(const [category,label,pattern] of SAFE_ANCHORS){
+    if(flags[category])continue;
+    const match=source.match(pattern),value=match?bounded(match[1],160):'';
+    if(value&&!UNSAFE_ANCHOR.test(value))anchors.push(`${label}：${value}`);
+  }
+  // Never echo an unstructured prompt. This fixed sentence cannot carry
+  // paths, layout instructions, historical wording, or changed details.
+  return anchors.length?anchors.join('；'):'仅保持未涉及内容不变。';
+}
+
 export function buildRevisionPrompt(basePrompt,note,{key='',baseFile=null}={}){
   // key/baseFile remain accepted for callers and durable metadata, but are
   // deliberately never interpolated into the remote image message.
   void key;void baseFile;
   const narrative=narrativeFrom(basePrompt),changes=splitNote(note),flags=intentFlags(changes),ratio=ratioFrom(basePrompt);
-  const fallback=Object.keys(narrative).length?'':cleanBaseText(basePrompt)
-    .replace(/(?:用户已确认|冻结原始|历史失败|之前失败|目标分镜|编辑身份与安全约束|执行器|后台网页生图)/g,' ')
-    .replace(/\s{2,}/g,' ').trim().slice(0,800);
+  const fallback=Object.keys(narrative).length?'':safeFallback(basePrompt,flags);
   const changeLines=changes.flatMap((line,index)=>[
     `- 修改 ${index+1}（原话）：${line}`,
     `  可观察结果：${positiveResult(line)}`,

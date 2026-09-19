@@ -73,7 +73,7 @@ export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceF
   const intentCommand=helperCommand('submission-intent');
   const submittedCommand=helperCommand('submitted',' --conversation-url "<当前会话地址>" --submission-confirmed-by "new_user_message_and_stop_generation_control"');
   const downloadedCommand=helperCommand('downloaded',' --conversation-url "<当前会话地址>"');
-  const failedCommand=helperCommand('failed',' --submitted <true或false> --error-code "<错误代码>" --error "<简短原始错误>"');
+  const failedCommand=helperCommand('failed',' --submitted <true或false> --submission-intent <true或false> --submission-uncertain <true或false> --pre-submission-failure <true或false> --error-code "<错误代码>" --error "<简短原始错误>"');
   const action=editTarget
     ? '第一项附件是待编辑原图。请只修订明确指出的问题，保持其他正确内容。'
     : '创建一张新的独立分镜图。';
@@ -107,13 +107,13 @@ export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceF
 3. 等待页面完成加载并读取新状态，不用首屏占位内容判断登录。若存在“聊天/工作”切换，选择“聊天”并确认选中；不得在“工作”模式发送生图提示。确认已登录且聊天输入框可用，在添加菜单确认“创建图片”入口（需要时选择该模式）。若显示登录按钮，写 failed、submitted=false、referenceCount=0、errorCode=CHATGPT_LOGIN_REQUIRED；随后停止，不得上传或发送。按上一条 DOM 自适应的两段式附件流程上传所有参考文件，并在每次菜单变化后重新读取 DOM、逐项确认附件；不得操作系统文件选择窗口。
 4. 在发送聊天消息前，附件名和数量匹配后继续有界等待所有附件上传进度或“等待文件上传”状态消失，最长 180 秒；每次核对都从新 DOM 读取。只有发送按钮真实可用才能进入下一步；按钮仍 disabled 时禁止点击。然后执行：
    ${readyCommand}
-   只有 ok=true 才能继续。若超时后提示词仍在输入框、没有新用户消息且没有生成状态，执行 ${failedCommand}，其中 submissionIntent=true、submitted=false、errorCode=FILE_UPLOAD_CHROME_UNAVAILABLE、error 只写简短原始错误；再停止。这是可证明的未发送，不得自行改写其他字段。
+   只有 ok=true 才能继续。若超时后提示词仍在输入框、没有新用户消息且没有生成状态，执行 ${failedCommand}，明确传入 --submitted false、--submission-intent true、--submission-uncertain false、--pre-submission-failure true、--error-code FILE_UPLOAD_CHROME_UNAVAILABLE（submissionIntent=true、submitted=false）；error 只写简短原始错误；再停止。这是已记录发送意图但可证明未发送，不得自行改写其他字段。
 5. 发送前再次核对 worker-request.json 的 authorization.confirmed 和 requestId；授权撤销则停止。点击前且只在一次已确认可用的发送按钮点击之前执行：
    ${intentCommand}
-   只有 ok=true 后才能点击一次。点击后必须用新 DOM 正向证明至少一项：输入框已清空并出现本次新的用户消息，或页面已出现本次生成进度/停止生成控件。只有正向证据出现后，执行 ${submittedCommand}；只有 ok=true 才算 submitted。若点击返回但无法证明既未发送也未送达，执行 ${failedCommand}，其中 submitted=true、submissionUncertain=true、errorCode=SUBMISSION_UNCERTAIN；保留未知结果并绝不再点击。页面显示生成中时只等待，绝不再次发送。
+   只有 ok=true 后才能点击一次。点击后必须用新 DOM 正向证明至少一项：输入框已清空并出现本次新的用户消息，或页面已出现本次生成进度/停止生成控件。只有正向证据出现后，执行 ${submittedCommand}；只有 ok=true 才算 submitted。若点击返回但无法证明既未发送也未送达，执行 ${failedCommand}，明确传入 --submitted true、--submission-intent true、--submission-uncertain true、--pre-submission-failure false、--error-code SUBMISSION_UNCERTAIN；保留未知结果并绝不再点击。页面显示生成中时只等待，绝不再次发送。
 6. 页面显示生成完成后，从下载控件取得原始 PNG/JPG/WebP，复制到准确路径 ${path.resolve(outputFile)}。不得把缩略图或截图当成原图。
 7. 验证目标文件存在且可读取，然后执行 ${downloadedCommand}。helper 会核对目标文件必须是本次 worker-request.json 的 outputFile，并原子写入 state=downloaded、submitted=true、artifactPath、conversationUrl 和 downloadedAt；只有 ok=true 才算下载完成。公开 CUA 没有焦点恢复接口，不报告焦点已恢复，最后只返回真实原图绝对路径和会话 URL。
-8. 如果已有正向送达证据后发生任何错误，仍须执行 ${failedCommand} 并把 submitted=true；提交前若失败则 submitted=false，并按实际情况补充 submissionIntent=true、preSubmissionFailure=true。不要重发；无论导航、登录、上传、发送或下载在哪一步失败，都由外层 finally 统一关闭本次自己创建的专用 tab；不得退回 IAB 或其他浏览器重试。除上述 helper 外，不得直接写入、删除、替换或格式化 web-generation.json；helper 失败就停止并保留原记录。
+8. 如果已有正向送达证据后发生任何错误，仍须执行 ${failedCommand} 并明确传入 --submitted true、--submission-intent true、--submission-uncertain true（如果无法判断是否送达）或 false（如果已确认送达）、--pre-submission-failure false；提交前且已执行 submission-intent 后失败则明确传入 --submitted false、--submission-intent true、--submission-uncertain false、--pre-submission-failure true。提交后的不确定结果绝不能标记为 pre-submission failure。不要重发；无论导航、登录、上传、发送或下载在哪一步失败，都由外层 finally 统一关闭本次自己创建的专用 tab；不得退回 IAB 或其他浏览器重试。除上述 helper 外，不得直接写入、删除、替换或格式化 web-generation.json；helper 失败就停止并保留原记录。
 
 附件绝对路径（按此顺序上传）：
 ${listedFiles(referenceFiles)}
@@ -257,7 +257,7 @@ function recordBrowserPreSubmissionFailure(manifestFile,requestId,failure,dir){
   const errorCode=explicit|| (uploadUnavailable?'FILE_UPLOAD_CHROME_UNAVAILABLE':originPermissionDenied?'BROWSER_ORIGIN_PERMISSION_DENIED':historicalIab?'IAB_UNAVAILABLE':BROWSER_TAB_BACKGROUND_ERROR.test(detail)?'BROWSER_TAB_BACKGROUND_UNAVAILABLE':CHROME_UNAVAILABLE_ERROR.test(detail)?'BROWSER_CHROME_UNAVAILABLE':BROWSER_FOCUS_ERROR.test(detail)&&/RESTORE_FAILED_AFTER_CLOSE/i.test(detail)?'BROWSER_FOCUS_RESTORE_FAILED_AFTER_CLOSE':BROWSER_FOCUS_ERROR.test(detail)&&/RESTORE_FAILED/i.test(detail)?'BROWSER_FOCUS_RESTORE_FAILED':'BROWSER_FOCUS_UNAVAILABLE');
   const prefix=browserFailurePrefix(errorCode);
   try{
-    patchManifestState(manifestFile,'failed',{submitted:'false',submissionIntent:'false',preSubmissionFailure:'true',errorCode,error:`${prefix}；未上传附件或发送消息。原始错误：${detail}`});
+    patchManifestState(manifestFile,'failed',{submitted:'false',submissionIntent:manifest.submissionIntent===true?'true':'false',preSubmissionFailure:'true',errorCode,error:`${prefix}；未上传附件或发送消息。原始错误：${detail}`});
     return readWebManifest(manifestFile);
   }catch{return manifest;}
 }
@@ -267,7 +267,7 @@ function normalizeOriginPermissionDenied({manifestFile,requestId,dir,outputFile,
   const detail=String(browserRunEvidenceText(dir,{manifest,failure})).slice(0,1000);
   const explicit=explicitManifestErrorCode(manifest),errorCode=explicit||'BROWSER_ORIGIN_PERMISSION_DENIED';
   try{
-    patchManifestState(manifestFile,'failed',{submitted:'false',submissionIntent:'false',preSubmissionFailure:'true',errorCode,error:`${browserFailurePrefix(errorCode)}；未上传附件或发送消息。原始错误：${detail}`});
+    patchManifestState(manifestFile,'failed',{submitted:'false',submissionIntent:manifest.submissionIntent===true?'true':'false',preSubmissionFailure:'true',errorCode,error:`${browserFailurePrefix(errorCode)}；未上传附件或发送消息。原始错误：${detail}`});
     return readWebManifest(manifestFile);
   }catch{return manifest;}
 }

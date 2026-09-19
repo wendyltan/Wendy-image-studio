@@ -37,6 +37,24 @@ test('atomic lifecycle patch preserves unknown fields and locks identity',()=>{
   const record=readRunIdentity(run.dir,{strict:true});assert.equal(compareRunIdentity({record,requireModern:true}).ok,true);
 });
 
+test('failed lifecycle records explicit intent for a pre-submission failure and rejects post-submit pre-submit labeling',()=>{
+  const run=fixture();
+  patchManifest({stage:'accepted',manifestFile:run.manifestFile,args:{}});
+  patchManifest({stage:'ready',manifestFile:run.manifestFile,args:{conversationUrl:'https://chatgpt.com/c/fixture',referenceCount:1}});
+  patchManifest({stage:'submission-intent',manifestFile:run.manifestFile,args:{}});
+  const pre=patchManifest({stage:'failed',manifestFile:run.manifestFile,args:{submitted:'false',submissionIntent:'true',submissionUncertain:'false',preSubmissionFailure:'true',errorCode:'FILE_UPLOAD_CHROME_UNAVAILABLE',error:'fixture'}}).manifest;
+  assert.equal(pre.submitted,false);assert.equal(pre.submissionIntent,true);assert.equal(pre.submissionUncertain,false);assert.equal(pre.preSubmissionFailure,true);
+
+  const submitted=fixture();
+  patchManifest({stage:'accepted',manifestFile:submitted.manifestFile,args:{}});
+  patchManifest({stage:'ready',manifestFile:submitted.manifestFile,args:{conversationUrl:'https://chatgpt.com/c/fixture',referenceCount:1}});
+  patchManifest({stage:'submission-intent',manifestFile:submitted.manifestFile,args:{}});
+  patchManifest({stage:'submitted',manifestFile:submitted.manifestFile,args:{submissionConfirmedBy:'fixture'}});
+  assert.throws(()=>patchManifest({stage:'failed',manifestFile:submitted.manifestFile,args:{submitted:'true',submissionIntent:'true',submissionUncertain:'true',preSubmissionFailure:'true',errorCode:'SUBMISSION_UNCERTAIN',error:'fixture'}}),/preSubmissionFailure/);
+  const uncertain=patchManifest({stage:'failed',manifestFile:submitted.manifestFile,args:{submitted:'true',submissionIntent:'true',submissionUncertain:'true',preSubmissionFailure:'false',errorCode:'SUBMISSION_UNCERTAIN',error:'fixture'}}).manifest;
+  assert.equal(uncertain.submitted,true);assert.equal(uncertain.submissionUncertain,true);assert.equal(uncertain.preSubmissionFailure,false);
+});
+
 test('tampered request identity is rejected before any manifest write',()=>{
   const run=fixture({tamperManifest:true}),before=fs.readFileSync(run.manifestFile);
   assert.throws(()=>patchManifest({stage:'accepted',manifestFile:run.manifestFile,args:{}}),/身份不一致/);
