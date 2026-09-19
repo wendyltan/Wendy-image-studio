@@ -1,7 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import {fileURLToPath} from 'node:url';
 import {runCodex,findCodex} from './bridge.mjs';
+import {identityFields,sameIdentityValue,readJsonObject as readRunJson,readRunIdentity,compareRunIdentity} from './run-identity.mjs';
+import {patchManifest} from './run-manifest.mjs';
 // Keep the durable provider id for existing project records. The production
 // transport is direct Chrome; older IAB manifests remain readable for
 // recovery, but IAB is never a fallback for a new request.
@@ -29,6 +32,7 @@ const FILE_UPLOAD_CHROME_UNAVAILABLE_ERROR=/(?:^|[^A-Z0-9_])FILE_UPLOAD_CHROME_U
 // command arguments are not browser evidence; only a result returned by the
 // current browser tool may establish a site-origin permission denial.
 const BROWSER_ORIGIN_PERMISSION_DENIED_ERROR=/(?:^|[^A-Z0-9_])BROWSER_ORIGIN_PERMISSION_DENIED(?:$|[^A-Z0-9_])|Browser use cannot access\s+https?:\/\/chatgpt\.com\b[^\n]*(?:denied permission|permission denied|拒绝)|https?:\/\/chatgpt\.com\b[^\n]*(?:browser security policy|origin permission|访问权限被拒绝)/i;
+const MANIFEST_HELPER=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'run-manifest.mjs');
 
 function normalizeTimestamp(value){
   if(typeof value!=='string'||!value.trim())return null;
@@ -51,8 +55,7 @@ function listedFiles(files=[]){
 
 export function readWebManifest(file){
   try{
-    const value=JSON.parse(fs.readFileSync(file,'utf8'));
-    if(!value||typeof value!=='object')return null;
+    const value=readRunJson(file,{strict:true});
     const state=String(value.state||'');
     if(!MANIFEST_STATES.has(state))return null;
     const conversationUrl=/^https:\/\/chatgpt\.com\/(?:c\/[^\s?#]+)?(?:[?#][^\s]*)?$/.test(String(value.conversationUrl||''))?String(value.conversationUrl):null;
@@ -63,6 +66,14 @@ export function readWebManifest(file){
 }
 
 export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceFiles=[],editTarget=null,conversationUrl=null,capsule='',requestId=null}){
+  const helperFile=JSON.stringify(MANIFEST_HELPER),manifestPath=JSON.stringify(path.resolve(manifestFile));
+  const helperCommand=(stage,extra='')=>`node ${helperFile} ${stage} --manifest-file ${manifestPath}${extra}`;
+  const acceptedCommand=helperCommand('accepted');
+  const readyCommand=helperCommand('ready',' --conversation-url "<当前会话地址>" --reference-count <已确认附件数>');
+  const intentCommand=helperCommand('submission-intent');
+  const submittedCommand=helperCommand('submitted',' --conversation-url "<当前会话地址>" --submission-confirmed-by "new_user_message_and_stop_generation_control"');
+  const downloadedCommand=helperCommand('downloaded',' --conversation-url "<当前会话地址>"');
+  const failedCommand=helperCommand('failed',' --submitted <true或false> --error-code "<错误代码>" --error "<简短原始错误>"');
   const action=editTarget
     ? '第一项附件是待编辑原图。请只修订明确指出的问题，保持其他正确内容。'
     : '创建一张新的独立分镜图。';
@@ -89,25 +100,33 @@ export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceF
 - 除写入下列目标图片和执行记录外，不修改本地文件。
 
 执行步骤：
-1. 真正开始处理本次 requestId（${requestId||'从 worker-request.json 读取'}）并核对 worker-request.json 中的 manifestFile、instructionFile 和 outputFile 后，先原子更新 ${JSON.stringify(path.resolve(manifestFile))} 为 provider=${WEB_IMAGE_PROVIDER}、transport=${WEB_IMAGE_TRANSPORT}、focusPolicy=${WEB_IMAGE_FOCUS_POLICY}、state=accepted、accepted=true、requestId（必须完全匹配）、acceptedAt。所有时间只能由 new Date().toISOString() 取得，禁止手写、缩写或插入占位字符。这个状态是执行器开始处理的凭据；若无法写入，写 state=failed、submitted=false、errorCode 和 error 后停止。未写入 accepted 前不得打开或准备网页、登录、上传附件。开始前必须读取 worker-request.json，确认 authorization.confirmed=true 且 requestId 匹配；否则停止。
+1. 真正开始处理本次 requestId（${requestId||'从 worker-request.json 读取'}）并核对 worker-request.json 中的 manifestFile、instructionFile 和 outputFile。开始前必须读取 worker-request.json，确认 authorization.confirmed=true 且 requestId 匹配；否则停止。未写入 accepted 前不得打开或准备网页、登录、上传附件。manifest 只能通过预置的原子生命周期 helper 更新，禁止手工拼接、覆盖或重建 JSON，也禁止改变或删除 projectId、projectVersion、taskId、target、requestId、runId、outputFile。先执行：
+   ${acceptedCommand}
+   只有命令返回 JSON 中的 ok=true 后，才算 accepted 成功；helper 会从同一执行目录复核 request、worker、execution 和锁定身份并自行生成 ISO 时间。若 helper 失败，立即停止，不要用其他命令补写；若需记录失败，只执行下面的 failed helper。
 2. 使用当前工具公开的 const tab=await cua.createBrowserTab("chrome",undefined,{sessionName:"🎨 温蒂生图"}) 新建一个自己拥有的空白专用 Chrome 标签页并保存 tab handle；不传入 visible，不创建第二个标签页。随后只能在同一个 try { await tab.goto("https://chatgpt.com")；执行本次页面的导航、登录、上传、发送和下载 } finally { await tab.close() } 结构中操作。创建时 Chrome 可能短暂取得焦点，公开 CUA 没有焦点恢复接口，因此不得声称零焦点切换或后台隐藏。${conversation}
 3. 等待页面完成加载并读取新状态，不用首屏占位内容判断登录。若存在“聊天/工作”切换，选择“聊天”并确认选中；不得在“工作”模式发送生图提示。确认已登录且聊天输入框可用，在添加菜单确认“创建图片”入口（需要时选择该模式）。若显示登录按钮，写 failed、submitted=false、referenceCount=0、errorCode=CHATGPT_LOGIN_REQUIRED；随后停止，不得上传或发送。按上一条 DOM 自适应的两段式附件流程上传所有参考文件，并在每次菜单变化后重新读取 DOM、逐项确认附件；不得操作系统文件选择窗口。
-4. 在发送聊天消息前，原子更新同一清单为 state=ready、conversationUrl、referenceCount、submitted=false、requestId、acceptedAt 和 readyAt。附件名和数量匹配后，继续有界等待所有附件上传进度或“等待文件上传”状态消失，最长 180 秒；每次核对都从新 DOM 读取。只有发送按钮真实可用才能进入下一步；按钮仍 disabled 时禁止点击。若超时后提示词仍在输入框、没有新用户消息且没有生成状态，写 state=failed、submitted=false、submissionIntent=true、preSubmissionFailure=true、errorCode=FILE_UPLOAD_CHROME_UNAVAILABLE 后停止；这是可证明的未发送，不得写 submittedAt。
-5. 发送前再次核对 worker-request.json 的 authorization.confirmed 和 requestId；授权撤销则停止。点击前只原子记录 state=ready、submissionIntent=true、submitted=false、conversationUrl、requestId 和 submissionAttemptAt，然后且只然后点击一次已确认可用的发送按钮。点击后必须用新 DOM 正向证明至少一项：输入框已清空并出现本次新的用户消息，或页面已出现本次生成进度/停止生成控件。只有这个正向证据出现后，才原子更新 state=submitted、submitted=true、submittedAt、submissionConfirmedBy。如果点击返回但无法证明既未发送也未送达，为安全起见写 submitted=true、submissionUncertain=true、state=failed，保留未知结果并绝不再点击。页面显示生成中时只等待，绝不再次发送。
+4. 在发送聊天消息前，附件名和数量匹配后继续有界等待所有附件上传进度或“等待文件上传”状态消失，最长 180 秒；每次核对都从新 DOM 读取。只有发送按钮真实可用才能进入下一步；按钮仍 disabled 时禁止点击。然后执行：
+   ${readyCommand}
+   只有 ok=true 才能继续。若超时后提示词仍在输入框、没有新用户消息且没有生成状态，执行 ${failedCommand}，其中 submissionIntent=true、submitted=false、errorCode=FILE_UPLOAD_CHROME_UNAVAILABLE、error 只写简短原始错误；再停止。这是可证明的未发送，不得自行改写其他字段。
+5. 发送前再次核对 worker-request.json 的 authorization.confirmed 和 requestId；授权撤销则停止。点击前且只在一次已确认可用的发送按钮点击之前执行：
+   ${intentCommand}
+   只有 ok=true 后才能点击一次。点击后必须用新 DOM 正向证明至少一项：输入框已清空并出现本次新的用户消息，或页面已出现本次生成进度/停止生成控件。只有正向证据出现后，执行 ${submittedCommand}；只有 ok=true 才算 submitted。若点击返回但无法证明既未发送也未送达，执行 ${failedCommand}，其中 submitted=true、submissionUncertain=true、errorCode=SUBMISSION_UNCERTAIN；保留未知结果并绝不再点击。页面显示生成中时只等待，绝不再次发送。
 6. 页面显示生成完成后，从下载控件取得原始 PNG/JPG/WebP，复制到准确路径 ${path.resolve(outputFile)}。不得把缩略图或截图当成原图。
-7. 验证目标文件存在且可读取，把清单更新为 state=downloaded、submitted=true、artifactPath、conversationUrl、requestId、acceptedAt 和 downloadedAt。公开 CUA 没有焦点恢复接口，不报告焦点已恢复，最后只返回真实原图绝对路径和会话 URL。
-8. 如果已有正向送达证据后发生任何错误，仍须更新清单为 state=failed、submitted=true、requestId、acceptedAt、conversationUrl、errorCode 和 error。不要重发；无论导航、登录、上传、发送或下载在哪一步失败，都由外层 finally 统一关闭本次自己创建的专用 tab；提交前若失败，写 submitted=false；不得退回 IAB 或其他浏览器重试。
+7. 验证目标文件存在且可读取，然后执行 ${downloadedCommand}。helper 会核对目标文件必须是本次 worker-request.json 的 outputFile，并原子写入 state=downloaded、submitted=true、artifactPath、conversationUrl 和 downloadedAt；只有 ok=true 才算下载完成。公开 CUA 没有焦点恢复接口，不报告焦点已恢复，最后只返回真实原图绝对路径和会话 URL。
+8. 如果已有正向送达证据后发生任何错误，仍须执行 ${failedCommand} 并把 submitted=true；提交前若失败则 submitted=false，并按实际情况补充 submissionIntent=true、preSubmissionFailure=true。不要重发；无论导航、登录、上传、发送或下载在哪一步失败，都由外层 finally 统一关闭本次自己创建的专用 tab；不得退回 IAB 或其他浏览器重试。除上述 helper 外，不得直接写入、删除、替换或格式化 web-generation.json；helper 失败就停止并保留原记录。
 
 附件绝对路径（按此顺序上传）：
 ${listedFiles(referenceFiles)}
 
 附件规则：两张温蒂人设必须同时作为身份参考；其他附件只锁定对应环境、物件或编辑目标。${action}
 
-冻结制作要求：
+本地执行参考（不要复制给 ChatGPT 的用户消息）：
 ${capsule}
 
-本次单张要求：
-${prompt}`;
+远端 ChatGPT 唯一发送内容（只复制 <image_prompt> 与 </image_prompt> 之间的文本；不要把本条执行指令、附件路径、manifest、requestId、项目状态或本地参考一起发送）：
+<image_prompt>
+${prompt}
+</image_prompt>`;
 }
 
 function writeJson(file,value){
@@ -117,11 +136,12 @@ function writeJson(file,value){
   fs.renameSync(temp,file);
 }
 
+function patchManifestState(manifestFile,stage,args={}){
+  return patchManifest({stage,manifestFile,args}).manifest;
+}
+
 function readJsonObject(file){
-  try{
-    const value=JSON.parse(fs.readFileSync(file,'utf8'));
-    return value&&typeof value==='object'&&!Array.isArray(value)?value:null;
-  }catch{return null;}
+  return readRunJson(file);
 }
 
 function textFromBrowserToolResult(result){
@@ -153,59 +173,23 @@ function structuredBrowserToolResultText(dir){
   return chunks.join('\n');
 }
 
-function identityFields(value){
-  if(!value||typeof value!=='object')return {};
-  const fields={};
-  for(const key of ['projectId','projectVersion','taskId','target']){
-    if(value[key]!==undefined&&value[key]!==null&&value[key]!=='')fields[key]=value[key];
-  }
-  return fields;
-}
-
-function sameIdentityValue(left,right,key){
-  if(left===undefined||left===null||left===''||right===undefined||right===null||right==='')return true;
-  return key==='projectVersion'?Number(left)===Number(right):String(left)===String(right);
-}
-
 /**
  * Keep a terminal permission error tied to this exact request and CLI run.
  * A stale event file or a worker from another task must never rewrite the
  * current manifest into a different failure category.
  */
 function browserRunIdentityMatches({dir,manifestFile,outputFile,requestId,manifest}={}){
-  const runId=path.basename(path.resolve(dir||''));
-  const worker=readJsonObject(path.join(dir,'worker-request.json'));
-  const request=readJsonObject(path.join(dir,'request.json'));
-  const execution=readJsonObject(path.join(dir,'execution.json'));
-  if(!worker||worker.provider!==WEB_IMAGE_PROVIDER||worker.requestId!==requestId)return false;
-  if(request?.provider!==undefined&&request.provider!==WEB_IMAGE_PROVIDER)return false;
-  if(manifest?.provider!==WEB_IMAGE_PROVIDER)return false;
-  if(manifest?.requestId!==requestId)return false;
-  if(worker.manifestFile&&path.resolve(String(worker.manifestFile))!==path.resolve(String(manifestFile||'')))return false;
-  if(outputFile&&path.resolve(String(worker.outputFile||''))!==path.resolve(String(outputFile)))return false;
-  const modern=Boolean(worker.runId||worker.outputFile||manifest.runId||execution?.runId);
-  if(modern&&(!worker.manifestFile||!worker.outputFile||!worker.runId||!manifest.runId||!execution))return false;
-  if(worker.manifestFile&&path.resolve(String(worker.manifestFile))!==path.resolve(String(manifestFile||'')))return false;
-  if(worker.outputFile&&outputFile&&path.resolve(String(worker.outputFile))!==path.resolve(String(outputFile)))return false;
-  if(!execution||String(execution.runId||'')!==runId)return false;
-  if(request?.requestId!==undefined&&String(request.requestId)!==requestId)return false;
-  if(request?.runId!==undefined&&String(request.runId)!==runId)return false;
-  if(request?.run_id!==undefined&&String(request.run_id)!==runId)return false;
-  if(manifest?.runId!==undefined&&String(manifest.runId)!==runId)return false;
-  if(manifest?.run_id!==undefined&&String(manifest.run_id)!==runId)return false;
-  if(worker.runId!==undefined&&String(worker.runId)!==runId)return false;
-  if(request?.expectedOutput){
-    const projectRoot=path.resolve(dir,'..','..');
-    if(path.resolve(projectRoot,String(request.expectedOutput))!==path.resolve(String(outputFile||worker.outputFile||'')))return false;
-  }
-  const sources=[request,worker,manifest];
-  for(const key of ['projectId','projectVersion','taskId','target']){
-    if(request?.[key]!==undefined&&!sameIdentityValue(request[key],worker?.[key],key))return false;
-    for(let i=0;i<sources.length;i++)for(let j=i+1;j<sources.length;j++){
-      if(!sameIdentityValue(sources[i]?.[key],sources[j]?.[key],key))return false;
-    }
-  }
-  return true;
+  try{
+    const record=readRunIdentity(dir,{strict:true}),expected={requestId,runId:record.runId};
+    if(outputFile)expected.outputFile=path.resolve(String(outputFile));
+    const comparison=compareRunIdentity({record,expected});
+    if(!comparison.ok)return false;
+    if(record.request?.provider!==undefined&&record.request.provider!==WEB_IMAGE_PROVIDER)return false;
+    if(record.worker?.provider!==WEB_IMAGE_PROVIDER||record.manifest?.provider!==WEB_IMAGE_PROVIDER)return false;
+    if(record.worker?.manifestFile&&path.resolve(String(record.worker.manifestFile))!==path.resolve(String(manifestFile||'')))return false;
+    if(manifest?.requestId!==requestId)return false;
+    return true;
+  }catch{return false;}
 }
 
 function browserRunEvidenceText(dir,{manifest=null,failure=null}={}){
@@ -272,16 +256,20 @@ function recordBrowserPreSubmissionFailure(manifestFile,requestId,failure,dir){
   const historicalIab=!explicit&&IAB_UNAVAILABLE_ERROR.test(String(failure?.code||failure?.message||''));
   const errorCode=explicit|| (uploadUnavailable?'FILE_UPLOAD_CHROME_UNAVAILABLE':originPermissionDenied?'BROWSER_ORIGIN_PERMISSION_DENIED':historicalIab?'IAB_UNAVAILABLE':BROWSER_TAB_BACKGROUND_ERROR.test(detail)?'BROWSER_TAB_BACKGROUND_UNAVAILABLE':CHROME_UNAVAILABLE_ERROR.test(detail)?'BROWSER_CHROME_UNAVAILABLE':BROWSER_FOCUS_ERROR.test(detail)&&/RESTORE_FAILED_AFTER_CLOSE/i.test(detail)?'BROWSER_FOCUS_RESTORE_FAILED_AFTER_CLOSE':BROWSER_FOCUS_ERROR.test(detail)&&/RESTORE_FAILED/i.test(detail)?'BROWSER_FOCUS_RESTORE_FAILED':'BROWSER_FOCUS_UNAVAILABLE');
   const prefix=browserFailurePrefix(errorCode);
-  writeJson(manifestFile,{...manifest,state:'failed',accepted:manifest.accepted===true,submitted:false,submissionIntent:false,preSubmissionFailure:true,referenceCount:0,errorCode,focusPolicy:WEB_IMAGE_FOCUS_POLICY,error:`${prefix}；未上传附件或发送消息。原始错误：${detail}`,failedAt:new Date().toISOString()});
-  return readWebManifest(manifestFile);
+  try{
+    patchManifestState(manifestFile,'failed',{submitted:'false',submissionIntent:'false',preSubmissionFailure:'true',errorCode,error:`${prefix}；未上传附件或发送消息。原始错误：${detail}`});
+    return readWebManifest(manifestFile);
+  }catch{return manifest;}
 }
 
 function normalizeOriginPermissionDenied({manifestFile,requestId,dir,outputFile,manifest,failure}={}){
   if(!originPermissionDeniedForRun({dir,manifestFile,outputFile,requestId,manifest,failure}))return null;
   const detail=String(browserRunEvidenceText(dir,{manifest,failure})).slice(0,1000);
   const explicit=explicitManifestErrorCode(manifest),errorCode=explicit||'BROWSER_ORIGIN_PERMISSION_DENIED';
-  writeJson(manifestFile,{...manifest,state:'failed',accepted:manifest.accepted===true,submitted:false,submissionIntent:false,preSubmissionFailure:true,referenceCount:0,errorCode,focusPolicy:WEB_IMAGE_FOCUS_POLICY,error:`${browserFailurePrefix(errorCode)}；未上传附件或发送消息。原始错误：${detail}`,failedAt:manifest.failedAt||new Date().toISOString()});
-  return readWebManifest(manifestFile);
+  try{
+    patchManifestState(manifestFile,'failed',{submitted:'false',submissionIntent:'false',preSubmissionFailure:'true',errorCode,error:`${browserFailurePrefix(errorCode)}；未上传附件或发送消息。原始错误：${detail}`});
+    return readWebManifest(manifestFile);
+  }catch{return manifest;}
 }
 
 function browserPreSubmissionFailureObserved(dir,failure,manifest=null){
@@ -294,13 +282,18 @@ function finalizeWorkerResult({dir,manifestFile,outputFile,requestId,result,fail
   if(normalizedOrigin)manifest=normalizedOrigin;
   else if((failure||explicitManifestErrorCode(manifest))&&browserPreSubmissionFailureObserved(dir,failure,manifest))manifest=recordBrowserPreSubmissionFailure(manifestFile,requestId,failure,dir);
   if(manifest?.requestId===requestId&&(!manifest.role||!manifest.executorReasoningEffort)){
-    writeJson(manifestFile,{...manifest,role:manifest.role||role,executorModel:(manifest.executorModel??model)||null,executorReasoningEffort:manifest.executorReasoningEffort||reasoningEffort});
-    manifest=readWebManifest(manifestFile);
+    try{
+      patchManifestState(manifestFile,'metadata',{role:manifest.role||role,executorModel:(manifest.executorModel??model)||null,executorReasoningEffort:manifest.executorReasoningEffort||reasoningEffort,focusPolicy:manifest.focusPolicy||WEB_IMAGE_FOCUS_POLICY});
+      manifest=readWebManifest(manifestFile);
+    }catch{}
   }
-  const matches=manifest?.requestId===requestId;
+  const matches=manifest?.requestId===requestId&&browserRunIdentityMatches({dir,manifestFile,outputFile,requestId,manifest});
   if(matches&&manifest.state==='downloaded'&&manifest.accepted===true&&manifest.submitted===true&&path.resolve(manifest.artifactPath||'')===path.resolve(outputFile)&&fs.existsSync(outputFile))return {...result,text:outputFile,manifest};
   if(matches&&manifest.state==='failed'){
     const error=new Error(manifest.error||'网页生成未完成。');error.code=manifest.errorCode||'WEB_IMAGE_FAILED';error.webManifest=manifest;throw error;
+  }
+  if(manifest?.requestId===requestId&&!browserRunIdentityMatches({dir,manifestFile,outputFile,requestId,manifest})){
+    const error=new Error('执行记录身份不一致，原文件已保留，不能自动采用或重试。');error.code='REQUEST_IDENTITY_MISMATCH';error.webManifest=manifest;throw error;
   }
   const error=failure||new Error('执行已结束，但没有取得已核实原图。记录已保留，请检查已有图片；不会自动重试。');error.webManifest=manifest;throw error;
 }
@@ -309,7 +302,7 @@ function archivePreAcceptanceAttempt(dir,manifest,execution){
   const attemptsDir=path.join(dir,'attempts');fs.mkdirSync(attemptsDir,{recursive:true});
   const serial=String(fs.readdirSync(attemptsDir).filter(name=>/^\d{3}-preaccept-usage-limit$/.test(name)).length+1).padStart(3,'0');
   const archive=path.join(attemptsDir,`${serial}-preaccept-usage-limit`);fs.mkdirSync(archive,{recursive:false});
-  for(const name of ['execution.json','events.jsonl','response.txt','result.json','prompt.txt','web-generation.json']){
+  for(const name of ['execution.json','events.jsonl','response.txt','result.json','prompt.txt','web-generation.json','run-identity.json']){
     const source=path.join(dir,name);if(fs.existsSync(source))fs.copyFileSync(source,path.join(archive,name));
   }
   writeJson(path.join(archive,'attempt.json'),{schemaVersion:1,requestId:manifest.requestId,state:manifest.state,accepted:manifest.accepted===true,submitted:manifest.submitted===true,referenceCount:Number(manifest.referenceCount)||0,executionState:execution.state,error:execution.error||null,archivedAt:new Date().toISOString()});
@@ -320,14 +313,18 @@ function archiveConfirmedUnsentAttempt(dir,manifest,execution,audit){
   const attemptsDir=path.join(dir,'attempts');fs.mkdirSync(attemptsDir,{recursive:true});
   const serial=String(fs.readdirSync(attemptsDir).filter(name=>/^\d{3}-/.test(name)).length+1).padStart(3,'0');
   const archive=path.join(attemptsDir,`${serial}-confirmed-unsent`);fs.mkdirSync(archive,{recursive:false});
-  for(const name of ['execution.json','events.jsonl','response.txt','result.json','prompt.txt','web-generation.json','web-audit.json']){
+  for(const name of ['execution.json','events.jsonl','response.txt','result.json','prompt.txt','web-generation.json','run-identity.json','web-audit.json']){
     const source=path.join(dir,name);if(fs.existsSync(source))fs.copyFileSync(source,path.join(archive,name));
   }
   writeJson(path.join(archive,'attempt.json'),{schemaVersion:1,requestId:manifest.requestId,state:manifest.state,accepted:manifest.accepted===true,submitted:manifest.submitted===true,submissionIntent:manifest.submissionIntent===true,referenceCount:Number(manifest.referenceCount)||0,executionState:execution.state,errorCode:manifest.errorCode||null,error:manifest.error||execution.error||null,auditResult:audit.result,archivedAt:new Date().toISOString()});
   return path.relative(dir,archive);
 }
 
-function assertExpectedIdentity(expected,request,worker,manifest){
+function assertExpectedIdentity(expected,request,worker,manifest,{dir=null,outputFile=null}={}){
+  if(dir){
+    const record=readRunIdentity(dir,{strict:true}),comparison=compareRunIdentity({record,expected:{...expected,...(outputFile?{outputFile}: {})}});
+    if(!comparison.ok){const error=new Error(`待续接图片请求身份不匹配；原记录已保留，不会重新执行：${comparison.issues.join('；')}`);error.code='REQUEST_IDENTITY_MISMATCH';throw error;}
+  }
   for(const key of ['projectId','projectVersion','taskId','target','requestId']){
     if(expected?.[key]===undefined||expected?.[key]===null||expected?.[key]==='')continue;
     const sources=key==='requestId'?[worker,manifest]:[request,worker,manifest];
@@ -364,12 +361,16 @@ export function confirmedUnsentWebAudit({dir,expected={}}={}){
 export async function dispatchChatGptWebJob({codexBin,dir,outputFile,prompt,referenceFiles=[],editTarget=null,conversationUrl=null,capsule='',signal,timeoutMs=900000,model=null,reasoningEffort=WEB_IMAGE_EXECUTOR_EFFORT,role=WEB_IMAGE_EXECUTOR_ROLE}){
   if(signal?.aborted)throw new Error('已暂停，尚未启动图片任务。');
   fs.mkdirSync(dir,{recursive:true});
-  const manifestFile=path.join(dir,'web-generation.json'),instructionFile=path.join(dir,'prompt.txt'),requestFile=path.join(dir,'worker-request.json');
+  const manifestFile=path.join(dir,'web-generation.json'),instructionFile=path.join(dir,'prompt.txt'),requestFile=path.join(dir,'worker-request.json'),requestMetadataFile=path.join(dir,'request.json');
   if(fs.existsSync(requestFile))throw new Error('这个图片请求已存在，请检查已有结果，不会再次执行。');
-  const requestId=crypto.randomUUID(),createdAt=new Date().toISOString();
-  const runId=path.basename(path.resolve(dir)),requestIdentity=identityFields(readJsonObject(path.join(dir,'request.json')));
-  writeJson(manifestFile,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,transport:WEB_IMAGE_TRANSPORT,browser:WEB_IMAGE_BROWSER,focusPolicy:WEB_IMAGE_FOCUS_POLICY,role,executorModel:model||null,executorReasoningEffort:reasoningEffort,...requestIdentity,runId,state:'queued',requestId,accepted:false,submitted:false,referenceCount:0,createdAt});
-  writeJson(requestFile,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,transport:WEB_IMAGE_TRANSPORT,browser:WEB_IMAGE_BROWSER,focusPolicy:WEB_IMAGE_FOCUS_POLICY,role,executorModel:model||null,executorReasoningEffort:reasoningEffort,...requestIdentity,runId,requestId,authorization:{confirmed:true,scope:'one_chatgpt_web_image_submission',confirmedAt:createdAt},instructionFile,manifestFile,outputFile:path.resolve(outputFile),referenceFiles:referenceFiles.map(file=>path.resolve(file)),createdAt});
+  const requestId=crypto.randomUUID(),createdAt=new Date().toISOString(),absoluteOutput=path.resolve(outputFile);
+  const runId=path.basename(path.resolve(dir)),requestIdentity=identityFields(readJsonObject(path.join(dir,'request.json'))),lockedIdentity={...requestIdentity,requestId,runId,outputFile:absoluteOutput};
+  const commonIdentity={identitySchemaVersion:2,identityLocked:true,...lockedIdentity};
+  writeJson(manifestFile,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,transport:WEB_IMAGE_TRANSPORT,browser:WEB_IMAGE_BROWSER,focusPolicy:WEB_IMAGE_FOCUS_POLICY,role,executorModel:model||null,executorReasoningEffort:reasoningEffort,...commonIdentity,state:'queued',accepted:false,submitted:false,referenceCount:0,createdAt});
+  const previousRequest=readJsonObject(requestMetadataFile)||{};
+  writeJson(requestMetadataFile,{...previousRequest,schemaVersion:Number(previousRequest.schemaVersion||2),provider:previousRequest.provider||WEB_IMAGE_PROVIDER,identitySchemaVersion:2,identityLocked:true,...lockedIdentity,expectedOutput:previousRequest.expectedOutput||path.relative(path.resolve(dir,'..','..'),absoluteOutput)});
+  writeJson(requestFile,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,transport:WEB_IMAGE_TRANSPORT,browser:WEB_IMAGE_BROWSER,focusPolicy:WEB_IMAGE_FOCUS_POLICY,role,executorModel:model||null,executorReasoningEffort:reasoningEffort,...commonIdentity,expectedOutput:path.relative(path.resolve(dir,'..','..'),absoluteOutput),authorization:{confirmed:true,scope:'one_chatgpt_web_image_submission',confirmedAt:createdAt},instructionFile,manifestFile,referenceFiles:referenceFiles.map(file=>path.resolve(file)),createdAt});
+  writeJson(path.join(dir,'run-identity.json'),{schemaVersion:1,identitySchemaVersion:2,identityLocked:true,provider:WEB_IMAGE_PROVIDER,...lockedIdentity,expectedOutput:absoluteOutput,createdAt});
   let result,failure;
   try{result=await runCodex({codexBin,dir,image:true,browserMode:'chrome',signal,timeoutMs,model,reasoningEffort,role,writableDirs:[path.dirname(path.resolve(outputFile))],prompt:chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceFiles,editTarget,conversationUrl,capsule,requestId})});}catch(error){failure=error;}
   return finalizeWorkerResult({dir,manifestFile,outputFile,requestId,result,failure,model,reasoningEffort,role});
@@ -382,7 +383,7 @@ export async function resumeChatGptWebJob({codexBin,dir,signal,timeoutMs=900000,
   const manifestFile=path.join(dir,'web-generation.json'),requestFile=path.join(dir,'request.json'),workerFile=path.join(dir,'worker-request.json'),executionFile=path.join(dir,'execution.json'),eventsFile=path.join(dir,'events.jsonl');
   const manifest=readWebManifest(manifestFile),request=readJsonObject(requestFile),worker=readJsonObject(workerFile),execution=readJsonObject(executionFile);
   if(!manifest||!request||!worker||!execution)throw new Error('待续接图片请求缺少完整执行记录；不会创建第二个请求。');
-  assertExpectedIdentity(expected,request,worker,manifest);
+  assertExpectedIdentity(expected,request,worker,manifest,{dir,outputFile:worker.outputFile});
   const requestId=manifest.requestId,outputFile=path.resolve(String(worker.outputFile||''));
   if(!requestId||worker.requestId!==requestId||!outputFile||!browserRunIdentityMatches({dir,manifestFile,outputFile,requestId,manifest}))throw new Error('待续接图片请求身份不一致；原记录已保留，不会重新执行。');
   const preAcceptance=manifest.state==='queued'&&manifest.accepted!==true&&manifest.submitted!==true&&Number(manifest.referenceCount)===0&&!manifest.acceptedAt&&!manifest.readyAt&&!manifest.submittedAt&&!manifest.downloadedAt&&!manifest.artifactPath;
@@ -397,11 +398,15 @@ export async function resumeChatGptWebJob({codexBin,dir,signal,timeoutMs=900000,
   const instructionFile=String(worker.instructionFile||path.join(dir,'prompt.txt')),nextInstruction=typeof instruction==='string'&&instruction.trim()?instruction:fs.readFileSync(instructionFile,'utf8'),archive=preAcceptance?archivePreAcceptanceAttempt(dir,manifest,execution):archiveConfirmedUnsentAttempt(dir,manifest,execution,audit),resumedAt=new Date().toISOString();
   if(audit&&!(typeof instruction==='string'&&instruction.trim()))throw new Error('已确认未发送的续接缺少更新后执行指令；原记录已保留。');
   fs.writeFileSync(instructionFile,nextInstruction,{mode:0o600});
-  const resumePatch={...manifest,state:'queued',accepted:false,submitted:false,submissionIntent:false,submissionUncertain:false,preSubmissionFailure:false,referenceCount:0,acceptedAt:null,readyAt:null,submissionAttemptAt:null,submittedAt:null,downloadedAt:null,artifactPath:null,errorCode:null,error:null,resumeCount:Number(manifest.resumeCount||0)+1,resumedAt};
-  if(preAcceptance)resumePatch.lastPreAcceptanceAttempt=archive;else {resumePatch.lastConfirmedUnsentAttempt=archive;resumePatch.confirmedUnsentAudit='web-audit.json';}
-  writeJson(manifestFile,resumePatch);
+  const resumeArgs={resumeCount:Number(manifest.resumeCount||0)+1,resumedAt,...(preAcceptance?{lastPreAcceptanceAttempt:archive}:{lastConfirmedUnsentAttempt:archive,confirmedUnsentAudit:'web-audit.json'})};
+  patchManifestState(manifestFile,'resume',resumeArgs);
   let result,failure;
   try{result=await runCodex({codexBin,dir,image:true,browserMode:'chrome',signal,timeoutMs,model:model||worker.executorModel||null,reasoningEffort:reasoningEffort||worker.executorReasoningEffort||WEB_IMAGE_EXECUTOR_EFFORT,role:role||worker.role||WEB_IMAGE_EXECUTOR_ROLE,writableDirs:[path.dirname(outputFile)],prompt:nextInstruction});}catch(error){failure=error;}
-  const after=readWebManifest(manifestFile);if(after?.requestId===requestId&&!after.resumeCount)writeJson(manifestFile,{...after,resumeCount:Number(manifest.resumeCount||0)+1,resumedAt,...(preAcceptance?{lastPreAcceptanceAttempt:archive}:{lastConfirmedUnsentAttempt:archive,confirmedUnsentAudit:'web-audit.json'})});
-  return finalizeWorkerResult({dir,manifestFile,outputFile,requestId,result,failure,model:model||worker.executorModel||null,reasoningEffort:reasoningEffort||worker.executorReasoningEffort||WEB_IMAGE_EXECUTOR_EFFORT,role:role||worker.role||WEB_IMAGE_EXECUTOR_ROLE});
+  const finalResult=finalizeWorkerResult({dir,manifestFile,outputFile,requestId,result,failure,model:model||worker.executorModel||null,reasoningEffort:reasoningEffort||worker.executorReasoningEffort||WEB_IMAGE_EXECUTOR_EFFORT,role:role||worker.role||WEB_IMAGE_EXECUTOR_ROLE});
+  try{
+    patchManifestState(manifestFile,'metadata',resumeArgs);
+    const restored=readWebManifest(manifestFile);
+    if(restored)finalResult.manifest=restored;
+  }catch{}
+  return finalResult;
 }

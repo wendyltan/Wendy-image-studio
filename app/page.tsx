@@ -3013,7 +3013,8 @@ function WorkflowStatus({
     failed_no_output: '本次没有取得图片',
     running: '进行中',
     artifact_saved: '原图已保存',
-    artifact_saved_unchecked: '原图已保存，等待检查',
+    artifact_saved_unchecked: '原图已保存，自动校对未完成',
+    review_required: '原图已保存，等待人工查看',
     completed: '已完成',
     recovered_local: '已找回原图',
     review_failed: '检查未完成',
@@ -3068,11 +3069,17 @@ function WorkflowStatus({
           ? '后台已接单，但当前网页生图请求已失败；请求记录和原图找回入口仍保留。'
           : '网页生图请求已失败；请求记录和原图找回入口仍保留。')
       : '';
+  const savedArtifactQaUnavailable =
+    task?.status === 'artifact_saved_unchecked' ||
+    task?.status === 'review_required' ||
+    task?.errorCode === 'QA_UNAVAILABLE';
   const statusMessage =
     webFailureText ||
-    (task?.status === 'not_accepted'
-      ? '后台尚未确认接单，已停止本机等待；请求已保留，不会自动重试。'
-      : webText || project.message);
+    (savedArtifactQaUnavailable
+      ? '原图已保存，自动校对未完成，请人工查看；不会自动重生'
+      : task?.status === 'not_accepted'
+        ? '后台尚未确认接单，已停止本机等待；请求已保留，不会自动重试。'
+        : webText || project.message);
   const uploadUnavailable =
     project.lastFailure?.kind === 'browser-upload-unavailable' ||
     task?.errorCode === 'browser-upload-unavailable' ||

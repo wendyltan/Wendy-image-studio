@@ -5,6 +5,10 @@ import {DATA,REFS,FACE,CHECKS,jsonWrite,inside,rules,digest,validatePlan,PLAN_SC
 import {runCodex,pythonRun,rateLimitSnapshot,readGenerationEvidence,generationDiagnosticSummary,findCodex} from './bridge.mjs';
 import {JobStore} from './job-store.mjs';
 import {WEB_IMAGE_PROVIDER,WEB_IMAGE_EXECUTOR_ROLE,WEB_IMAGE_EXECUTOR_EFFORT,chatGptWebImagePrompt,dispatchChatGptWebJob,resumeChatGptWebJob,confirmedUnsentWebAudit,readWebManifest,webWorkerStatus} from './chatgpt-web-provider.mjs';
+import {readRunIdentity,compareRunIdentity,readRunEvidence} from './run-identity.mjs';
+import {IMAGE_OUTCOME,SAVED_ARTIFACT_QA_MESSAGE,SavedArtifactQaUnavailableError,savedArtifactQaUnavailable} from './image-lifecycle.mjs';
+import {buildRevisionPrompt,revisionPromptTelemetry} from './revision-prompt.mjs';
+export {buildRevisionPrompt,revisionPromptTelemetry};
 export const active = new Map();
 export const COMPOSITION_VERSION='no-page-title-v1';
 const runningProjects = new Map();
@@ -160,7 +164,7 @@ export function job(p,phase,fn){
       p.queueJob={id:queued.id,status:'running',phase,queuedAt:queued.queuedAt,startedAt:claimed.startedAt};p.status=phase;p.progress={...p.progress,phase,startedAt:claimed.startedAt,completedAt:null};saveProject(p);
       beat=setInterval(()=>jobStore.heartbeat(queued.id,queueOwner),5000);
       try{await fn(controller.signal);finishProgressStage(p,'completed');jobStore.finish(queued.id,queueOwner,'completed');}
-      catch(e){const quotaPause=e.code==='LOW_QUOTA'||e.code==='QUOTA_REFRESH_REQUIRED'||e.code===USAGE_LIMIT_BEFORE_START;p.status=controller.signal.aborted||quotaPause?'paused':'attention';p.error=String(e.message||e).slice(0,2000);p.message=p.error;p.progress={...p.progress,completedAt:new Date().toISOString()};finishProgressStage(p,p.status==='paused'?'paused':'failed');if(p.currentTask?.status==='running')finishTask(p,p.currentTask,p.status==='paused'?'paused':'failed',{error:p.error});saveProject(p);jobStore.finish(queued.id,queueOwner,controller.signal.aborted||quotaPause?'paused':'failed',{error:p.error});}
+      catch(e){const savedArtifactQA=e instanceof SavedArtifactQaUnavailableError||e?.outcome===IMAGE_OUTCOME.ARTIFACT_SAVED_UNCHECKED||e?.outcome===IMAGE_OUTCOME.REVIEW_REQUIRED;if(savedArtifactQA){p.status='attention';p.error=SAVED_ARTIFACT_QA_MESSAGE;p.message=SAVED_ARTIFACT_QA_MESSAGE;p.progress={...p.progress,completedAt:new Date().toISOString()};finishProgressStage(p,'completed');saveProject(p);jobStore.finish(queued.id,queueOwner,'completed',{outcome:e?.outcome||IMAGE_OUTCOME.ARTIFACT_SAVED_UNCHECKED});}else{const quotaPause=e.code==='LOW_QUOTA'||e.code==='QUOTA_REFRESH_REQUIRED'||e.code===USAGE_LIMIT_BEFORE_START;p.status=controller.signal.aborted||quotaPause?'paused':'attention';p.error=String(e.message||e).slice(0,2000);p.message=p.error;p.progress={...p.progress,completedAt:new Date().toISOString()};finishProgressStage(p,p.status==='paused'?'paused':'failed');if(p.currentTask?.status==='running')finishTask(p,p.currentTask,p.status==='paused'?'paused':'failed',{error:p.error});saveProject(p);jobStore.finish(queued.id,queueOwner,controller.signal.aborted||quotaPause?'paused':'failed',{error:p.error});}}
     }finally{if(beat)clearInterval(beat);p.queueJob=null;try{saveProject(p);}finally{active.delete(p.id);runningProjects.delete(p.id);}}
   };
   queueTail=queueTail.catch(()=>{}).then(run);return p;
@@ -232,10 +236,6 @@ async function prepareWebAttachments(p,dir,sourceFiles,cachePlan){
   const cacheFile=path.join(versionDir(p),'上传附件缓存.json');let existing=[];try{existing=JSON.parse(fs.readFileSync(cacheFile,'utf8')).files||[];}catch{}const merged=new Map(existing.filter(item=>item?.sourceSha256&&item.file).map(item=>[item.sourceSha256,item]));for(const [index,item] of prepared.entries()){if(!item?.file)continue;let relative;try{relative=path.relative(projectDir(p.id),inside(projectDir(p.id),item.file));}catch{continue;}merged.set(cachePlan?.sourceSha256s?.[index]||checksum(sourceFiles[index]),{sourceSha256:cachePlan?.sourceSha256s?.[index]||checksum(sourceFiles[index]),file:relative,optimized:item.optimized===true,sizeBytes:Number(item.sizeBytes)||fs.statSync(item.file).size,updatedAt:new Date().toISOString()});}jsonWrite(cacheFile,{schemaVersion:1,files:[...merged.values()].slice(-200)});
   return prepared;
 }
-export function buildRevisionPrompt(basePrompt,note,{key='',baseFile=null}={}){
-  const source=baseFile?`本次明确选定的编辑基图：${String(baseFile)}`:'本次明确选定的编辑基图为第一项附件';
-  return `冻结原始分镜提示词（只读基准，不得改写）：\n${String(basePrompt||'')}\n\n用户已确认本次修改（独立差异，唯一允许改变的内容）：\n${String(note||'')}\n\n编辑身份与安全约束：${source}；只改本次差异，其他人物身份、面容、发型、服装、动作、视线、场景、物件、光线、画幅、构图、风格、无文字要求和安全区全部保持不变。不要把之前失败的修订稿、历史任务或其他会话要求叠加进来；不要自行修复未列出的内容。目标分镜：${String(key||'当前分镜')}。`;
-}
 function executorLimitFor(limits,executorModel){
   if(!executorModel||!limits?.byLimitId||typeof limits.byLimitId!=='object')return null;
   const matches=Object.entries(limits.byLimitId).filter(([id,bucket])=>id!=='codex'&&bucket?.normalModelSlug===executorModel);
@@ -296,43 +296,21 @@ function invalidateArtifacts(p,ids){
 }
 function repairActions(report){return new Set((report?.issueDetails||[]).filter(x=>x.severity==='blocking'||x.severity==='review').map(x=>x.repairAction));}
 function runEvidence(dir){
-  const response=path.join(dir||'','response.txt'),events=path.join(dir||'','events.jsonl');let text='',eventText='',browserText='',usage=null;
-  if(response&&fs.existsSync(response))text=fs.readFileSync(response,'utf8');
-  if(events&&fs.existsSync(events)){
-    eventText=fs.readFileSync(events,'utf8');
-    for(const line of eventText.split('\n')){try{const e=JSON.parse(line);if(e.type==='turn.completed'&&e.usage)usage=e.usage;const item=e?.item||e,server=String(item?.server||item?.serverName||'').toLowerCase(),tool=String(item?.tool||item?.name||'').toLowerCase();if(item?.type==='mcp_tool_call'&&(server==='cua_repl'||server.includes('browser')||tool==='browser')&&(!tool||tool==='js'||tool==='browser')){const content=Array.isArray(item.result?.content)?item.result.content:[];browserText+=content.filter(block=>block?.type==='text'&&typeof block.text==='string').map(block=>block.text).join('\n')+'\n';}}catch{}}
-  }
-  return {text,eventText,browserText,usage};
-}
-function sameRunIdentity(left,right,key){
-  if(left===undefined||left===null||left===''||right===undefined||right===null||right==='')return true;
-  return key==='projectVersion'?Number(left)===Number(right):String(left)===String(right);
+  const durable=readRunEvidence(dir||''),text=durable.responseText,eventText=durable.eventsText;let browserText='',usage=null;
+  for(const e of durable.events){if(e.type==='turn.completed'&&e.usage)usage=e.usage;const item=e?.item||e,server=String(item?.server||item?.serverName||'').toLowerCase(),tool=String(item?.tool||item?.name||'').toLowerCase();if(item?.type==='mcp_tool_call'&&(server==='cua_repl'||server.includes('browser')||tool==='browser')&&(!tool||tool==='js'||tool==='browser')){const content=Array.isArray(item.result?.content)?item.result.content:[];browserText+=content.filter(block=>block?.type==='text'&&typeof block.text==='string').map(block=>block.text).join('\n')+'\n';}}
+  return {text,eventText,browserText,usage,parseErrors:durable.parseErrors};
 }
 function matchingWebRunRecord(pending){
   if(!pending?.dir)return null;
   try{
-    const dir=path.resolve(pending.dir),projectRoot=path.resolve(dir,'..','..'),request=JSON.parse(fs.readFileSync(path.join(dir,'request.json'),'utf8')),worker=JSON.parse(fs.readFileSync(path.join(dir,'worker-request.json'),'utf8')),manifest=readWebManifest(path.join(dir,'web-generation.json'));let execution=null;try{execution=JSON.parse(fs.readFileSync(path.join(dir,'execution.json'),'utf8'));}catch{}
-    if(request.provider!==WEB_IMAGE_PROVIDER||worker.provider!==WEB_IMAGE_PROVIDER||manifest?.provider!==WEB_IMAGE_PROVIDER||!manifest.requestId||worker.requestId!==manifest.requestId)return null;
-    if(request.taskId!==pending.taskId||pending.projectId!==request.projectId||request.projectId!==pending.projectId||Number(request.projectVersion)!==Number(pending.projectVersion)||request.target!==pending.key)return null;
-    const runId=path.basename(dir),modern=Boolean(worker.runId||worker.outputFile||manifest.runId||execution?.runId);
-    if(modern&&(!worker.manifestFile||!worker.outputFile||!worker.runId||!manifest.runId||!execution?.runId))return null;
+    const dir=path.resolve(pending.dir),record=readRunIdentity(dir),{request,worker,execution}=record,manifest=readWebManifest(path.join(dir,'web-generation.json'));
+    if(Object.keys(record.parseErrors||{}).length||!request||!worker||!manifest)return null;
+    if(request.provider!==WEB_IMAGE_PROVIDER||worker.provider!==WEB_IMAGE_PROVIDER||manifest.provider!==WEB_IMAGE_PROVIDER||!manifest.requestId||worker.requestId!==manifest.requestId)return null;
+    const expected={projectId:pending.projectId??request.projectId,projectVersion:pending.projectVersion??request.projectVersion,taskId:pending.taskId??request.taskId,target:pending.key??request.target,requestId:manifest.requestId,runId:record.runId};
+    const outputFile=pending.file||worker.outputFile||record.expectedOutput;if(outputFile)expected.outputFile=path.resolve(String(outputFile));
+    const comparison=compareRunIdentity({record,expected});if(!comparison.ok)return null;
     if(worker.manifestFile&&path.resolve(worker.manifestFile)!==path.join(dir,'web-generation.json'))return null;
-    if(worker.runId!==undefined&&String(worker.runId)!==runId)return null;
-    if(manifest.runId!==undefined&&String(manifest.runId)!==runId)return null;
-    if(execution?.runId!==undefined&&String(execution.runId)!==runId)return null;
-    if(worker.taskId!==undefined&&!sameRunIdentity(worker.taskId,request.taskId,'taskId'))return null;
-    if(worker.projectId!==undefined&&!sameRunIdentity(worker.projectId,request.projectId,'projectId'))return null;
-    if(worker.projectVersion!==undefined&&!sameRunIdentity(worker.projectVersion,request.projectVersion,'projectVersion'))return null;
-    if(worker.target!==undefined&&!sameRunIdentity(worker.target,request.target,'target'))return null;
-    for(const key of ['projectId','projectVersion','taskId','target']){
-      if(manifest[key]!==undefined&&!sameRunIdentity(manifest[key],request[key],key))return null;
-    }
-    const expectedOutput=request.expectedOutput?path.resolve(projectRoot,String(request.expectedOutput)):null,workerOutput=worker.outputFile?path.resolve(worker.outputFile):null,pendingOutput=pending.file?path.resolve(pending.file):null;
-    if(expectedOutput&&workerOutput&&expectedOutput!==workerOutput)return null;
-    if(pendingOutput&&workerOutput&&pendingOutput!==workerOutput)return null;
-    if(modern&&(!workerOutput||!expectedOutput||(pendingOutput&&expectedOutput!==pendingOutput)))return null;
-    if(manifest.artifactPath&&workerOutput&&path.resolve(manifest.artifactPath)!==workerOutput)return null;
-    return {dir,request,worker,manifest,execution,runId};
+    return {dir,request,worker,manifest,execution,runId:record.runId,identity:comparison};
   }catch{return null;}
 }
 function matchingPendingManifest(pending){
@@ -684,6 +662,48 @@ async function verifyImage(file){
   if(!extension)throw new Error('已找到的文件不是可用的 PNG、JPG 或 WebP 图片。');
   return {...info,extension,sizeBytes:fs.statSync(file).size,sha256:checksum(file)};
 }
+/**
+ * Read-only evidence gate for an image whose manifest was damaged after the
+ * browser downloaded it.  This function never attaches, retries, or changes a
+ * project; a user-facing recovery action may call it and then explicitly
+ * adopt the returned file.  Every modern record must still agree on the
+ * request/task/project/run/output binding, while old records can omit fields
+ * that did not exist when they were created.
+ */
+export async function inspectOrphanImageEvidence({dir,file=null,expected={}}={}){
+  const reasons=[];let record=null,integrity=null;
+  try{record=readRunIdentity(dir,{strict:true});}
+  catch(error){return {status:'not_recoverable',reasons:[error.message],requiresUserAction:true,canAutoAdopt:false};}
+  if(Object.keys(record.parseErrors||{}).length)reasons.push('执行记录含有非法 JSON。');
+  const {request,worker,manifest,execution}=record;
+  if(!request||!worker||!manifest||!execution)reasons.push('request、worker、manifest 或 execution 记录不完整。');
+  const output=record.expectedOutput;
+  const target=file?path.resolve(String(file)):output;
+  if(!output||!target||target!==output)reasons.push('候选原图路径与 expectedOutput 不一致。');
+  if(target&&!fs.existsSync(target))reasons.push('expectedOutput 文件不存在。');
+  else if(target&&!fs.statSync(target).isFile())reasons.push('expectedOutput 不是普通文件。');
+  if(request?.provider!==undefined&&request.provider!==WEB_IMAGE_PROVIDER)reasons.push('request provider 不匹配。');
+  if(worker?.provider!==WEB_IMAGE_PROVIDER||manifest?.provider!==WEB_IMAGE_PROVIDER)reasons.push('网页执行器 provider 不匹配。');
+  const expectedIdentity={projectId:expected.projectId??request?.projectId,projectVersion:expected.projectVersion??request?.projectVersion,taskId:expected.taskId??request?.taskId,target:expected.target??request?.target,requestId:expected.requestId??manifest?.requestId,runId:record.runId,outputFile:output};
+  const comparison=compareRunIdentity({record,expected:expectedIdentity,requireModern:false});
+  if(!comparison.ok)reasons.push(...comparison.issues);
+  if(!request?.requestId||String(request.requestId)!==String(manifest?.requestId||''))reasons.push('request.requestId 缺失或不匹配。');
+  if(!request?.runId||String(request.runId)!==record.runId)reasons.push('request.runId 缺失或不匹配。');
+  if(!worker?.runId||String(worker.runId)!==record.runId)reasons.push('worker.runId 缺失或不匹配。');
+  if(!worker?.outputFile||path.resolve(String(worker.outputFile))!==output)reasons.push('worker.outputFile 缺失或不匹配。');
+  if(!execution?.runId||String(execution.runId)!==record.runId)reasons.push('execution.runId 缺失或不匹配。');
+  if(!request?.expectedOutput)reasons.push('request.expectedOutput 缺失。');
+  if(!worker?.requestId||!manifest?.requestId||worker.requestId!==manifest.requestId)reasons.push('requestId 缺失或不一致。');
+  if(manifest?.state!=='downloaded'||manifest?.submitted!==true)reasons.push('manifest 没有已提交且已下载的正向证据。');
+  if(manifest?.artifactPath&&path.resolve(String(manifest.artifactPath))!==output)reasons.push('manifest.artifactPath 与 expectedOutput 不匹配。');
+  if(!reasons.length){
+    try{integrity=await verifyImage(target);}
+    catch(error){reasons.push(`原图无法解码：${error.message}`);}
+  }
+  if(integrity&&expected.sha256&&integrity.sha256!==expected.sha256)reasons.push('原图 SHA-256 与用户指定值不匹配。');
+  if(reasons.length)return {status:'not_recoverable',reasons:[...new Set(reasons)],requiresUserAction:true,canAutoAdopt:false,identity:comparison.identity,file:target||null};
+  return {status:'recoverable_orphan',requiresUserAction:true,canAutoAdopt:false,file:target,integrity,identity:comparison.identity,manifestState:manifest.state,requestId:manifest.requestId};
+}
 async function persistImage(source,target){
   if(!fs.existsSync(source))return null;
   const temp=`${target}.partial-${crypto.randomUUID()}`;fs.copyFileSync(source,temp);
@@ -698,7 +718,7 @@ function writeRunRequest(dir,p,task,pending){
   jsonWrite(path.join(dir,'request.json'),{schemaVersion:2,provider:pending.provider||'legacy',taskId:task.id,attempt:task.attempt,target:pending.key,createdAt:pending.at,projectId:p.id,
     projectVersion:p.version,expectedOutput:path.relative(projectDir(p.id),pending.file),model:pending.executorModel||p.brief.model||null,reasoningEffort:pending.executorReasoningEffort||WEB_IMAGE_EXECUTOR_EFFORT,role:WEB_IMAGE_EXECUTOR_ROLE,
     creativeModel:p.brief.model||null,creativeReasoningEffort:p.brief.reasoningEffort||null,executorModel:pending.executorModel||p.brief.model||null,executorReasoningEffort:pending.executorReasoningEffort||WEB_IMAGE_EXECUTOR_EFFORT,
-    promptSha256:pending.telemetry.promptSha256,promptCharacters:pending.telemetry.promptCharacters,basePromptSha256:pending.telemetry.basePromptSha256||null,revisionDeltaSha256:pending.telemetry.revisionDeltaSha256||null,revisionDeltaCharacters:pending.telemetry.revisionDeltaCharacters||0,referenceNames:pending.refs,referenceFiles:pending.inputFiles.map(summarize),editTarget:pending.prior?summarize(pending.prior):null,source:task.source,revisionBase:pending.revisionBase||null,preparation:pending.telemetry.preparation||null});
+    promptSha256:pending.telemetry.promptSha256,promptCharacters:pending.telemetry.promptCharacters,revisionPromptVersion:pending.telemetry.revisionPromptVersion||null,revisionPromptSha256:pending.telemetry.revisionPromptSha256||null,revisionPromptCharacters:pending.telemetry.revisionPromptCharacters||null,revisionPromptSource:pending.telemetry.revisionPromptSource||null,revisionPromptSourceSegments:pending.telemetry.revisionPromptSourceSegments||null,basePromptSha256:pending.telemetry.basePromptSha256||null,revisionDeltaSha256:pending.telemetry.revisionDeltaSha256||null,revisionDeltaCharacters:pending.telemetry.revisionDeltaCharacters||0,referenceNames:pending.refs,referenceFiles:pending.inputFiles.map(summarize),editTarget:pending.prior?summarize(pending.prior):null,source:task.source,revisionBase:pending.revisionBase||null,preparation:pending.telemetry.preparation||null});
 }
 function previousConversation(prior){
   if(!prior)return null;
@@ -739,7 +759,8 @@ async function generate(p,key,prompt,refnames,signal,prior=null,verify=true,qaKi
   const basePrompt=String(revisionMeta.basePrompt||prompt),revisionDelta=revisionMeta.revisionDelta?String(revisionMeta.revisionDelta):null,prepStartedAt=new Date().toISOString(),cachePlan=preparedCacheFor(p,sourceFiles,prior);
   activity(p,`正在整理并压缩${cachePlan.missing.length}个上传素材${cachePlan.cacheHits?`，复用${cachePlan.cacheHits}个已准备附件`:''}…`);
   const prepared=await prepareWebAttachments(p,dir,sourceFiles,cachePlan),preparation={startedAt:prepStartedAt,completedAt:new Date().toISOString(),durationMs:Math.max(0,Date.now()-Date.parse(prepStartedAt)),sourceCount:sourceFiles.length,preparedCount:prepared.length,reusedCount:cachePlan.cacheHits,preparedCountThisRun:cachePlan.missing.length};const inputFiles=prepared.map(item=>item.file);checkpoint(signal);
-  const telemetry=promptTelemetry(prompt,refs,{requestedReferenceCount:refnames.length,source:prior?'edit':'generate',basePromptSha256:promptHash(basePrompt),revisionDeltaSha256:revisionDelta?promptHash(revisionDelta):null,revisionDeltaCharacters:revisionDelta?.length||0,preparation,preparedAttachments:prepared.map((item,index)=>({sourceSha256:cachePlan.sourceSha256s[index],file:path.relative(projectDir(p.id),item.file),optimized:item.optimized===true,sizeBytes:Number(item.sizeBytes)||0,reused:item.reused===true})),uploadOriginalBytes:sourceFiles.reduce((n,item)=>n+fs.statSync(item).size,0),uploadPreparedBytes:prepared.reduce((n,item)=>n+Number(item.sizeBytes||0),0),optimizedAttachmentCount:prepared.filter(item=>item.optimized).length});const task=beginTask(p,'image',key,{attempt,provider:WEB_IMAGE_PROVIDER,providerInvocationLimit:1,providerInvocations:0,source:prior?'edit':'generate',role:WEB_IMAGE_EXECUTOR_ROLE,creativeModel:p.brief.model||null,creativeReasoningEffort:p.brief.reasoningEffort||null,executorModel:executor.model,executorReasoningEffort:executor.reasoningEffort,basePrompt,revisionDelta,revisionBase:revisionMeta.revisionBase||null,telemetry});const pending={key,file,dir,prompt,basePrompt,revisionDelta,revisionBase:revisionMeta.revisionBase||null,refs:refnames,inputFiles,sourceFiles,prior,provider:WEB_IMAGE_PROVIDER,executorModel:executor.model,executorReasoningEffort:executor.reasoningEffort,taskId:task.id,projectId:p.id,projectVersion:p.version,telemetry,at:new Date().toISOString()};
+  const revisionTelemetry=revisionDelta?revisionPromptTelemetry(prompt,{basePrompt,note:revisionDelta}):{};
+  const telemetry=promptTelemetry(prompt,refs,{requestedReferenceCount:refnames.length,source:prior?'edit':'generate',basePromptSha256:promptHash(basePrompt),revisionDeltaSha256:revisionDelta?promptHash(revisionDelta):null,revisionDeltaCharacters:revisionDelta?.length||0,...revisionTelemetry,preparation,preparedAttachments:prepared.map((item,index)=>({sourceSha256:cachePlan.sourceSha256s[index],file:path.relative(projectDir(p.id),item.file),optimized:item.optimized===true,sizeBytes:Number(item.sizeBytes)||0,reused:item.reused===true})),uploadOriginalBytes:sourceFiles.reduce((n,item)=>n+fs.statSync(item).size,0),uploadPreparedBytes:prepared.reduce((n,item)=>n+Number(item.sizeBytes||0),0),optimizedAttachmentCount:prepared.filter(item=>item.optimized).length});const task=beginTask(p,'image',key,{attempt,provider:WEB_IMAGE_PROVIDER,providerInvocationLimit:1,providerInvocations:0,source:prior?'edit':'generate',role:WEB_IMAGE_EXECUTOR_ROLE,creativeModel:p.brief.model||null,creativeReasoningEffort:p.brief.reasoningEffort||null,executorModel:executor.model,executorReasoningEffort:executor.reasoningEffort,basePrompt,revisionDelta,revisionBase:revisionMeta.revisionBase||null,telemetry});const pending={key,file,dir,prompt,basePrompt,revisionDelta,revisionBase:revisionMeta.revisionBase||null,refs:refnames,inputFiles,sourceFiles,prior,provider:WEB_IMAGE_PROVIDER,executorModel:executor.model,executorReasoningEffort:executor.reasoningEffort,taskId:task.id,projectId:p.id,projectVersion:p.version,telemetry,at:new Date().toISOString()};
   writeRunRequest(dir,p,task,pending);p.pending=pending;p.lastFailure=null;saveProject(p);
   activity(p,`正在打开专用生图页面并上传${inputFiles.length}个素材…`);
   let failure,made=null;const manifestFile=path.join(dir,'web-generation.json'),conversationUrl=previousConversation(prior),capsule=fs.readFileSync(path.join(versionDir(p),'制作提示词胶囊.txt'),'utf8');
@@ -792,8 +813,13 @@ async function generate(p,key,prompt,refnames,signal,prior=null,verify=true,qaKi
     const check=await qa(p,file,prompt,refs,signal,qaKind);
     record.qa=check;jsonWrite(file+'.json',record);finishTask(p,task,'completed',{artifact:file,qa:check.pass?'passed':'needs_review'});saveProject(p);return record;
   }catch(error){
-    record.qa={...record.qa,status:'unavailable',summary:'原图已保存，但自动画面校对没有完成。可在网页中查看并决定下一步。',qaError:String(error.message||error).slice(0,500)};
-    jsonWrite(file+'.json',record);finishTask(p,task,'artifact_saved_unchecked',{artifact:file,qa:'unavailable',error:String(error.message||error).slice(0,500)});saveProject(p);throw error;
+    if(signal.aborted){
+      record.qa={...record.qa,status:'unavailable',summary:'原图已保存，但本次任务已暂停，尚未自动校对。',qaError:String(error.message||error).slice(0,500)};
+      jsonWrite(file+'.json',record);finishTask(p,task,IMAGE_OUTCOME.ARTIFACT_SAVED_UNCHECKED,{artifact:file,qa:'unavailable',error:record.qa.qaError});saveProject(p);throw error;
+    }
+    const outcome=savedArtifactQaUnavailable(error,{artifact:file});
+    record.qa={...record.qa,status:outcome.qaStatus,summary:outcome.message,qaError:outcome.detail};
+    jsonWrite(file+'.json',record);writeRunResult(dir,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:task.id,attempt:task.attempt,endedAt:new Date().toISOString(),outcome:outcome.outcome,artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,errorCode:outcome.errorCode,error:outcome.detail});finishTask(p,task,outcome.outcome,{artifact:file,qa:outcome.qaStatus,error:outcome.detail,errorCode:outcome.errorCode});p.status='attention';p.message=outcome.message;p.error=outcome.message;saveProject(p);throw new SavedArtifactQaUnavailableError(error,{artifact:file});
   }
 }
 export function sampleProject(p){verifyApproval(p);return job(p,'sampling',async signal=>{
@@ -811,7 +837,7 @@ export function sampleProject(p){verifyApproval(p);return job(p,'sampling',async
     if(!current){
       activity(p,`正在绘制${label}样张（${i+1}/2）…`);
       current=await generate(p,`样张-${i+1}`,`${sample.prompt}。单幅竖图，优先3:4；若内置生图返回标准2:3竖幅，保留原图，不裁切，也不要因此再次生图。`,sample.references,signal,null,true,'方向样张');
-      p.samples[i]=current;saveProject(p);if(current.qa.pass)continue;issues=materialSampleIssues(current.qa.issues,current.qa.issueDetails||[]);
+      p.samples[i]=current;saveProject(p);if(current.qa.status==='unavailable'){p.status='attention';p.message=SAVED_ARTIFACT_QA_MESSAGE;p.error=p.message;saveProject(p);return;}if(current.qa.pass)continue;issues=materialSampleIssues(current.qa.issues,current.qa.issueDetails||[]);
       if(!issues.length){current.qa={...current.qa,pass:true,issues:[],repairPrompt:'',summary:`${current.qa.summary}；该图为方向样张，标准2:3竖幅可直接用于确认。`};saveProject(p);continue;}
     }
     if(!current.qa.pass){requireSampleDecision(p,[i]);return;}
@@ -1087,7 +1113,7 @@ function resumeSameRequestImage(p){
     jsonWrite(file+'.json',imageRecord);const panelKey=panelKeyFromImageKey(pending.key);if(panelKey)invalidatePanelDownstream(p,panelKey);recordArtifact(p,artifactIdForImageKey(pending.key),'image',imageRecord.file,[],{integrity:persisted.integrity});attachImageRecord(p,imageRecord);p.pending=null;p.lastFailure=null;finishTask(p,task,'artifact_saved',{artifact:file,qa:'pending',webState:'downloaded'});saveProject(p);
     try{
       checkpoint(signal);const check=await qa(p,file,pending.prompt,imageRefs(p,pending.refs||[]),signal,'原始分镜');imageRecord.qa=check;jsonWrite(file+'.json',imageRecord);finishTask(p,task,'completed',{artifact:file,qa:check.pass?'passed':'needs_review',webState:'downloaded'});p.status=check.pass?'paused':'attention';p.error=null;p.message=check.pass?`${pending.key} 已按原请求完成、保存并校对；本次只续接这一张。`:`${pending.key} 原图已保存，画面检查建议：${(check.issues||[]).join('；')||'请人工查看'}。本次不会自动重画。`;if(panelKey&&!check.pass)requirePanelDecision(p,panelKey,imageRecord);saveProject(p);return imageRecord;
-    }catch(error){imageRecord.qa={...imageRecord.qa,status:'unavailable',summary:'原图已保存，但自动画面校对没有完成。可在网页中查看并决定下一步。',qaError:String(error.message||error).slice(0,500)};jsonWrite(file+'.json',imageRecord);finishTask(p,task,'artifact_saved_unchecked',{artifact:file,qa:'unavailable',webState:'downloaded',error:imageRecord.qa.qaError});p.status='paused';p.message=`${pending.key} 原图已保存；自动画面校对未完成，本次不会重新生图。`;saveProject(p);return imageRecord;}
+    }catch(error){const outcome=savedArtifactQaUnavailable(error,{artifact:file,webState:'downloaded'});imageRecord.qa={...imageRecord.qa,status:outcome.qaStatus,summary:outcome.message,qaError:outcome.detail};jsonWrite(file+'.json',imageRecord);writeRunResult(pending.dir,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:task.id,requestId:webManifest.requestId,endedAt:new Date().toISOString(),outcome:outcome.outcome,artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,errorCode:outcome.errorCode,error:outcome.detail});finishTask(p,task,outcome.outcome,{artifact:file,qa:outcome.qaStatus,webState:'downloaded',error:outcome.detail,errorCode:outcome.errorCode});p.status='attention';p.message=outcome.message;p.error=outcome.message;saveProject(p);return imageRecord;}
   });
 }
 export function resume(p){if(p.pending){
@@ -1167,8 +1193,20 @@ export function recoverImage(p){verifyApproval(p);if(!p.pending)throw new Error(
   const recoveryIdentity={projectId:p.id,projectVersion:p.version,target:pending.key,...(webManifest?{requestId:webManifest.requestId||null,acceptanceState:webManifest.state,accepted:webManifest.accepted===true,acceptedAt:webManifest.acceptedAt||null,submitted:webManifest.submitted===true,submittedAt:webManifest.submittedAt||null}: {})};
   let file=pending.file;
   const {evidence,candidates}=attributableCandidates(pending);
-  let persisted=null;
-  if(candidates.length===1)persisted=await persistImage(candidates[0],file);
+  let persisted=null,orphanEvidence=null;
+  // A downloaded web artifact is only eligible for this explicit recovery
+  // action after the complete durable identity chain has been rechecked. This
+  // keeps the existing UI entry local-only while preventing a stale or
+  // cross-run file from being adopted merely because it exists at the target.
+  if(pending.provider===WEB_IMAGE_PROVIDER&&webManifest?.state==='downloaded'){
+    orphanEvidence=await inspectOrphanImageEvidence({dir:pending.dir,file,expected:{projectId:p.id,projectVersion:p.version,taskId:pending.taskId,target:pending.key,requestId:webManifest.requestId}});
+    if(orphanEvidence.status!=='recoverable_orphan'){
+      writeRunResult(pending.dir,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:pending.taskId||null,endedAt:new Date().toISOString(),outcome:'artifact_still_unknown',...recoveryIdentity,evidenceStatus:orphanEvidence.status,reasons:orphanEvidence.reasons||[],diagnostics:generationDiagnosticSummary(evidence)});
+      throw new Error(`已保存文件未通过本次 request、执行器、下载结果和完整性核验，原图与记录已保留；不会自动采用或重生。${(orphanEvidence.reasons||[]).slice(0,3).join('；')}`);
+    }
+  }
+  if(orphanEvidence?.status==='recoverable_orphan')persisted=await persistImage(orphanEvidence.file,file);
+  else if(candidates.length===1)persisted=await persistImage(candidates[0],file);
   if(!persisted){
     writeRunResult(pending.dir,{schemaVersion:2,provider:pending.provider||'legacy',taskId:pending.taskId||null,endedAt:new Date().toISOString(),outcome:'artifact_still_unknown',...recoveryIdentity,diagnostics:generationDiagnosticSummary(evidence),candidateCount:candidates.length,candidateNames:candidates.map(candidate=>path.basename(candidate))});
     const known=definiteImageFailure(pending);
@@ -1201,8 +1239,13 @@ export function reviewImage(p,key){
       jsonWrite(file+'.json',record);finishTask(p,task,'completed',{artifact:file,qa:report.pass?'passed':'needs_review'});
       p.status='paused';p.error=null;p.message=report.pass?'原图已重新校对，可以继续下一步。':'原图已重新校对，请查看建议后决定是否修改。';saveProject(p);return record;
     }catch(error){
-      record.qa={pass:null,status:'unavailable',summary:'原图仍已保存，但这次自动画面校对没有完成。',issues:[],repairPrompt:'',qaError:String(error.message||error).slice(0,500)};
-      jsonWrite(file+'.json',record);finishTask(p,task,'review_failed',{artifact:file,error:record.qa.qaError});saveProject(p);throw error;
+      if(signal.aborted){
+        record.qa={pass:null,status:'unavailable',summary:'原图仍已保存，但本次任务已暂停，尚未自动校对。',issues:[],repairPrompt:'',qaError:String(error.message||error).slice(0,500)};
+        jsonWrite(file+'.json',record);finishTask(p,task,'review_failed',{artifact:file,error:record.qa.qaError});saveProject(p);throw error;
+      }
+      const outcome=savedArtifactQaUnavailable(error,{artifact:file,taskStatus:IMAGE_OUTCOME.REVIEW_REQUIRED});
+      record.qa={pass:null,status:outcome.qaStatus,summary:outcome.message,issues:[],repairPrompt:'',qaError:outcome.detail};
+      jsonWrite(file+'.json',record);finishTask(p,task,outcome.outcome,{artifact:file,error:outcome.detail,errorCode:outcome.errorCode});p.status='attention';p.message=outcome.message;p.error=outcome.message;saveProject(p);throw new SavedArtifactQaUnavailableError(error,{artifact:file,taskStatus:IMAGE_OUTCOME.REVIEW_REQUIRED});
     }
   });
 }

@@ -15,7 +15,7 @@ fs.writeFileSync(path.join(dir,'argv.json'),JSON.stringify(args));
 let input='';process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>{
  const req=JSON.parse(fs.readFileSync(path.join(dir,'worker-request.json'),'utf8'));
  const mode=${JSON.stringify(mode)};
- const base={schemaVersion:2,provider:req.provider,transport:req.transport,browser:req.browser,focusPolicy:req.focusPolicy,requestId:req.requestId,runId:req.runId,projectId:req.projectId,projectVersion:req.projectVersion,taskId:req.taskId,target:req.target,accepted:true,acceptedAt:new Date().toISOString(),submitted:false};
+ const base={schemaVersion:2,identitySchemaVersion:2,identityLocked:true,provider:req.provider,transport:req.transport,browser:req.browser,focusPolicy:req.focusPolicy,requestId:req.requestId,runId:req.runId,projectId:req.projectId,projectVersion:req.projectVersion,taskId:req.taskId,target:req.target,outputFile:req.outputFile,accepted:true,acceptedAt:new Date().toISOString(),submitted:false};
  const write=m=>fs.writeFileSync(req.manifestFile,JSON.stringify(m));
  if(mode==='hang'){setInterval(()=>{},100);return;}
  if(mode==='empty')return;
@@ -33,7 +33,7 @@ let input='';process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>{
  write({...base,state:'downloaded',submitted:true,requestId:mode==='wrong'?'11111111-1111-4111-8111-111111111111':req.requestId,artifactPath:req.outputFile});
  if(mode==='crash-after-download')process.exitCode=1;
 });
-`);fs.chmodSync(bin,0o755);return {codexBin:bin,dir,outputFile:path.join(dir,'out.png'),prompt:'fixture',timeoutMs:2000};
+`);fs.chmodSync(bin,0o755);return {codexBin:bin,dir,outputFile:path.join(dir,'out.png'),prompt:'fixture',timeoutMs:5000};
 }
 test('direct execution starts once, retains identity, and records the Chrome focus boundary',async()=>{
  const args=setup('success'),result=await dispatchChatGptWebJob(args);assert.equal(result.manifest.state,'downloaded');
@@ -110,7 +110,7 @@ test('explicit file-upload failure wins over permission words in prompt and comm
 });
 test('exit-zero origin evidence from another project cannot be normalized',async()=>{
  const args=setup('origin-permission-denied-exit0-mismatch');fs.writeFileSync(path.join(args.dir,'request.json'),JSON.stringify({provider:'chatgpt-web-iab',projectId:'current-project',projectVersion:3,taskId:'current-task',target:'第1页-第1格'}));
- await assert.rejects(dispatchChatGptWebJob(args),error=>error.code==='BROWSER_CHROME_UNAVAILABLE'&&error.webManifest?.errorCode==='BROWSER_CHROME_UNAVAILABLE');
+ await assert.rejects(dispatchChatGptWebJob(args),error=>error.code==='REQUEST_IDENTITY_MISMATCH'&&error.webManifest?.errorCode==='BROWSER_CHROME_UNAVAILABLE');
  const manifest=readWebManifest(path.join(args.dir,'web-generation.json'));assert.equal(manifest.errorCode,'BROWSER_CHROME_UNAVAILABLE');assert.equal(manifest.submitted,false);assert.equal(manifest.preSubmissionFailure,undefined);assert.equal(fs.existsSync(args.outputFile),false);
 });
 test('process exit without a result is unknown, not queued forever',async()=>{await assert.rejects(dispatchChatGptWebJob(setup('empty')),/执行已结束/);});

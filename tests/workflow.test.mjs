@@ -30,6 +30,9 @@ if(a.includes('--output-schema')){const s=JSON.parse(fs.readFileSync(a[a.indexOf
 else {const noImage=process.env.WENDI_TEST_NO_IMAGE_ONCE;if(noImage&&!fs.existsSync(noImage)){fs.writeFileSync(noImage,'1');text=process.env.WENDI_TEST_NO_IMAGE_TEXT||'未能生成：ChatGPT 网页连接错误，目标路径尚不存在。';}else{const m=p.match(/复制到准确路径 ([^\\n]+?\\.png)/)||p.match(/再输出 ([^\\n]+?\\.png)/);if(!m)process.exit(2);const file=m[1];fs.mkdirSync(path.dirname(file),{recursive:true});const r=p.match(/目标原始画面宽高比 (\\d+):(\\d+)/);const w=r?+r[1]:750,h=r?+r[2]:1000;execFileSync('/Library/Frameworks/Python.framework/Versions/3.10/bin/python3',['-c','from PIL import Image,ImageDraw; import sys; im=Image.new("RGB",(int(sys.argv[2]),int(sys.argv[3])),"#d8dfce"); ImageDraw.Draw(im).text((20,20),"PIPELINE TEST ONLY",fill="black"); im.save(sys.argv[1])',file,String(w),String(h)]);text=file;const pause=process.env.WENDI_TEST_PAUSE_AFTER_IMAGE;if(pause&&!fs.existsSync(pause)){fs.writeFileSync(pause,'1');await new Promise(resolve=>setTimeout(resolve,10000));}}}
 const usageLimit=process.env.WENDI_TEST_USAGE_LIMIT_ONCE;if(usageLimit&&!fs.existsSync(usageLimit)){fs.writeFileSync(usageLimit,'1');console.log(JSON.stringify({type:'error',message:text}));process.exit(1);}if(usageLimit&&fs.existsSync(usageLimit)&&fs.existsSync(path.join(process.cwd(),'worker-request.json'))){const req=JSON.parse(fs.readFileSync(path.join(process.cwd(),'worker-request.json'),'utf8'));const manifest=JSON.parse(fs.readFileSync(req.manifestFile,'utf8'));fs.writeFileSync(req.manifestFile,JSON.stringify({...manifest,state:'downloaded',accepted:true,acceptedAt:new Date().toISOString(),readyAt:new Date().toISOString(),submitted:true,submittedAt:new Date().toISOString(),referenceCount:req.referenceFiles.length,downloadedAt:new Date().toISOString(),artifactPath:req.outputFile,conversationUrl:'https://chatgpt.com/c/test-resume'}));}fs.writeFileSync(out,text);console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text}}));if(/Browser use cannot access\\s+https:\\/\\/chatgpt\\.com|FILE_UPLOAD_CHROME_UNAVAILABLE|UPLOAD_ERROR/i.test(text))console.log(JSON.stringify({type:'item.completed',item:{type:'mcp_tool_call',server:'cua_repl',tool:'js',result:{content:[{type:'text',text}]}}}));console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:100,cached_input_tokens:40,output_tokens:10,reasoning_output_tokens:2}}));
 `,{mode:0o700});
+// Keep the QA interruption fixture tied to the public revision-prompt shape,
+// not to an internal sentence that the remote executor must never receive.
+fs.writeFileSync(fake,fs.readFileSync(fake,'utf8').replace("panelCrash&&p.includes('用户已确认本次修改')","panelCrash&&p.includes('必须修改：')&&p.includes('可观察结果：')&&p.includes('把书放下并看向窗外')"),{mode:0o700});
 async function done(id){for(let i=0;i<200;i++){if(!E.active.has(id))return E.readProject(id);await new Promise(r=>setTimeout(r,50));}throw new Error('test job timed out');}
 function callCount(){return fs.existsSync(process.env.WENDI_TEST_CALLS)?fs.readFileSync(process.env.WENDI_TEST_CALLS,'utf8').split('\n').filter(Boolean).length:0;}
 function sha256File(file){return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');}
@@ -108,6 +111,9 @@ test('UI keeps real image errors and removes the non-blocking Chrome focus notic
   assert.match(text,/imageReady=\{data\?\.connection\.imageWorker\?\.ready !== false\}/);
   assert.doesNotMatch(text,/imageWorker\?\.focusSafe !== false/);
   assert.match(text,/网页生图当前不可用/);
+  assert.match(text,/原图已保存，自动校对未完成，请人工查看；不会自动重生/);
+  assert.match(text,/artifact_saved_unchecked: '原图已保存，自动校对未完成'/);
+  assert.match(text,/review_required: '原图已保存，等待人工查看'/);
   assert.match(text,/!imageReady && project\.status === 'review'/);
   assert.doesNotMatch(text,/专用 Chrome 标签页会短暂取得焦点/);
   assert.doesNotMatch(text,/隐藏网页浏览器能力不可用；没有上传附件或发送消息。请恢复 Codex 内嵌浏览器 IAB/);
@@ -513,6 +519,14 @@ test('recovering an existing original is local and restores a viewable sample re
   const before=callCount();E.recoverImage(restored);restored=await done(restored.id);
   assert.equal(callCount(),before);assert.equal(restored.pending,null);assert.equal(restored.samples[0].file,path.relative(E.projectDir(restored.id),file));assert(fs.existsSync(W.inside(E.projectDir(restored.id),restored.samples[0].file)));assert(restored.artifacts.some(x=>x.id==='image:样张-1'));
 });
+test('explicit web original recovery uses the full identity and integrity gate',async()=>{
+  const project=E.createProject({...brief,idea:'网页原图显式找回身份核验'});project.plan=structuredClone(plan);project.version=1;project.approved={version:1,hash:W.digest(project.plan)};project.status='attention';
+  const dir=path.join(E.projectDir(project.id),'.制作记录','完整网页原图找回'),file=path.join(E.projectDir(project.id),'v1','素材','完整网页找回.png'),relative=path.relative(E.projectDir(project.id),file),taskId='orphan-recovery-task',requestId=crypto.randomUUID(),runId=path.basename(dir),manifestFile=path.join(dir,'web-generation.json');fs.mkdirSync(dir,{recursive:true});fs.mkdirSync(path.dirname(file),{recursive:true});fs.copyFileSync(W.inside(W.REFS,W.FACE[0]),file);
+  const identity={projectId:project.id,projectVersion:1,taskId,target:'样张-1',requestId,runId,outputFile:file},write=(name,value)=>fs.writeFileSync(path.join(dir,name),JSON.stringify(value,null,2)+'\n');
+  write('request.json',{schemaVersion:2,provider:G.WEB_IMAGE_PROVIDER,identitySchemaVersion:2,identityLocked:true,...identity,expectedOutput:relative});write('worker-request.json',{schemaVersion:2,provider:G.WEB_IMAGE_PROVIDER,identitySchemaVersion:2,identityLocked:true,...identity,manifestFile});write('execution.json',{schemaVersion:1,runId,state:'completed'});write('run-identity.json',{schemaVersion:1,identitySchemaVersion:2,identityLocked:true,...identity});write('web-generation.json',{schemaVersion:2,provider:G.WEB_IMAGE_PROVIDER,identitySchemaVersion:2,identityLocked:true,...identity,state:'downloaded',accepted:true,submitted:true,artifactPath:file,referenceCount:0});
+  project.pending={key:'样张-1',file,dir,provider:G.WEB_IMAGE_PROVIDER,taskId,projectId:project.id,projectVersion:1,prompt:'脸部近景',refs:[],inputFiles:[],at:new Date().toISOString()};project.tasks=[{id:taskId,kind:'image',target:'样张-1',status:'artifact_saved',projectId:project.id,projectVersion:1,providerInvocations:1}];project.currentTask=project.tasks[0];E.saveProject(project);E.recoverImage(project);const recovered=await done(project.id);
+  assert.equal(recovered.pending,null);assert.equal(recovered.samples[0].file,relative);assert.equal(recovered.samples[0].qa.status,'recovered_pending_review');assert.equal(recovered.currentTask.status,'recovered_local');
+});
 test('a historical not-accepted task cannot swallow a later unknown recovery failure',async()=>{
   const failed=E.createProject({...brief,idea:'历史未接单不能吞掉找回异常'});failed.plan=structuredClone(plan);failed.version=1;failed.approved={version:1,hash:W.digest(failed.plan)};failed.samplesApproved=true;failed.status='attention';
   const dir=path.join(E.projectDir(failed.id),'.制作记录','找回仍未知'),file=path.join(E.projectDir(failed.id),'v1','素材','仍未知.png'),taskId='historical-not-accepted';fs.mkdirSync(dir,{recursive:true});
@@ -574,6 +588,25 @@ test('an image artifact and its record survive a QA transport failure',async()=>
   let failed=E.createProject(brief);E.planProject(failed);failed=await done(failed.id);E.approvePlan(failed,W.digest(failed.plan));failed=await done(failed.id);
   delete process.env.WENDI_TEST_CRASH_QA_ONCE;
   const image=failed.artifacts.find(x=>x.id==='image:样张-1');assert(image);assert(fs.existsSync(W.inside(E.projectDir(failed.id),image.file)));assert.equal(failed.samples[0].file,image.file);assert.notEqual(failed.samples[0].qa?.pass,true);
+});
+test('QA unavailable after saving an original is an explicit non-regenerating terminal state',async()=>{
+  const marker=path.join(temp,'qa-terminal-state');process.env.WENDI_TEST_CRASH_QA_ONCE=marker;
+  let failed=E.createProject({...brief,idea:'QA 不可用终态回归'});E.planProject(failed);failed=await done(failed.id);E.approvePlan(failed,W.digest(failed.plan));failed=await done(failed.id);
+  delete process.env.WENDI_TEST_CRASH_QA_ONCE;
+  const image=failed.artifacts.find(x=>x.id==='image:样张-1');assert(image);
+  assert(fs.existsSync(W.inside(E.projectDir(failed.id),image.file)));
+  assert.equal(failed.pending,null);
+  assert.equal(failed.currentTask.status,'artifact_saved_unchecked');
+  assert.equal(failed.status,'attention');
+  assert.equal(failed.message,'原图已保存，自动校对未完成，请人工查看；不会自动重生');
+  assert.equal(failed.error,failed.message);
+  const qaRun=fs.readdirSync(path.join(E.projectDir(failed.id),'.制作记录')).map(name=>path.join(E.projectDir(failed.id),'.制作记录',name)).find(dir=>{try{return JSON.parse(fs.readFileSync(path.join(dir,'result.json'),'utf8')).outcome==='artifact_saved_unchecked';}catch{return false;}});
+  assert(qaRun);assert.equal(JSON.parse(fs.readFileSync(path.join(qaRun,'result.json'),'utf8')).errorCode,'QA_UNAVAILABLE');
+});
+test('manual QA unavailable remains a review-required terminal state',async()=>{
+  let reviewed=E.createProject({...brief,idea:'人工复核 QA 不可用终态回归'});E.planProject(reviewed);reviewed=await done(reviewed.id);E.approvePlan(reviewed,W.digest(reviewed.plan));reviewed=await done(reviewed.id);
+  const marker=path.join(temp,'qa-review-terminal-state');process.env.WENDI_TEST_CRASH_QA_ONCE=marker;const beforeImageTasks=reviewed.tasks.filter(task=>task.kind==='image').length;E.reviewImage(reviewed,'sample-1');reviewed=await done(reviewed.id);delete process.env.WENDI_TEST_CRASH_QA_ONCE;
+  assert.equal(reviewed.status,'attention');assert.equal(reviewed.pending,null);assert.equal(reviewed.currentTask.kind,'review');assert.equal(reviewed.currentTask.status,'review_required');assert.equal(reviewed.currentTask.errorCode,'QA_UNAVAILABLE');assert.equal(reviewed.samples[0].qa.status,'unavailable');assert.equal(reviewed.tasks.filter(task=>task.kind==='image').length,beforeImageTasks);assert.equal(reviewed.message,'原图已保存，自动校对未完成，请人工查看；不会自动重生');
 });
 test('pausing after image write still records the verified original',async()=>{
   const marker=path.join(temp,'pause-after-image');process.env.WENDI_TEST_PAUSE_AFTER_IMAGE=marker;
@@ -640,6 +673,8 @@ test('HTTP service serves built app and blocks foreign writes and unlisted files
     terminalProject.pending={key:'第1页-第1格',file:terminalFile,dir:terminalDir,prompt:'终态一致性',refs:[],inputFiles:[],provider:G.WEB_IMAGE_PROVIDER,taskId:terminalTaskId,projectId:terminalProject.id,projectVersion:2,at:new Date().toISOString()};terminalProject.currentTask={id:terminalTaskId,kind:'image',target:'第1页-第1格',status:'not_accepted',errorCode:'WEB_WORKER_NOT_ACCEPTED',webState:'queued',providerInvocations:0};E.saveProject(terminalProject);
     const terminalBody=await (await fetch(base+`/api/projects/${terminalProject.id}`)).json();assert.equal(terminalBody.pending.requestId,terminalRequestId);assert.equal(terminalBody.pending.accepted,true);assert.equal(terminalBody.pending.webState,'failed');assert.equal(terminalBody.pending.errorCode,'IAB_UNAVAILABLE');assert.equal(terminalBody.currentTask.status,'failed');assert.equal(terminalBody.currentTask.webState,'failed');assert.equal(terminalBody.currentTask.errorCode,'IAB_UNAVAILABLE');
     fs.writeFileSync(path.join(terminalDir,'worker-request.json'),JSON.stringify({schemaVersion:2,provider:G.WEB_IMAGE_PROVIDER,requestId:crypto.randomUUID(),projectId:terminalProject.id,projectVersion:2}));const mismatchedBody=await (await fetch(base+`/api/projects/${terminalProject.id}`)).json();assert.equal(mismatchedBody.pending.webState,null);assert.equal(mismatchedBody.currentTask.status,'not_accepted');assert.equal(mismatchedBody.currentTask.webState,'queued');
+    const qaSaved=E.createProject({...brief,idea:'HTTP QA 已保存终态文案测试'});qaSaved.status='attention';qaSaved.message='原图已保存，自动校对未完成，请人工查看；不会自动重生';qaSaved.error=qaSaved.message;qaSaved.currentTask={id:'qa-saved-task',kind:'image',target:'样张-1',status:'artifact_saved_unchecked',errorCode:'QA_UNAVAILABLE',providerInvocations:1,webState:'downloaded'};E.saveProject(qaSaved);
+    const qaSavedBody=await (await fetch(base+`/api/projects/${qaSaved.id}`)).json();assert.equal(qaSavedBody.pending,null);assert.equal(qaSavedBody.status,'attention');assert.equal(qaSavedBody.message,qaSaved.message);assert.equal(qaSavedBody.error,qaSaved.message);assert.equal(qaSavedBody.currentTask.status,'artifact_saved_unchecked');assert.equal(qaSavedBody.currentTask.errorCode,'QA_UNAVAILABLE');
     assert.equal((await fetch(base+'/')).status,200);
     const switched=await (await fetch(base+`/api/projects/${p.id}/settings`,{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:JSON.stringify({model:'fixture-model',reasoningEffort:'low'})})).json();assert.equal(switched.brief.model,'fixture-model');assert.equal(switched.modelHistory.at(-1).to.model,'fixture-model');
     const renamed=await (await fetch(base+`/api/projects/${p.id}/title`,{method:'POST',headers:{'Content-Type':'application/json','X-Wendi-Request':'studio'},body:JSON.stringify({title:'已改名的流程测试'})})).json();assert.equal(renamed.title,'已改名的流程测试');
