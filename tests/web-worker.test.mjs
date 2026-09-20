@@ -122,6 +122,12 @@ test('process exit without a result is unknown, not queued forever',async()=>{aw
 test('submission survives executor failure without a new execution',async()=>{const args=setup('submitted');await assert.rejects(dispatchChatGptWebJob(args));assert.equal(readWebManifest(path.join(args.dir,'web-generation.json')).submitted,true);await assert.rejects(dispatchChatGptWebJob(args),/请求已存在/);});
 test('saved matching download survives an executor exit error',async()=>{assert.equal((await dispatchChatGptWebJob(setup('crash-after-download'))).manifest.state,'downloaded');});
 test('direct execution has a bounded timeout',async()=>{const args=setup('hang');await assert.rejects(dispatchChatGptWebJob({...args,timeoutMs:100}),/等待时间较长/);});
+test('invalid frozen references stop before the browser executor is spawned',async()=>{
+ const args=setup('success'),missing=path.join(args.dir,'missing-reference.jpg');
+ await assert.rejects(dispatchChatGptWebJob({...args,referenceFiles:[missing]}),error=>error.code==='REFERENCE_FILES_INVALID'&&/不存在或不可读/.test(error.message));
+ assert.equal(fs.existsSync(path.join(args.dir,'worker-request.json')),false);
+ assert.equal(fs.existsSync(path.join(args.dir,'argv.json')),false);
+});
 test('cancelled request never spawns or creates a request',async()=>{const args=setup('success'),controller=new AbortController();controller.abort();await assert.rejects(dispatchChatGptWebJob({...args,signal:controller.signal}),/已暂停/);assert(!fs.existsSync(path.join(args.dir,'worker-request.json')));});
 test('worker timestamps are normalized before reaching the timing UI',()=>{
  const dir=fs.mkdtempSync(path.join(root,'timestamps-')),file=path.join(dir,'web-generation.json');

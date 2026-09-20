@@ -69,6 +69,49 @@ function readJsonObject(file){
 }
 
 /**
+ * Validate the frozen attachment array before a browser tab is opened. The
+ * browser worker must receive the exact prepared paths in this order; a
+ * hand-typed path or a stale prepared file is a local, deterministic failure
+ * and must never reach ChatGPT or the send button.
+ */
+export function validateFrozenReferenceFiles({referenceFiles=[],expectedEntries}={}){
+  const paths=Array.isArray(referenceFiles)?referenceFiles:[],errors=[],files=[];
+  if(!Array.isArray(referenceFiles))errors.push('referenceFiles 必须是数组。');
+  const normalized=paths.map((value,index)=>{
+    if(typeof value!=='string'||!value.trim()){
+      errors.push(`第 ${index+1} 个附件路径为空或不是文本。`);
+      return null;
+    }
+    const file=path.resolve(value);
+    try{
+      const stat=fs.statSync(file);
+      if(!stat.isFile())throw new Error('不是普通文件');
+      if(stat.size<=0)throw new Error('文件为空');
+      fs.accessSync(file,fs.constants.R_OK);
+      const sha256=crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+      return {path:file,name:path.basename(file),sizeBytes:stat.size,sha256};
+    }catch(error){
+      errors.push(`第 ${index+1} 个附件不存在或不可读：${file}（${error.message}）`);
+      return null;
+    }
+  });
+  if(new Set(normalized.filter(Boolean).map(item=>item.path)).size!==normalized.filter(Boolean).length)errors.push('附件路径重复，冻结顺序不唯一。');
+  for(const item of normalized)if(item)files.push(item);
+  if(Array.isArray(expectedEntries)){
+    if(expectedEntries.length!==normalized.length)errors.push(`冻结附件数量不一致：台账 ${expectedEntries.length}，实际 ${normalized.length}。`);
+    const count=Math.min(expectedEntries.length,normalized.length);
+    for(let index=0;index<count;index++){
+      const expected=expectedEntries[index]||{},actual=normalized[index];
+      if(!actual)continue;
+      if(expected.name&&String(expected.name)!==actual.name)errors.push(`第 ${index+1} 个附件名称或顺序不一致：台账 ${expected.name}，实际 ${actual.name}。`);
+      if(expected.sizeBytes!==undefined&&Number(expected.sizeBytes)!==actual.sizeBytes)errors.push(`第 ${index+1} 个附件大小不一致：${actual.name}。`);
+      if(expected.sha256&&String(expected.sha256)!==actual.sha256)errors.push(`第 ${index+1} 个附件 sha256 不一致：${actual.name}。`);
+    }
+  }
+  return {ok:errors.length===0,errors,files};
+}
+
+/**
  * Keep browser evidence tied to this exact request and CLI run. A stale event
  * file or worker from another task must never rewrite the current manifest.
  */
@@ -253,10 +296,17 @@ export async function dispatchChatGptWebJob({codexBin,dir,outputFile,prompt,refe
   const requestId=crypto.randomUUID(),createdAt=new Date().toISOString(),absoluteOutput=path.resolve(outputFile);
   const runId=path.basename(path.resolve(dir)),requestIdentity=identityFields(readJsonObject(path.join(dir,'request.json'))),lockedIdentity={...requestIdentity,requestId,runId,outputFile:absoluteOutput};
   const commonIdentity={identitySchemaVersion:2,identityLocked:true,...lockedIdentity};
-  writeJson(manifestFile,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,transport:WEB_IMAGE_TRANSPORT,browser:WEB_IMAGE_BROWSER,focusPolicy:WEB_IMAGE_FOCUS_POLICY,role,executorModel:model||null,executorReasoningEffort:reasoningEffort,...commonIdentity,state:'queued',accepted:false,submitted:false,referenceCount:0,createdAt});
   const previousRequest=readJsonObject(requestMetadataFile)||{};
+  const referenceValidation=validateFrozenReferenceFiles({referenceFiles,expectedEntries:previousRequest.referenceFiles});
+  if(!referenceValidation.ok){
+    const error=new Error(`冻结附件预检失败：${referenceValidation.errors.join('；')}`);
+    error.code='REFERENCE_FILES_INVALID';
+    error.referenceValidation=referenceValidation;
+    throw error;
+  }
+  writeJson(manifestFile,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,transport:WEB_IMAGE_TRANSPORT,browser:WEB_IMAGE_BROWSER,focusPolicy:WEB_IMAGE_FOCUS_POLICY,role,executorModel:model||null,executorReasoningEffort:reasoningEffort,...commonIdentity,state:'queued',accepted:false,submitted:false,referenceCount:0,createdAt});
   writeJson(requestMetadataFile,{...previousRequest,schemaVersion:Number(previousRequest.schemaVersion||2),provider:previousRequest.provider||WEB_IMAGE_PROVIDER,identitySchemaVersion:2,identityLocked:true,...lockedIdentity,expectedOutput:previousRequest.expectedOutput||path.relative(path.resolve(dir,'..','..'),absoluteOutput)});
-  writeJson(requestFile,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,transport:WEB_IMAGE_TRANSPORT,browser:WEB_IMAGE_BROWSER,focusPolicy:WEB_IMAGE_FOCUS_POLICY,role,executorModel:model||null,executorReasoningEffort:reasoningEffort,...commonIdentity,expectedOutput:path.relative(path.resolve(dir,'..','..'),absoluteOutput),authorization:{confirmed:true,scope:'one_chatgpt_web_image_submission',confirmedAt:createdAt},instructionFile,manifestFile,referenceFiles:referenceFiles.map(file=>path.resolve(file)),createdAt});
+  writeJson(requestFile,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,transport:WEB_IMAGE_TRANSPORT,browser:WEB_IMAGE_BROWSER,focusPolicy:WEB_IMAGE_FOCUS_POLICY,role,executorModel:model||null,executorReasoningEffort:reasoningEffort,...commonIdentity,expectedOutput:path.relative(path.resolve(dir,'..','..'),absoluteOutput),authorization:{confirmed:true,scope:'one_chatgpt_web_image_submission',confirmedAt:createdAt},instructionFile,manifestFile,referenceFiles:referenceValidation.files.map(item=>item.path),referenceEntries:referenceValidation.files.map(({name,sizeBytes,sha256})=>({name,sizeBytes,sha256})),createdAt});
   writeJson(path.join(dir,'run-identity.json'),{schemaVersion:1,identitySchemaVersion:2,identityLocked:true,provider:WEB_IMAGE_PROVIDER,...lockedIdentity,expectedOutput:absoluteOutput,createdAt});
   let result,failure;
   try{result=await runCodex({codexBin,dir,image:true,browserMode:'chrome',signal,timeoutMs,model,reasoningEffort,role,writableDirs:[path.dirname(path.resolve(outputFile))],prompt:chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceFiles,editTarget,conversationUrl,capsule,requestId})});}catch(error){failure=error;}
@@ -283,6 +333,13 @@ export async function resumeChatGptWebJob({codexBin,dir,signal,timeoutMs=900000,
   if(worker.executorModel&&model&&worker.executorModel!==model)throw new Error('待续接请求的执行器模型已变化；不会重新执行。');
   if(worker.executorReasoningEffort&&reasoningEffort&&worker.executorReasoningEffort!==reasoningEffort)throw new Error('待续接请求的执行器思考力度已变化；不会重新执行。');
   if(worker.role&&role&&worker.role!==role)throw new Error('待续接请求的执行器角色已变化；不会重新执行。');
+  const referenceValidation=validateFrozenReferenceFiles({referenceFiles:worker.referenceFiles,expectedEntries:Array.isArray(worker.referenceEntries)?worker.referenceEntries:request.referenceFiles});
+  if(!referenceValidation.ok){
+    const error=new Error(`待续接图片请求的冻结附件预检失败：${referenceValidation.errors.join('；')}`);
+    error.code='REFERENCE_FILES_INVALID';
+    error.referenceValidation=referenceValidation;
+    throw error;
+  }
   const instructionFile=String(worker.instructionFile||path.join(dir,'prompt.txt')),nextInstruction=typeof instruction==='string'&&instruction.trim()?instruction:fs.readFileSync(instructionFile,'utf8'),archive=preAcceptance?archivePreAcceptanceAttempt(dir,manifest,execution):archiveConfirmedUnsentAttempt(dir,manifest,execution,audit),resumedAt=new Date().toISOString();
   if(audit&&!(typeof instruction==='string'&&instruction.trim()))throw new Error('已确认未发送的续接缺少更新后执行指令；原记录已保留。');
   fs.writeFileSync(instructionFile,nextInstruction,{mode:0o600});

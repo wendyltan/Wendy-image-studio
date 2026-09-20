@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {test} from 'node:test';
-import {chatGptWebImagePrompt} from '../server/chatgpt-web-provider.mjs';
+import {chatGptWebImagePrompt,validateFrozenReferenceFiles} from '../server/chatgpt-web-provider.mjs';
 import {patchManifest} from '../server/run-manifest.mjs';
 import {buildManifestCommands} from '../server/web-manifest-commands.mjs';
 
@@ -109,6 +109,37 @@ test('executor instructions carry explicit stage flags and only the image_prompt
   assert.equal((instruction.match(/\n<\/image_prompt>/g)||[]).length,1);
   assert.match(instruction,/只复制 <image_prompt> 与 <\/image_prompt> 之间的文本/);
   assert.match(instruction,/node "[^"]+server\/run-manifest\.mjs"/);
+});
+
+test('frozen reference validation rejects missing, unreadable, reordered, or tampered attachments before Chrome',()=>{
+  const dir=fs.mkdtempSync(path.join(root,'reference-validation-'));
+  const first=path.join(dir,'01-base.jpg'),second=path.join(dir,'02-face.jpg');
+  fs.writeFileSync(first,'first-reference');fs.writeFileSync(second,'second-reference');
+  const expected=[
+    {name:path.basename(first),sizeBytes:fs.statSync(first).size,sha256:crypto.createHash('sha256').update(fs.readFileSync(first)).digest('hex')},
+    {name:path.basename(second),sizeBytes:fs.statSync(second).size,sha256:crypto.createHash('sha256').update(fs.readFileSync(second)).digest('hex')},
+  ];
+  const valid=validateFrozenReferenceFiles({referenceFiles:[first,second],expectedEntries:expected});
+  assert.equal(valid.ok,true);assert.deepEqual(valid.files.map(item=>item.name),expected.map(item=>item.name));
+  const missing=validateFrozenReferenceFiles({referenceFiles:[first,path.join(dir,'missing.jpg')],expectedEntries:expected});
+  assert.equal(missing.ok,false);assert(missing.errors.some(error=>/不存在|不可读/.test(error)));
+  const reordered=validateFrozenReferenceFiles({referenceFiles:[second,first],expectedEntries:expected});
+  assert.equal(reordered.ok,false);assert(reordered.errors.some(error=>/顺序|name|名称/.test(error)));
+  fs.writeFileSync(second,'tampered-reference');
+  const tampered=validateFrozenReferenceFiles({referenceFiles:[first,second],expectedEntries:expected});
+  assert.equal(tampered.ok,false);assert(tampered.errors.some(error=>/sha256|哈希|大小/.test(error)));
+});
+
+test('executor instructions bind the top-level worker reference array and gate send on every upload group',()=>{
+  const instruction=chatGptWebImagePrompt({outputFile:'/tmp/out.png',manifestFile:'/tmp/run/web-generation.json',prompt:'fixture',referenceFiles:['/tmp/a.png','/tmp/b.png']});
+  assert.match(instruction,/const worker=JSON\.parse\(fs\.readFileSync\(['"]worker-request\.json['"],['"]utf8['"]\)\)/);
+  assert.match(instruction,/worker\.referenceFiles/);
+  assert.match(instruction,/不是 worker\.worker\.referenceFiles/);
+  assert.match(instruction,/不要手写|不要手打|完整数组原样/);
+  assert.match(instruction,/每个 group|逐个附件 group|group.*数量/);
+  assert.match(instruction,/等待.*等待文件上传.*消失|等待文件上传.*消失/);
+  assert.match(instruction,/发送按钮.*disabled|disabled.*发送按钮/);
+  assert.match(instruction,/禁止.*submission-intent|submission-intent.*禁止/);
 });
 
 test('executor retrieves the original generated media through page assets',()=>{
