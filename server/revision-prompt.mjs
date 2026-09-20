@@ -71,6 +71,36 @@ function splitNote(note){
   return rows.length?rows:['按原始修改说明修正指定局部。'];
 }
 
+// A revision note often contains a compact change followed by invariants such
+// as “保持姿势和视线不变”.  Those invariants are not user change intent.  If
+// they enter the classifier, a generic word like “姿势” can select a domain
+// repair template (for example the espresso template) and contaminate an
+// otherwise clothing-only edit.  Keep the parser deliberately conservative:
+// remove only explicit keep/unchanged fragments and never inspect the frozen
+// base prompt here.
+const KEEP_CLAUSE=/(?:保持|保留|不改变|不改动|不要改变|不要改动|不要修改|无需(?:再)?修改|不得改变)[^。！？!?]*?(?:不变|原样|如前|一致|$)/g;
+
+function normalizeChangeList(note){
+  const normalized=[];
+  for(const row of splitNote(note)){
+    const hadKeep=KEEP_CLAUSE.test(row);
+    KEEP_CLAUSE.lastIndex=0;
+    const stripped=row.replace(KEEP_CLAUSE,' ').replace(/[，,、；;：:]\s*(?=[，,、；;：:])/g,' ').replace(/\s{2,}/g,' ').trim();
+    for(const item of stripped.split(/[，,、；;]/).map(value=>value.replace(/^[。！？!?；;，,、：:\s]+|[。！？!?；;，,、：:\s]+$/g,'').trim()).filter(Boolean)){
+      // A row made entirely of an invariant is not a change.  The generic
+      // output constraints already cover “不要添加文字/水印”等 output rules.
+      if(/^(?:当前|其他|其余|未涉及)?\s*(?:内容|部分|元素|姿势|动作|视线|身份|背景|构图|光线)?\s*(?:保持|保留|不改变|不改动|不要改变|不要改动|不要修改|无需(?:再)?修改|不得改变)/.test(item))continue;
+      if(hadKeep&&!hasIssueIntent(item))continue;
+      if(item)normalized.push(item);
+    }
+  }
+  return normalized.length?normalized:['按原始修改说明修正指定局部。'];
+}
+
+function hasIssueIntent(value){
+  return /(?:不对|不正确|错误|不自然|僵硬|有问题|错位|缺少|不合理|需要|修正|修复|纠正|改善|调整|改成|改为|改动|修改|改变|替换)/i.test(value);
+}
+
 function intentFlags(lines){
   const value=lines.join(' ');
   return {
@@ -87,17 +117,35 @@ function intentFlags(lines){
 
 function positiveResult(line){
   const value=redactInternal(line);
-  if(/咖啡机|出液|冲煮|portafilter|萃取|手柄|双出液嘴/i.test(value)){
+  const espressoDomain=/(?:咖啡机|意式|萃取|冲煮|portafilter|萃取头|出液(?:口|嘴)?|液流|粉碗|手柄)/i.test(value);
+  const actionDomain=/(?:动作|姿势|站姿|肩颈|肘部|手臂|手腕|重心|站立|坐姿|转身|表情)/i.test(value);
+  const clothingDomain=/(?:服装|衣服|裙|鞋|穿着|配饰|衣物)/i.test(value);
+  // Domain templates require both an explicit domain noun and an issue/change
+  // intent.  Keep-only phrases and generic “姿势/视线” wording therefore
+  // cannot activate a professional template.
+  if(espressoDomain&&hasIssueIntent(value)){
     return '修正为真实连贯的意式咖啡机出液关系：冲煮头与 portafilter 手柄正确锁合；双出液嘴位于手柄底部，每股液流都从对应出液嘴连续流出；杯子正位于双出液嘴下方承接液流，手柄朝右；各部件不得悬空、穿插或错位。';
   }
-  if(/动作|姿势|僵硬|肩颈|肘部|手臂|手腕|重心|站姿|坐姿/i.test(value)){
+  if(actionDomain&&hasIssueIntent(value)){
     return '把人物改为自然、放松且可观察的动作：肩颈放松，肘部与手腕自然弯曲或下垂，重心落在双脚，躯干和手臂有自然曲线；双手远离热出液口并以合理姿态完成当前操作，视线自然落在杯子与萃取过程；只联动调整完成该姿势所需的局部。';
   }
+  if(clothingDomain&&hasIssueIntent(value))return `仅调整服装相关内容：${value.replace(/[。！？!?；;]+$/,'')}；衣物颜色、长度、材质和垂坠按这条说明呈现，不联动改变人物动作、视线、场景或物件。`;
   if(/不对|错误|不自然|僵硬|有问题|错位|缺少|不合理/i.test(value)){
     return `修正该说明所指区域，使位置、方向、连接和比例与第1附件及相关参考一致，结果在画面中清晰可见；仅影响完成本条修订所需的局部。`;
   }
   if(/不要|去掉|移除|删除/i.test(value))return `画面中不出现该说明所指内容，其余未涉及部分保持不变。`;
   return `按“${value.replace(/[。！？!?；;]+$/,'')}”完成可直接观察的局部修订，其余未涉及部分保持不变。`;
+}
+
+const SCOPED_OBJECT_TERMS=/(?:咖啡机|意式|萃取|冲煮|portafilter|萃取头|出液(?:口|嘴)?|液流|粉碗|手柄|奶油白杯|杯子|杯)/i;
+
+function scopedKeepText(value,label,flags){
+  const item=bounded(value);
+  if(!item)return '';
+  // A non-object edit should not carry a detailed object ledger into the
+  // remote message.  This keeps a clothing/walking revision from acquiring a
+  // coffee task merely because the frozen story mentions another panel.
+  return !flags.object&&SCOPED_OBJECT_TERMS.test(item)?`${label}按第1附件原样保持，不引入器具专项变化。`:item;
 }
 
 function keepLines(narrative,flags,fallback=''){
@@ -109,20 +157,21 @@ function keepLines(narrative,flags,fallback=''){
   if(characters&&!flags.character)lines.push(`人物与角色：${characters}`);
   const costume=bounded(narrative.costume);
   if(costume&&!flags.clothing)lines.push(`服装与穿着：${costume}`);
-  const scene=bounded(narrative.scene);
+  const scene=scopedKeepText(narrative.scene,'场景与环境',flags);
   if(scene&&!flags.scene)lines.push(`场景与环境：${scene}`);
-  const lighting=bounded(narrative.lighting);
+  const lighting=scopedKeepText(narrative.lighting,'光线',flags);
   if(lighting&&!flags.lighting)lines.push(`光线：${lighting}`);
-  const gaze=bounded(narrative.gaze);
+  const gaze=scopedKeepText(narrative.gaze,'人物视线',flags);
   if(gaze&&!flags.action)lines.push(`视线：${gaze}`);
-  const expression=bounded(narrative.expression);
+  const expression=scopedKeepText(narrative.expression,'人物表情',flags);
   if(expression&&!flags.action)lines.push(`表情：${expression}`);
 
+  // Do not echo a whole cross-page object ledger into a scoped revision.  It
+  // can contain another panel's espresso vocabulary and accidentally turn a
+  // clothing or walking edit into a coffee edit.  The attached base image is
+  // already the source of truth for untouched objects.
   if(flags.object)lines.push('未涉及的背景物件与器具细节保持不变；仅为完成上述器具修订进行必要的局部联动。');
-  else {
-    const objects=bounded(narrative.objects);
-    if(objects)lines.push(`物件：${objects}`);
-  }
+  else lines.push('未涉及的背景物件与器具保持原图不变，不新增、不替换。');
   if(flags.composition)lines.push('除完成上述构图或画面修订所需的局部联动外，其他空间关系保持不变。');
   else lines.push('原图的整体构图、主体尺度与前中后景关系保持不变。');
   if(flags.style)lines.push('未涉及的绘画风格、线条、色块与质感保持不变。');
@@ -151,7 +200,7 @@ function safeFallback(basePrompt,flags){
   const source=String(basePrompt||''),anchors=[];
   for(const [category,label,pattern] of SAFE_ANCHORS){
     if(flags[category])continue;
-    const match=source.match(pattern),value=match?bounded(match[1],160):'';
+    const match=source.match(pattern),value=match?scopedKeepText(match[1],label,flags):'';
     if(value&&!UNSAFE_ANCHOR.test(value))anchors.push(`${label}：${value}`);
   }
   // Never echo an unstructured prompt. This fixed sentence cannot carry
@@ -163,7 +212,7 @@ export function buildRevisionPrompt(basePrompt,note,{key='',baseFile=null}={}){
   // key/baseFile remain accepted for callers and durable metadata, but are
   // deliberately never interpolated into the remote image message.
   void key;void baseFile;
-  const narrative=narrativeFrom(basePrompt),changes=splitNote(note),flags=intentFlags(changes),ratio=ratioFrom(basePrompt);
+  const narrative=narrativeFrom(basePrompt),changes=normalizeChangeList(note),flags=intentFlags(changes),ratio=ratioFrom(basePrompt);
   const fallback=Object.keys(narrative).length?'':safeFallback(basePrompt,flags);
   const changeLines=changes.flatMap((line,index)=>[
     `- 修改 ${index+1}（原话）：${line}`,
@@ -192,6 +241,8 @@ export function buildRevisionPrompt(basePrompt,note,{key='',baseFile=null}={}){
     ...output,
   ].join('\n');
 }
+
+export {normalizeChangeList};
 
 function sha256(value){return crypto.createHash('sha256').update(String(value||''),'utf8').digest('hex');}
 

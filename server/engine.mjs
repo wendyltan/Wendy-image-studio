@@ -705,6 +705,17 @@ function currentImageArtifact(p,key){
   const record=p.panels?.[key],id=artifactIdForImageKey(key);
   return record?.file?(p.artifacts||[]).find(artifact=>artifact.id===id&&artifact.file===record.file&&artifact.valid!==false):null;
 }
+function qaPromptForRecord(record,definition,key){
+  // Older browser runs persisted the mechanical executor instruction as the
+  // record prompt.  For an image revision, rebuild the scoped QA brief from
+  // the frozen base prompt plus the explicit delta so QA cannot inspect the
+  // executor capsule or a stale cross-panel domain ledger.
+  if(record?.revisionDelta){
+    const base=String(record.basePrompt||definition?.prompt||record.prompt||'');
+    return buildRevisionPrompt(base,record.revisionDelta,{key});
+  }
+  return record?.prompt||definition?.prompt;
+}
 export function pageIsCurrent(p,page){
   if(page?.compositionVersion!==COMPOSITION_VERSION||!page?.qa?.pass)return false;
   const pageArtifact=(p.artifacts||[]).find(artifact=>artifact.id===`page:${page.number}`&&artifact.file===page.file&&artifact.valid!==false);
@@ -833,8 +844,8 @@ export function syncRecoveredImageMetadata(p,options={}){return syncRecoveredMet
 export function reviewImage(p,key){
   verifyApproval(p);if(p.pending)throw new Error('请先完成这次原图找回，再重新校对。');
   const sample=/^sample-([12])$/.exec(key);const panel=/^(\d+)-(\d+)$/.exec(key);let record,refs,prompt,kind;
-  if(sample){record=p.samples?.[Number(sample[1])-1];const definition=p.plan.samples?.[Number(sample[1])-1];refs=definition?.references;prompt=definition?.prompt;kind='方向样张';}
-  else if(panel){record=p.panels?.[key];const definition=p.plan.pages?.[Number(panel[1])-1]?.panels?.[Number(panel[2])-1];refs=definition?.references;prompt=record?.prompt||definition?.prompt;kind='原始分镜';}
+  if(sample){record=p.samples?.[Number(sample[1])-1];const definition=p.plan.samples?.[Number(sample[1])-1];refs=definition?.references;prompt=qaPromptForRecord(record,definition,key);kind='方向样张';}
+  else if(panel){record=p.panels?.[key];const definition=p.plan.pages?.[Number(panel[1])-1]?.panels?.[Number(panel[2])-1];refs=definition?.references;prompt=qaPromptForRecord(record,definition,key);kind='原始分镜';}
   else throw new Error('请选择已保存的样张或原始分镜。');
   if(!record?.file||!refs||!prompt)throw new Error('这张图片没有可用于重新校对的完整记录。');
   return job(p,'revising',async signal=>{
