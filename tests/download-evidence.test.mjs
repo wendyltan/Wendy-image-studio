@@ -8,7 +8,10 @@ import {
   DOWNLOAD_EVIDENCE_FILE,
   extractDownloadEvidence,
   inspectDownloadArtifact,
+  pageAssetMatchesResult,
   readDownloadEvidence,
+  stableFileId,
+  stableFileIdsForAsset,
   validateDownloadEvidence,
   writeDownloadEvidence,
 } from '../server/web-download-evidence.mjs';
@@ -30,7 +33,8 @@ function fixture(){
   const src='https://chatgpt.com/backend-api/estuary/content?id=file_current_fixture&sig=fixture';
   return {dir,output,actual,evidence:{
     schemaVersion:2,source:'pageAssets',projectId,projectVersion,taskId,target,conversationUrl,requestId,runId,
-    currentResult:{src,resultId:'file_current_fixture',marker:'暖阳厨房里的手冲咖啡时光'},
+    matchingStrategy:'exact-src',
+    currentResult:{src,resultId:'file_current_fixture',stableFileId:'file_current_fixture',marker:'暖阳厨房里的手冲咖啡时光'},
     inventory:{id:'inventory-fixture',assetCount:1},exactMatchCount:1,matchedAssetIds:['asset-current'],
     matchedAsset:{id:'asset-current',kind:'image',contentType:'image/png',url:src,sourceUrl:src,role:'generated-result',isThumbnail:false,isPreview:false},
     bundle:{downloadedCount:1,failures:[],contentType:'image/png',path:'/tmp/bundled-original.png'},
@@ -45,6 +49,23 @@ test('structured page-assets evidence validates against the exact original artif
   const file=writeDownloadEvidence(run.dir,run.evidence,{conversationUrl,requestId,runId,outputFile:run.output,actual:run.actual});
   assert.equal(file,path.join(run.dir,DOWNLOAD_EVIDENCE_FILE));
   assert.deepEqual(readDownloadEvidence(run.dir),run.evidence);
+});
+
+test('stable file id matching accepts a changed signed URL but rejects non-image inventory records',()=>{
+  const run=fixture(),domSrc=run.evidence.currentResult.src,inventorySrc=domSrc.replace('sig=fixture','sig=rotated');
+  assert.equal(stableFileId(domSrc),'file_current_fixture');
+  assert.deepEqual(stableFileIdsForAsset({url:inventorySrc,sourceUrl:inventorySrc,name:'content'}),['file_current_fixture']);
+  assert.equal(pageAssetMatchesResult({kind:'image',url:inventorySrc,sourceUrl:inventorySrc,contentType:'image/png',role:'generated-result'},{src:domSrc}),true);
+  assert.equal(pageAssetMatchesResult({kind:'other',url:inventorySrc,sourceUrl:inventorySrc,contentType:'image/png'},{src:domSrc}),false);
+  const evidence={...run.evidence,matchingStrategy:'stable-file-id',currentResult:{...run.evidence.currentResult,src:domSrc,stableFileId:'file_current_fixture'},matchedAsset:{...run.evidence.matchedAsset,url:inventorySrc,sourceUrl:inventorySrc}};
+  const check=validateDownloadEvidence(evidence,{conversationUrl,requestId,runId,outputFile:run.output,actual:run.actual});
+  assert.equal(check.ok,true,check.errors?.join('; '));
+});
+
+test('stable file id matching rejects a different result even when the URL shape is valid',()=>{
+  const run=fixture(),evidence={...run.evidence,matchingStrategy:'stable-file-id',currentResult:{...run.evidence.currentResult,stableFileId:'file_other_fixture'},matchedAsset:{...run.evidence.matchedAsset,url:run.evidence.currentResult.src.replace('file_current_fixture','file_other_fixture'),sourceUrl:run.evidence.currentResult.src.replace('file_current_fixture','file_other_fixture')}};
+  const check=validateDownloadEvidence(evidence,{conversationUrl,requestId,runId,outputFile:run.output,actual:run.actual});
+  assert.equal(check.ok,false);assert(check.errors.some(error=>/stable|file id|一致/.test(error)));
 });
 
 test('validator rejects zero or multiple exact result-asset matches',()=>{

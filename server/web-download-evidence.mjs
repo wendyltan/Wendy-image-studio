@@ -9,10 +9,33 @@ const IMAGE_CONTENT_TYPES=new Set(['image/png','image/jpeg','image/webp']);
 const MEDIA_URL=/^https:\/\/chatgpt\.com\/backend-api\/estuary\/content(?:[?#/]|$)/i;
 const HASH=/^[a-f0-9]{64}$/i;
 const ISO=/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+const STABLE_FILE_ID=/\b(file_[A-Za-z0-9_-]+)\b/;
 
 function object(value){return value&&typeof value==='object'&&!Array.isArray(value)?value:null;}
 function text(value){return typeof value==='string'?value.trim():'';}
 function samePath(left,right){return path.resolve(String(left||''))===path.resolve(String(right||''));}
+/**
+ * ChatGPT may expose the same generated file through URLs with different
+ * signed query strings.  The file id is the stable source identity; query
+ * parameters are transport metadata and must not decide whether an asset is
+ * the current result.
+ */
+export function stableFileId(value){
+  const match=text(value).match(STABLE_FILE_ID);
+  return match?.[1]||null;
+}
+export function stableFileIdsForAsset(asset){
+  const value=object(asset);
+  return [...new Set([value?.url,value?.sourceUrl,value?.name].map(stableFileId).filter(Boolean))];
+}
+export function pageAssetMatchesResult(asset,{src=null,stableId=null}={}){
+  const value=object(asset),url=text(value?.url||value?.sourceUrl),wanted=stableId||stableFileId(src);
+  if(!value||value.kind!=='image'||!MEDIA_URL.test(url)||!wanted)return false;
+  if(!IMAGE_CONTENT_TYPES.has(text(value.contentType).toLowerCase()))return false;
+  if(value.isThumbnail===true||value.isPreview===true)return false;
+  if(/(?:thumbnail|preview|缩略|预览)/i.test([value.role,url,value.name].map(text).join(' ')))return false;
+  return stableFileIdsForAsset(value).includes(wanted);
+}
 function formatForContentType(value){
   const type=text(value).toLowerCase();
   if(type==='image/png')return 'PNG';
@@ -85,6 +108,9 @@ export function extractDownloadEvidence(value){
 export function completeDownloadEvidence(evidence,{actual=null}={}){
   const value=structuredClone(object(evidence)||{}),output=object(value.output)||(value.output={});
   if(actual){for(const key of ['path','bytes','format','width','height','sha256'])if(output[key]===undefined||output[key]===null||output[key]==='')output[key]=actual[key];}
+  const result=object(value.currentResult),src=text(result?.src),asset=object(value.matchedAsset),assetUrl=text(asset?.url||asset?.sourceUrl),id=text(result?.stableFileId)||stableFileId(src)||stableFileId(result?.resultId);
+  if(result&&id&&!result.stableFileId)result.stableFileId=id;
+  if(!value.matchingStrategy&&assetUrl&&src)value.matchingStrategy=assetUrl===src?'exact-src':'stable-file-id';
   return value;
 }
 
@@ -146,8 +172,14 @@ export function validateDownloadEvidence(value,{conversationUrl=null,requestId=n
   }
   if(text(evidence?.source)!=='pageAssets')errors.push('download evidence source 必须是 pageAssets。');
   if(!ISO.test(text(evidence?.capturedAt))||!Number.isFinite(Date.parse(evidence?.capturedAt)))errors.push('download evidence capturedAt 无效。');
-  const result=object(evidence?.currentResult),src=text(result?.src);
+  const result=object(evidence?.currentResult),src=text(result?.src),stableId=text(result?.stableFileId)||stableFileId(src);
   if(!MEDIA_URL.test(src))errors.push('当前结果 src 不是会话内原始媒体 URL。');
+  if(!stableId)errors.push('当前结果缺少稳定 file id。');
+  if(result?.stableFileId&&stableFileId(result.stableFileId)!==result.stableFileId)errors.push('当前结果 stableFileId 无效。');
+  if(result?.resultId&&stableFileId(result.resultId)!==result.resultId)errors.push('当前结果 resultId 无效。');
+  if(result?.resultId&&stableId&&result.resultId!==stableId)errors.push('当前结果 resultId 与 stableFileId 不一致。');
+  const matchingStrategy=text(evidence?.matchingStrategy);
+  if(!['exact-src','stable-file-id'].includes(matchingStrategy))errors.push('matchingStrategy 无效。');
   const inventory=object(evidence?.inventory);
   if(!text(inventory?.id))errors.push('缺少 pageAssets inventory id。');
   const exact=Number(evidence?.exactMatchCount);
@@ -160,8 +192,14 @@ export function validateDownloadEvidence(value,{conversationUrl=null,requestId=n
     if(text(asset.kind)!=='image')errors.push('matchedAsset.kind 必须是 image。');
     const contentType=text(asset.contentType).toLowerCase();
     if(!IMAGE_CONTENT_TYPES.has(contentType))errors.push('matchedAsset.contentType 不是允许的图片类型。');
-    const assetUrl=text(asset.url||asset.sourceUrl);
-    if(assetUrl!==src)errors.push('matchedAsset URL 与当前结果 src 不一致，可能是旧图或缩略图。');
+    const assetUrl=text(asset.url||asset.sourceUrl),assetStableIds=stableFileIdsForAsset(asset);
+    if(!MEDIA_URL.test(assetUrl))errors.push('matchedAsset URL 不是会话内原始媒体 URL。');
+    if(!stableId||!assetStableIds.includes(stableId))errors.push('matchedAsset 稳定 file id 与当前结果不一致，可能是旧图或缩略图。');
+    if(matchingStrategy==='exact-src'&&assetUrl!==src)errors.push('exact-src 匹配的 matchedAsset URL 与当前结果 src 不一致。');
+    if(matchingStrategy==='stable-file-id'&&assetUrl===src)errors.push('stable-file-id 匹配不应在 URL 完全相同时使用。');
+    const sourceUrl=text(asset.sourceUrl);
+    if(sourceUrl&&!MEDIA_URL.test(sourceUrl))errors.push('matchedAsset sourceUrl 不是会话内原始媒体 URL。');
+    if(sourceUrl&&stableId&&!stableFileIdsForAsset({url:sourceUrl}).includes(stableId))errors.push('matchedAsset sourceUrl 稳定 file id 与当前结果不一致。');
     const descriptor=[asset.role,assetUrl].map(text).join(' ');
     if(asset.isThumbnail===true||asset.isPreview===true||/(?:thumbnail|preview|缩略|预览)/i.test(descriptor))errors.push('matchedAsset 被标记为 thumbnail/preview，拒绝作为原图。');
     if(matchedIds&&matchedIds[0]!==text(asset.id))errors.push('matchedAsset.id 不在唯一精确匹配资产中。');

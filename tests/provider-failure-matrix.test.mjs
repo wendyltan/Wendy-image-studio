@@ -119,6 +119,10 @@ test('executor retrieves the original generated media through page assets',()=>{
   assert.match(instruction,/pageAssets\.bundle\(/);
   assert.match(instruction,/contentType/);
   assert.match(instruction,/downloadedCount/);
+  assert.match(instruction,/stable file id|稳定.*file id/);
+  assert.match(instruction,/matchingStrategy/);
+  assert.match(instruction,/重新执行 pageAssets\.list\(\)/);
+  assert.match(instruction,/kind="other"/);
   assert.doesNotMatch(instruction,/tab\.playwright\.waitForEvent\("download"\)/);
 });
 
