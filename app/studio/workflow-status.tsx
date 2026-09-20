@@ -7,7 +7,7 @@ import {
   RotateCcw,
 } from 'lucide-react';
 import { effortLabels } from './constants';
-import type { ProgressStage, Project, Task } from './types';
+import type { FailureClassification, ProgressStage, Project, Task } from './types';
 import {
   elapsed,
   stageElapsedMs,
@@ -77,6 +77,7 @@ export function WorkflowStatus({
   panelDecisionPrimary,
   recoveryPending,
   now,
+  failureClassification,
 }: {
   project: Project;
   progress: Project['progress'];
@@ -88,6 +89,7 @@ export function WorkflowStatus({
   panelDecisionPrimary: boolean;
   recoveryPending: boolean;
   now: number;
+  failureClassification?: FailureClassification | null;
 }) {
   const taskLabels: Record<string, string> = {
     unknown_result: '结果尚未确认',
@@ -173,6 +175,17 @@ export function WorkflowStatus({
           ? '后台已接单，但当前网页生图请求已失败；请求记录和原图找回入口仍保留。'
           : '网页生图请求已失败；请求记录和原图找回入口仍保留。')
       : '';
+  const failureCategoryLabels: Record<string, string> = {
+    extension_unavailable: '浏览器扩展不可用',
+    tab_creation: '专用标签页创建',
+    navigation: '页面导航或入口',
+    attachment_entry: '附件入口',
+    file_chooser: '文件选择器',
+    upload_verification: '附件核对',
+    send: '发送请求',
+    post_submit_unknown: '提交后结果未知',
+    other: '其他',
+  };
   const savedArtifactQaUnavailable =
     task?.status === 'artifact_saved_unchecked' ||
     task?.status === 'review_required' ||
@@ -355,6 +368,16 @@ export function WorkflowStatus({
               思考{taskText && ` · ${taskText}`}
             </small>
             {ownedTabText && <small> · {ownedTabText}</small>}
+            {failureClassification?.classifierSource === 'jev' && (
+              <small>
+                · Jev辅助分类：
+                {failureCategoryLabels[failureClassification.category] || '其他'}
+                {failureClassification.confidence === null
+                  ? ''
+                  : `（置信度 ${Math.round(failureClassification.confidence * 100)}%）`}
+                ，仅供说明，不改变重试、发送、额度或标签页策略
+              </small>
+            )}
           </span>
         </div>
         {project.busy ? (

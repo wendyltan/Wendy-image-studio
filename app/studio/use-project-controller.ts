@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import { studioApi, type CreateProjectInput } from './api';
-import type { Bootstrap, Project, Story } from './types';
+import type { Bootstrap, FailureClassification, Project, Story } from './types';
 
 export type StudioStatus = {
   setWaiting: Dispatch<SetStateAction<boolean>>;
@@ -65,6 +65,8 @@ export function useProjectController({
   const [data, setData] = useState<Bootstrap | null>(null);
   const [current, setCurrent] = useState<string | null>(null);
   const [project, setProject] = useState<Project | null>(null);
+  const [failureClassification, setFailureClassification] =
+    useState<FailureClassification | null>(null);
   const [restarting, setRestarting] = useState(false);
   const modelInitialized = useRef(false);
   const lastMessage = useRef('');
@@ -178,6 +180,35 @@ export function useProjectController({
       if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [current, status]);
+
+  const failureClassificationKey = project?.pending?.webState === 'failed'
+    ? [
+        project.id,
+        project.pending.requestId || project.pending.taskId || '',
+        project.pending.errorCode || '',
+      ].join(':')
+    : '';
+
+  useEffect(() => {
+    if (!current || !failureClassificationKey) {
+      return;
+    }
+    let gone = false;
+    const controller = new AbortController();
+    void studioApi
+      .failureClassification(current, controller.signal)
+      .then((result) => {
+        if (!gone) setFailureClassification(result);
+      })
+      .catch(() => {
+        // Classification is optional UI metadata. A failure here must never
+        // replace or delay the persisted workflow error.
+      });
+    return () => {
+      gone = true;
+      controller.abort();
+    };
+  }, [current, failureClassificationKey]);
 
   useEffect(() => {
     if (!project) return;
@@ -382,6 +413,7 @@ export function useProjectController({
   return {
     data,
     project,
+    failureClassification: failureClassificationKey ? failureClassification : null,
     current,
     restarting,
     refresh,

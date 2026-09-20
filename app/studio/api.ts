@@ -5,6 +5,7 @@ import type {
   Project,
   Proposal,
   StagedAssetCandidate,
+  FailureClassification,
 } from './types';
 
 export async function request<T>(
@@ -70,6 +71,12 @@ export const studioApi = {
   account: () => request<Bootstrap['account']>('/api/account', {}),
   project: (id: string, signal?: AbortSignal) =>
     request<Project>(`/api/projects/${id}`, undefined, signal),
+  failureClassification: (id: string, signal?: AbortSignal) =>
+    request<FailureClassification>(
+      `/api/projects/${id}/failure-classification`,
+      undefined,
+      signal,
+    ),
   createProject: (input: CreateProjectInput) =>
     request<Project>('/api/projects', input),
   restart: () => request<RestartResult>('/api/restart', {}),

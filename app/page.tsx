@@ -33,6 +33,7 @@ export default function Studio() {
     setSection,
     current,
     project,
+    failureClassification,
     idea,
     setIdea,
     pages,
@@ -584,6 +585,7 @@ export default function Studio() {
                 setEditNote={setEditNote}
                 analyze={analyze}
                 now={now}
+                failureClassification={failureClassification}
               />
             </>
           )}

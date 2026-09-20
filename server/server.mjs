@@ -1,6 +1,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import {execFile,spawn} from 'node:child_process';
 import {APP,ROOT,REFS,CHECKS,inside,digest} from './workflow.mjs';
 import {connectionStatus,appServerSnapshot,normalizeRateLimits} from './bridge.mjs';
@@ -8,6 +9,7 @@ import {WEB_IMAGE_PROVIDER,readWebManifest,webWorkerStatus} from './chatgpt-web-
 import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,decidePanel,rejectPanel,resume,reviseImage,repairPageLayout,unifyPageLayouts,recoverImage,reviewImage,retryMissingImage,imageRetryState,accept,recover,projectDir,syncRunningProject,refreshQuotaPauses,hasLiveWork} from './engine.mjs';
 import {CATEGORIES,listDocuments,listAssets,discoverArchiveStories,archiveStory,stageUpload,readCandidate,inspectStagedCandidate,saveManualAsset,searchAssets,analyzeAsset,saveAssetProposal,applyAssetProposal,saveDocument,suggestDocument,deleteProjectFolder,deleteArchiveStory} from './library.mjs';
 import {applyProjectStorageCleanup,reportDownloadsRedundancy,reportProjectStorage} from './storage-hygiene.mjs';
+import {classifyFailure} from './failure-classifier.mjs';
 const PORT=Number(process.env.PORT||4318);const HOST='127.0.0.1';
 const INSTANCE_ID=`${process.pid}-${Date.now()}`;let restartRequested=false;
 const front=path.join(APP,'dist/client');
@@ -42,6 +44,16 @@ function publicAsset(asset){
 }
 function publicAssets(assets=listAssets()){return assets.map(publicAsset);}
 function readJson(file){try{return JSON.parse(fs.readFileSync(file,'utf8'));}catch{return null;}}
+function writeFailureClassification(dir, value){
+  if(!dir||!value)return;
+  try{
+    fs.mkdirSync(dir,{recursive:true});
+    const file=path.join(dir,'failure-classification.json');
+    const temp=`${file}.tmp-${crypto.randomUUID()}`;
+    fs.writeFileSync(temp,JSON.stringify(value,null,2),{mode:0o600});
+    fs.renameSync(temp,file);
+  }catch{}
+}
 function pendingWebEvidence(p,pending){
   if(pending?.provider!==WEB_IMAGE_PROVIDER||!pending.dir)return null;
   const manifest=readWebManifest(path.join(pending.dir,'web-generation.json'));if(!manifest)return null;
@@ -223,6 +235,28 @@ const server=http.createServer(async(req,res)=>{
     if(url.pathname==='/api/storage/downloads-report'&&req.method==='GET'){
       const projectId=String(url.searchParams.get('projectId')||''),p=readProject(projectId),downloadsDir=process.env.WENDI_DOWNLOADS_DIR||path.join(process.env.HOME||'/Users/wuwendi','Downloads');
       return send(res,{downloads:reportDownloadsRedundancy({downloadsDir,projectRoot:projectDir(p.id)})});
+    }
+    const failureClassificationMatch=/^\/api\/projects\/([a-f0-9-]{36})\/failure-classification$/.exec(url.pathname);
+    if(failureClassificationMatch&&req.method==='GET'){
+      const p=readProject(failureClassificationMatch[1]),pending=p.pending;
+      if(!pending?.dir)return send(res,{category:'other',needsHuman:true,classifierSource:'fallback',model:null,confidence:null,probabilities:null,latencyMs:0,cacheHit:false,evidence:{submitted:false,submissionUncertain:false,hasReferences:false,attachmentExpectedKnown:false,attachmentObservedKnown:false,attachmentPending:false,sendEnabled:false,structuredFailureStage:false}});
+      const manifest=readWebManifest(path.join(pending.dir,'web-generation.json'))||{};
+      const uploadEvidence=readJson(path.join(pending.dir,'upload-evidence.json'))||{};
+      const result=await classifyFailure({
+        errorCode:manifest.errorCode||null,
+        error:manifest.error||null,
+        stage:manifest.ownedTabState||null,
+        failureStage:uploadEvidence.failureStage||manifest.failureStage||null,
+        submitted:manifest.submitted===true,
+        submissionUncertain:manifest.submissionUncertain===true,
+        referenceCount:Number(manifest.referenceCount),
+        attachmentExpected:uploadEvidence.attachmentExpected,
+        attachmentObserved:uploadEvidence.attachmentObserved,
+        attachmentPending:uploadEvidence.attachmentPending,
+        sendEnabled:uploadEvidence.sendEnabled,
+      });
+      writeFailureClassification(pending.dir,result);
+      return send(res,result);
     }
     const archiveDelete=/^\/api\/archive\/([A-Za-z0-9_-]+)\/delete$/.exec(url.pathname);if(archiveDelete&&req.method==='POST'){const b=await body(req);deleteArchiveStory(archiveDelete[1],b.confirmTitle);return send(res,{ok:true,archiveStories:discoverArchiveStories()});}
     const match=/^\/api\/projects\/([a-f0-9-]{36})(?:\/([a-z-]+))?$/.exec(url.pathname);

@@ -104,6 +104,27 @@ export type Pending = {
   kernelReset?: boolean;
 };
 
+export type FailureClassification = {
+  category:
+    | 'extension_unavailable'
+    | 'tab_creation'
+    | 'navigation'
+    | 'attachment_entry'
+    | 'file_chooser'
+    | 'upload_verification'
+    | 'send'
+    | 'post_submit_unknown'
+    | 'other';
+  needsHuman: boolean;
+  classifierSource: 'deterministic' | 'jev' | 'fallback';
+  model: string | null;
+  confidence: number | null;
+  probabilities: Record<string, number> | null;
+  latencyMs: number;
+  cacheHit: boolean;
+  evidence?: Record<string, boolean>;
+};
+
 export type ProgressStage = {
   id: string;
   label: string;
@@ -163,6 +184,7 @@ export type Project = {
   bundleURL: string;
   outputFolder: string;
   pending: Pending | null;
+  failureClassification?: FailureClassification | null;
   currentTask?: Task | null;
   imageRetry?: {
     certainty: 'confirmed_missing' | 'unknown_result';

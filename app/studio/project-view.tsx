@@ -7,7 +7,7 @@ import {
   Images,
   Leaf,
 } from 'lucide-react';
-import type { Plan, Picture, Project } from './types';
+import type { FailureClassification, Plan, Picture, Project } from './types';
 import { ProjectPictures } from './project-pictures';
 import { ProjectPlan } from './project-plan';
 import { ProjectSamples } from './project-samples';
@@ -45,6 +45,7 @@ export function ProjectView({
   setEditNote,
   analyze,
   now,
+  failureClassification,
 }: {
   project: Project;
   plan: Plan | null;
@@ -66,6 +67,7 @@ export function ProjectView({
   setEditNote: (x: string) => void;
   analyze: (kind: 'page' | 'panel' | 'sample', key: string | number) => void;
   now: number;
+  failureClassification?: FailureClassification | null;
 }) {
   const progress = project.progress;
   const task = project.currentTask;
@@ -163,6 +165,7 @@ export function ProjectView({
         panelDecisionPrimary={primaryCard === 'panel'}
         recoveryPending={Boolean(project.imageRetry)}
         now={now}
+        failureClassification={failureClassification}
       />
       {primaryCard === 'recovery' && <RecoveryCard action={action} />}
       {primaryCard === 'no-output' && (
