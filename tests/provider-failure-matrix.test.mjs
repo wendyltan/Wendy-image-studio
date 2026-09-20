@@ -43,6 +43,17 @@ test('every explicit pre-submission browser failure gets a complete false/false/
   }
 });
 
+test('owned-tab lifecycle boundary is recorded atomically without claiming a lost tab is closed',()=>{
+  const run=fixture();
+  patchManifest({stage:'accepted',manifestFile:run.manifestFile});
+  const value=patchManifest({stage:'failed',manifestFile:run.manifestFile,args:{submitted:'false',submissionIntent:'false',submissionUncertain:'false',preSubmissionFailure:'true',errorCode:'BROWSER_CHROME_UNAVAILABLE',error:'owned tab handle lost',ownedTabId:'unknown',ownedTabCleanupStatus:'not_observed',kernelReset:'true'}}).manifest;
+  assert.equal(value.preSubmissionFailure,true);
+  assert.equal(value.ownedTabId,null);
+  assert.equal(value.ownedTabCleanupStatus,'not_observed');
+  assert.equal(value.kernelReset,true);
+  assert.throws(()=>patchManifest({stage:'failed',manifestFile:run.manifestFile,args:{submitted:'false',errorCode:'BROWSER_CHROME_UNAVAILABLE',ownedTabCleanupStatus:'missing'}}),/ownedTabCleanupStatus/);
+});
+
 test('a proven no-send failure after submission intent keeps intent but remains certain pre-submission',()=>{
   const run=readyRun();
   patchManifest({stage:'submission-intent',manifestFile:run.manifestFile});
@@ -110,6 +121,10 @@ test('executor instructions carry explicit stage flags and only the image_prompt
   assert.match(instruction,/只复制 <image_prompt> 与 <\/image_prompt> 之间的文本/);
   assert.match(instruction,/filechooser[\s\S]*catch\(\(\)=>null\)/);
   assert.match(instruction,/node "[^"]+server\/run-manifest\.mjs"/);
+  assert.match(instruction,/globalThis\.__wendiOwnedTab/);
+  assert.match(instruction,/globalThis\.__wendiOwnedTabId/);
+  assert.match(instruction,/owned-tab-cleanup-status/);
+  assert.match(instruction,/kernel-reset/);
 });
 
 test('frozen reference validation rejects missing, unreadable, reordered, or tampered attachments before Chrome',()=>{

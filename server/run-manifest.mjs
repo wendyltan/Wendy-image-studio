@@ -8,7 +8,7 @@ import {inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence} f
 
 const MANIFEST_STATES=new Set(['queued','accepted','ready','submitted','downloaded','failed']);
 const URL_RE=/^https:\/\/chatgpt\.com\/(?:c\/[^\s?#]+)?(?:[?#][^\s]*)?$/;
-const VALUE_KEYS=new Set(['conversationUrl','referenceCount','errorCode','error','submissionConfirmedBy','artifactPath','accepted','submitted','submissionIntent','submissionUncertain','preSubmissionFailure','resumeCount','resumedAt','lastPreAcceptanceAttempt','lastConfirmedUnsentAttempt','confirmedUnsentAudit','role','executorModel','executorReasoningEffort','focusPolicy']);
+const VALUE_KEYS=new Set(['conversationUrl','referenceCount','errorCode','error','submissionConfirmedBy','artifactPath','accepted','submitted','submissionIntent','submissionUncertain','preSubmissionFailure','resumeCount','resumedAt','lastPreAcceptanceAttempt','lastConfirmedUnsentAttempt','confirmedUnsentAudit','role','executorModel','executorReasoningEffort','focusPolicy','ownedTabId','ownedTabCleanupStatus','kernelReset']);
 
 function now(){return new Date().toISOString();}
 function usageError(message){const error=new Error(message);error.code='MANIFEST_PATCH_REJECTED';return error;}
@@ -34,6 +34,19 @@ function bool(value,key){
   throw usageError(`${key} 必须是 true 或 false。`);
 }
 function integer(value,key){const parsed=Number(value);if(!Number.isInteger(parsed)||parsed<0)throw usageError(`${key} 必须是非负整数。`);return parsed;}
+function ownedTabId(value){
+  const normalized=String(value??'').trim();
+  // A missing/unknown handle is deliberately represented as null together
+  // with an explicit cleanup status; it is not evidence that the tab is gone.
+  if(!normalized||normalized==='unknown'||normalized==='unavailable')return null;
+  if(normalized.length>500)throw usageError('ownedTabId 过长。');
+  return normalized;
+}
+function cleanupStatus(value){
+  const normalized=String(value??'').trim();
+  if(!['open','closed','close_failed','not_observed','not_attempted'].includes(normalized))throw usageError('ownedTabCleanupStatus 必须是 open、closed、close_failed、not_observed 或 not_attempted。');
+  return normalized;
+}
 function outputPath(record){return record.workerOutput||record.expectedOutput||record.manifestOutput;}
 function manifestFileFrom(args){
   const file=String(args.manifestFile||'');
@@ -122,6 +135,9 @@ function stagePatch(stage,args,record){
     patch.submissionIntent=submissionIntent;
     patch.submissionUncertain=submissionUncertain;
     patch.preSubmissionFailure=preSubmissionFailure;
+    if(args.ownedTabId!==undefined)patch.ownedTabId=ownedTabId(args.ownedTabId);
+    if(args.ownedTabCleanupStatus!==undefined)patch.ownedTabCleanupStatus=cleanupStatus(args.ownedTabCleanupStatus);
+    if(args.kernelReset!==undefined)patch.kernelReset=bool(args.kernelReset,'kernelReset');
     if(args.conversationUrl)patch.conversationUrl=validateUrl(args.conversationUrl);
   }else if(stage==='resume'){
     const confirmedUnsent=Boolean(args.confirmedUnsentAudit);

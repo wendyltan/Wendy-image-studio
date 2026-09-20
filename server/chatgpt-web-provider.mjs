@@ -270,14 +270,24 @@ function matchingConfirmedUnsentAudit({dir,request,worker,manifest,expected={}}=
   const homeConversation=/^https:\/\/chatgpt\.com\/?$/.test(conversationUrl);
   const definitePreIntent=manifest.submitted!==true&&manifest.submissionIntent!==true&&manifest.preSubmissionFailure===true&&Number(manifest.referenceCount)===0&&!manifest.readyAt&&!manifest.submittedAt&&!manifest.downloadedAt;
   const noConversation=!conversationUrl;
-  if(manifest.errorCode!=='FILE_UPLOAD_CHROME_UNAVAILABLE'||(!stableConversation&&!homeConversation&&!noConversation)||(!stableConversation&&!definitePreIntent&&manifest.submissionIntent!==true))return null;
+  const uploadFailure=manifest.errorCode==='FILE_UPLOAD_CHROME_UNAVAILABLE';
+  const handleLossFailure=manifest.errorCode==='BROWSER_CHROME_UNAVAILABLE'
+    &&audit.failureStage==='owned-tab-handle-loss'
+    &&audit.evidence?.ownedTabHandleLost===true;
+  if((!uploadFailure&&!handleLossFailure)||(!stableConversation&&!homeConversation&&!noConversation)||(!stableConversation&&!definitePreIntent&&manifest.submissionIntent!==true))return null;
   if(String(audit.conversationUrl||'')!==String(manifest.conversationUrl||''))return null;
   for(const key of ['projectId','projectVersion','taskId','target','requestId']){
     const wanted=expected?.[key]??manifest?.[key]??worker?.[key]??request?.[key];
     for(const source of [request,worker,manifest,audit])if(wanted!==undefined&&source?.[key]!==undefined&&!sameIdentityValue(wanted,source[key],key))return null;
   }
   const evidence=audit.evidence||{};
-  if(evidence.composerContainsPrompt!==true||evidence.newUserMessagePresent!==false||evidence.generatedResultPresent!==false||evidence.sendButtonPresent!==true||evidence.executorOwnedTabClosed!==true)return null;
+  if(handleLossFailure){
+    if(evidence.composerContainsPrompt!==false||evidence.newUserMessagePresent!==false||evidence.generatedResultPresent!==false||evidence.sendButtonPresent!==false)return null;
+    if(audit.ownedTabCleanupStatus!=='not_observed'||manifest.ownedTabCleanupStatus!=='not_observed')return null;
+    if(audit.cleanupVerification!=='exact-owned-tab-getTab-not-found')return null;
+    if(audit.kernelReset!==true&&audit.kernelReset!==false)return null;
+    if(String(audit.ownedTabId??'')!==String(manifest.ownedTabId??''))return null;
+  }else if(evidence.composerContainsPrompt!==true||evidence.newUserMessagePresent!==false||evidence.generatedResultPresent!==false||evidence.sendButtonPresent!==true||evidence.executorOwnedTabClosed!==true)return null;
   const auditedAt=Date.parse(audit.auditedAt||'');if(!Number.isFinite(auditedAt)||auditedAt<Date.parse(manifest.submittedAt||manifest.readyAt||manifest.acceptedAt||manifest.createdAt||''))return null;
   return audit;
 }

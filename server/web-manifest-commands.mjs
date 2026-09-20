@@ -26,6 +26,10 @@ export function failureCommand(manifestFile,flags){
   return manifestCommand('failed',{manifestFile,args:failureArguments(flags)});
 }
 
+export function browserHandleLostCommand(manifestFile){
+  return manifestCommand('failed',{manifestFile,args:` --error-code "BROWSER_CHROME_UNAVAILABLE" --error "Chrome 专用标签页句柄未能保留，无法继续执行本次上传" --submitted false --submission-intent false --submission-uncertain false --pre-submission-failure true --owned-tab-id "<returned ownedTabId or unknown>" --owned-tab-cleanup-status "<closed|close_failed|not_observed>" --kernel-reset "<true或false>"`});
+}
+
 export function buildManifestCommands(manifestFile,{helperFile=DEFAULT_HELPER}={}){
   const command=(stage,args='')=>manifestCommand(stage,{manifestFile,helperFile,args});
   return Object.freeze({
@@ -40,6 +44,7 @@ export function buildManifestCommands(manifestFile,{helperFile=DEFAULT_HELPER}={
     uploadFailed:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'FILE_UPLOAD_CHROME_UNAVAILABLE',error:'附件入口或文件选择器未能完成'}),
     originPermissionDenied:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'BROWSER_ORIGIN_PERMISSION_DENIED',error:'chatgpt.com 站点源访问权限被拒绝'}),
     chromeUnavailable:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'BROWSER_CHROME_UNAVAILABLE',error:'Chrome extension 不可用'}),
+    browserHandleLost:browserHandleLostCommand(manifestFile),
     focusUnavailable:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'BROWSER_FOCUS_UNAVAILABLE',error:'Chrome 专用标签页焦点能力不可用'}),
     confirmedUnsentUploadFailed:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.confirmedUnsent,errorCode:'FILE_UPLOAD_CHROME_UNAVAILABLE',error:'已记录发送意图但页面确认未发送'}),
     submissionUncertain:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.uncertain,errorCode:'SUBMISSION_UNCERTAIN',error:'点击发送后无法确认是否送达'}),

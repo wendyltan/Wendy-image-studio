@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {test} from 'node:test';
 import {dispatchChatGptWebJob,resumeChatGptWebJob,readWebManifest,WEB_IMAGE_PROVIDER} from '../server/chatgpt-web-provider.mjs';
+import {patchManifest} from '../server/run-manifest.mjs';
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'wendi-direct-worker-'));
 function setup(mode){
  const dir=fs.mkdtempSync(path.join(root,'run-')),bin=path.join(dir,'worker.mjs');
@@ -23,6 +24,7 @@ let input='';process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>{
  if(mode==='usage-limit-once'){const marker=path.join(dir,'usage-limit-once');if(!fs.existsSync(marker)){fs.writeFileSync(marker,'1');console.log(JSON.stringify({type:'error',message:"You've hit your usage limit. Try again later."}));process.exitCode=1;return;}}
  if(mode==='legacy-confirmed-unsent-once'){const marker=path.join(dir,'legacy-confirmed-unsent-once');if(!fs.existsSync(marker)){fs.writeFileSync(marker,'1');write({...base,state:'failed',submitted:true,submissionIntent:true,referenceCount:2,readyAt:new Date().toISOString(),submittedAt:new Date().toISOString(),conversationUrl:'https://chatgpt.com/c/fixture-conversation',errorCode:'FILE_UPLOAD_CHROME_UNAVAILABLE',error:'upload wait remained disabled; no user message appeared'});process.exitCode=1;return;}}
  if(mode==='home-confirmed-unsent-once'){const marker=path.join(dir,'home-confirmed-unsent-once');if(!fs.existsSync(marker)){fs.writeFileSync(marker,'1');write({...base,state:'failed',submitted:false,submissionIntent:false,referenceCount:0,conversationUrl:'https://chatgpt.com/',errorCode:'FILE_UPLOAD_CHROME_UNAVAILABLE',error:'chooser failed before submission; no user message appeared'});process.exitCode=1;return;}}
+ if(mode==='owned-tab-handle-loss-once'){const marker=path.join(dir,'owned-tab-handle-loss-once');if(!fs.existsSync(marker)){fs.writeFileSync(marker,'1');write({...base,state:'failed',submitted:false,submissionIntent:false,referenceCount:0,errorCode:'BROWSER_CHROME_UNAVAILABLE',error:'owned tab handle was lost before navigation'});process.exitCode=1;return;}}
  if(mode==='focus-unavailable'){process.stderr.write('BROWSER_FOCUS_UNAVAILABLE: Chrome management capability is not advertised');process.exitCode=1;return;}
  if(mode==='origin-permission-denied'){console.log(JSON.stringify({type:'item.completed',item:{type:'mcp_tool_call',server:'cua_repl',tool:'js',result:{content:[{type:'text',text:'The user declined permission for this action. Browser use cannot access https://chatgpt.com because the user denied permission for this request.'}]}}}));write({...base,state:'accepted'});process.stderr.write('The user declined permission for this action. Browser use cannot access https://chatgpt.com because the user denied permission for this request.');process.exitCode=1;return;}
  if(mode==='origin-permission-denied-exit0'){write({...base,state:'failed',errorCode:'BROWSER_CHROME_UNAVAILABLE',error:'Chrome extension unavailable'});process.stderr.write('The user declined permission for this action. Browser use cannot access https://chatgpt.com because the user denied permission for this request.');return;}
@@ -98,6 +100,18 @@ test('a separately audited home pre-intent upload failure resumes the same reque
  const before=readWebManifest(path.join(args.dir,'web-generation.json')),requestId=before.requestId;
  assert.equal(before.conversationUrl,'https://chatgpt.com/');assert.equal(before.submitted,false);assert.equal(before.submissionIntent,false);assert.equal(before.preSubmissionFailure,true);
  fs.writeFileSync(path.join(args.dir,'web-audit.json'),JSON.stringify({schemaVersion:1,...identity,requestId,result:'confirmed_unsent',conversationUrl:before.conversationUrl,auditedAt:new Date(Date.now()+1000).toISOString(),evidence:{composerContainsPrompt:true,newUserMessagePresent:false,generatedResultPresent:false,sendButtonPresent:true,executorOwnedTabClosed:true}}));
+ const instruction=fs.readFileSync(path.join(args.dir,'prompt.txt'),'utf8');
+ const result=await resumeChatGptWebJob({...args,model:'gpt-5.6-luna',instruction,expected:{...identity,requestId}});
+ assert.equal(result.manifest.requestId,requestId);assert.equal(result.manifest.state,'downloaded');assert.equal(result.manifest.submitted,true);assert.equal(result.manifest.resumeCount,1);
+});
+test('a separately audited owned-tab handle loss resumes the same request only with boundary evidence',async()=>{
+ const args=setup('owned-tab-handle-loss-once'),identity={provider:WEB_IMAGE_PROVIDER,projectId:'77777777-7777-4777-8777-777777777777',projectVersion:6,taskId:'88888888-8888-4888-8888-888888888888',target:'第6页-第1格'};
+ fs.writeFileSync(path.join(args.dir,'request.json'),JSON.stringify(identity));
+ await assert.rejects(dispatchChatGptWebJob({...args,model:'gpt-5.6-luna'}));
+ const before=readWebManifest(path.join(args.dir,'web-generation.json')),requestId=before.requestId;
+ assert.equal(before.errorCode,'BROWSER_CHROME_UNAVAILABLE');assert.equal(before.preSubmissionFailure,true);assert.equal(before.submitted,false);
+ patchManifest({stage:'failed',manifestFile:path.join(args.dir,'web-generation.json'),args:{submitted:'false',submissionIntent:'false',submissionUncertain:'false',preSubmissionFailure:'true',errorCode:'BROWSER_CHROME_UNAVAILABLE',error:'owned tab handle was lost before navigation',ownedTabId:'fixture-owned-tab',ownedTabCleanupStatus:'not_observed',kernelReset:'false'}});
+ fs.writeFileSync(path.join(args.dir,'web-audit.json'),JSON.stringify({schemaVersion:2,...identity,requestId,result:'confirmed_unsent',failureStage:'owned-tab-handle-loss',ownedTabId:'fixture-owned-tab',ownedTabCleanupStatus:'not_observed',cleanupVerification:'exact-owned-tab-getTab-not-found',kernelReset:false,conversationUrl:null,auditedAt:new Date(Date.now()+1000).toISOString(),evidence:{ownedTabHandleLost:true,composerContainsPrompt:false,newUserMessagePresent:false,generatedResultPresent:false,sendButtonPresent:false,executorOwnedTabClosed:false}}));
  const instruction=fs.readFileSync(path.join(args.dir,'prompt.txt'),'utf8');
  const result=await resumeChatGptWebJob({...args,model:'gpt-5.6-luna',instruction,expected:{...identity,requestId}});
  assert.equal(result.manifest.requestId,requestId);assert.equal(result.manifest.state,'downloaded');assert.equal(result.manifest.submitted,true);assert.equal(result.manifest.resumeCount,1);
