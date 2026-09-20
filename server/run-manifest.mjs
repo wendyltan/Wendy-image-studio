@@ -113,7 +113,7 @@ function stagePatch(stage,args,record){
       const evidence=readDownloadEvidence(record.dir),result=readJsonObject(path.join(record.dir,'result.json')),validation=validateDownloadEvidence(evidence,{expectedIdentity:{projectId:record.request?.projectId,projectVersion:record.request?.projectVersion,taskId:record.request?.taskId,target:record.request?.target,requestId:current.requestId,runId:record.runId,conversationUrl:String(args.conversationUrl||current.conversationUrl||''),outputFile:artifact},request:record.request,worker:record.worker,result,manifest:current,outputFile:artifact,actual});
       if(!validation.ok)throw usageError(`结构化 pageAssets 下载证据未通过校验：${validation.errors.slice(0,4).join('；')}`);
     }
-    patch.state='downloaded';patch.accepted=true;patch.submitted=true;patch.artifactPath=artifact;patch.downloadedAt=now();patch.errorCode=null;patch.error=null;patch.failedAt=null;
+    patch.state='downloaded';patch.accepted=true;patch.submitted=true;patch.submissionIntent=true;patch.submissionUncertain=false;patch.preSubmissionFailure=false;patch.artifactPath=artifact;patch.downloadedAt=now();patch.errorCode=null;patch.error=null;patch.failedAt=null;
     if(args.conversationUrl)patch.conversationUrl=validateUrl(args.conversationUrl);
   }else if(stage==='failed'){
     const flags=failureFlags(args,current),{submitted,submissionIntent,submissionUncertain,preSubmissionFailure}=flags;

@@ -79,6 +79,9 @@ test('downloaded recovery clears stale failure markers from the durable manifest
   assert.equal(value.errorCode,null);
   assert.equal(value.error,null);
   assert.equal(value.failedAt,null);
+  assert.equal(value.submissionIntent,true);
+  assert.equal(value.submissionUncertain,false);
+  assert.equal(value.preSubmissionFailure,false);
   assert.equal(value.artifactPath,before.outputFile);
 });
 
