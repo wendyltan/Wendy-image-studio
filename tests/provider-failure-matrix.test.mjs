@@ -108,6 +108,7 @@ test('executor instructions carry explicit stage flags and only the image_prompt
   assert.equal((instruction.match(/\n<image_prompt>\n/g)||[]).length,1);
   assert.equal((instruction.match(/\n<\/image_prompt>/g)||[]).length,1);
   assert.match(instruction,/只复制 <image_prompt> 与 <\/image_prompt> 之间的文本/);
+  assert.match(instruction,/filechooser[\s\S]*catch\(\(\)=>null\)/);
   assert.match(instruction,/node "[^"]+server\/run-manifest\.mjs"/);
 });
 
