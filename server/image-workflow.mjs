@@ -6,6 +6,19 @@ import {createImagePreparation} from './image-preparation.mjs';
 
 const USAGE_LIMIT_ERROR=/(?:you'?ve hit your usage limit|usage limit(?: has been)? reached|rate limit reached|额度(?:已用尽|不足|限制)|使用额度(?:已用尽|不足)|hit your limit)/i;
 
+function ownedTabLifecycle(manifest) {
+  if (!manifest) return {};
+  return {
+    ownedTabId: manifest.ownedTabId || null,
+    sessionName: manifest.sessionName || null,
+    ownedTabState: manifest.ownedTabState || null,
+    cleanupStatus: manifest.cleanupStatus || manifest.ownedTabCleanupStatus || null,
+    cleanupVerifiedAt: manifest.cleanupVerifiedAt || null,
+    cleanupError: manifest.cleanupError || null,
+    kernelReset: manifest.kernelReset === true,
+  };
+}
+
 /**
  * The paid image path is a sequence of evidence-bearing stages.  This factory
  * keeps filesystem/provider details behind injected callbacks while leaving
@@ -120,8 +133,9 @@ export function createImageWorkflow({
       uploadPreparedBytes: prepared.reduce((n, item) => n + Number(item.sizeBytes || 0), 0),
       optimizedAttachmentCount: prepared.filter(item => item.optimized).length,
     });
-    const task = beginTask(project, 'image', key, {attempt, provider: webImageProvider, providerInvocationLimit: 1, providerInvocations: 0, source: prior ? 'edit' : 'generate', role: webImageExecutorRole, creativeModel: project.brief.model || null, creativeReasoningEffort: project.brief.reasoningEffort || null, executorModel: executor.model, executorReasoningEffort: executor.reasoningEffort, basePrompt, revisionDelta, revisionBase: revisionMeta.revisionBase || null, telemetry});
-    const pending = {key, file, dir, prompt, basePrompt, revisionDelta, revisionBase: revisionMeta.revisionBase || null, refs: refnames, inputFiles, sourceFiles, prior, provider: webImageProvider, executorModel: executor.model, executorReasoningEffort: executor.reasoningEffort, taskId: task.id, projectId: project.id, projectVersion: project.version, telemetry, at: new Date().toISOString()};
+    const lifecycleDefaults = {ownedTabId: null, ownedTabState: 'not_created', cleanupStatus: 'not_attempted', cleanupVerifiedAt: null, cleanupError: null, kernelReset: false};
+    const task = beginTask(project, 'image', key, {attempt, provider: webImageProvider, providerInvocationLimit: 1, providerInvocations: 0, source: prior ? 'edit' : 'generate', role: webImageExecutorRole, creativeModel: project.brief.model || null, creativeReasoningEffort: project.brief.reasoningEffort || null, executorModel: executor.model, executorReasoningEffort: executor.reasoningEffort, basePrompt, revisionDelta, revisionBase: revisionMeta.revisionBase || null, telemetry, ...lifecycleDefaults});
+    const pending = {key, file, dir, prompt, basePrompt, revisionDelta, revisionBase: revisionMeta.revisionBase || null, refs: refnames, inputFiles, sourceFiles, prior, provider: webImageProvider, executorModel: executor.model, executorReasoningEffort: executor.reasoningEffort, taskId: task.id, projectId: project.id, projectVersion: project.version, telemetry, ...lifecycleDefaults, at: new Date().toISOString()};
     writeRunRequest(dir, project, task, pending);
     project.pending = pending;
     project.lastFailure = null;
@@ -152,6 +166,8 @@ export function createImageWorkflow({
       pending.accepted = webManifest.accepted === true;
       pending.submitted = webManifest.submitted === true;
       pending.referenceCount = Number(webManifest.referenceCount) || 0;
+      Object.assign(pending, ownedTabLifecycle(webManifest));
+      Object.assign(task, ownedTabLifecycle(webManifest));
       saveProject(project);
     }
     activity(project, '正在核对网页执行结果并保存原图…');
@@ -161,7 +177,7 @@ export function createImageWorkflow({
       throw new Error('执行记录与本次图片请求不匹配，原文件已保留，不能自动采用或重试。');
     }
     task.providerInvocations = webManifest?.submitted ? 1 : (process.env.WENDI_TEST_PLAN_FILE ? task.providerInvocations : 0);
-    task.webTimings = webManifest ? {createdAt: webManifest.createdAt || null, acceptedAt: webManifest.acceptedAt || null, readyAt: webManifest.readyAt || null, submittedAt: webManifest.submittedAt || null, downloadedAt: webManifest.downloadedAt || null, executorModel: webManifest.executorModel || executor.model || null, executorReasoningEffort: webManifest.executorReasoningEffort || executor.reasoningEffort, role: webManifest.role || webImageExecutorRole} : null;
+    task.webTimings = webManifest ? {createdAt: webManifest.createdAt || null, acceptedAt: webManifest.acceptedAt || null, readyAt: webManifest.readyAt || null, submittedAt: webManifest.submittedAt || null, downloadedAt: webManifest.downloadedAt || null, executorModel: webManifest.executorModel || executor.model || null, executorReasoningEffort: webManifest.executorReasoningEffort || executor.reasoningEffort, role: webManifest.role || webImageExecutorRole, ...ownedTabLifecycle(webManifest)} : null;
     saveProject(project);
     if (preAcceptanceQuotaEvidence(pending, webManifest, failure, made)) {
       const usageError = String(failure?.message || webManifest.error || '已达到生图执行器额度限制。').slice(0, 1000);
@@ -273,6 +289,8 @@ export function createImageWorkflow({
         pending.accepted = webManifest.accepted === true;
         pending.submitted = webManifest.submitted === true;
         pending.referenceCount = Number(webManifest.referenceCount) || 0;
+        Object.assign(pending, ownedTabLifecycle(webManifest));
+        Object.assign(task, ownedTabLifecycle(webManifest));
         task.requestId = webManifest.requestId;
         task.accepted = pending.accepted;
         task.submitted = pending.submitted;
@@ -280,7 +298,7 @@ export function createImageWorkflow({
       }
       task.providerInvocations = webManifest?.submitted ? 1 : 0;
       task.webState = webManifest?.state || null;
-      task.webTimings = webManifest ? {createdAt: webManifest.createdAt || null, acceptedAt: webManifest.acceptedAt || null, readyAt: webManifest.readyAt || null, submittedAt: webManifest.submittedAt || null, downloadedAt: webManifest.downloadedAt || null, executorModel: webManifest.executorModel || executor.model || null, executorReasoningEffort: webManifest.executorReasoningEffort || executor.reasoningEffort, role: webManifest.role || executor.role} : null;
+      task.webTimings = webManifest ? {createdAt: webManifest.createdAt || null, acceptedAt: webManifest.acceptedAt || null, readyAt: webManifest.readyAt || null, submittedAt: webManifest.submittedAt || null, downloadedAt: webManifest.downloadedAt || null, executorModel: webManifest.executorModel || executor.model || null, executorReasoningEffort: webManifest.executorReasoningEffort || executor.reasoningEffort, role: webManifest.role || executor.role, ...ownedTabLifecycle(webManifest)} : null;
       saveProject(project);
       if (!matchingPendingManifest(pending)) { finishTask(project, task, 'unknown_result', {errorCode: 'REQUEST_IDENTITY_MISMATCH'}); throw new Error('续接记录与当前图片请求不匹配，原文件已保留，不能自动采用或重试。'); }
       if (preAcceptanceQuotaEvidence(pending, webManifest, failure, made)) {

@@ -1,0 +1,139 @@
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {test} from 'node:test';
+import {
+  ensureOwnedTabLease,
+  finalizeOwnedTabLease,
+  markOwnedTabCleanup,
+  markOwnedTabStage,
+  ownedTabSessionName,
+  readOwnedTabLease,
+  reserveOwnedTabCreate,
+} from '../server/owned-tab-lease.mjs';
+
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wendi-owned-tab-'));
+function fixture() {
+  const dir = fs.mkdtempSync(path.join(root, 'run-'));
+  return {dir, runId: path.basename(dir), requestId: crypto.randomUUID()};
+}
+
+test('owned tab session names are unique per run/request and never reuse the old group name', () => {
+  const one = ownedTabSessionName('run-a', crypto.randomUUID());
+  const two = ownedTabSessionName('run-b', crypto.randomUUID());
+  assert.match(one, /^🎨 温蒂生图-[a-f0-9]{8}$/);
+  assert.match(two, /^🎨 温蒂生图-[a-f0-9]{8}$/);
+  assert.notEqual(one, two);
+});
+
+test('reserve-create is atomic and a second create attempt is refused', () => {
+  const run = fixture();
+  ensureOwnedTabLease(run);
+  const reserved = reserveOwnedTabCreate(run);
+  assert.equal(reserved.state, 'creating');
+  assert.throws(() => reserveOwnedTabCreate(run), error => error.code === 'OWNED_TAB_ALREADY_CREATED');
+  assert.equal(readOwnedTabLease(run.dir, run).state, 'creating');
+});
+
+test('stage transitions expose upload and send boundaries and reject regressions', () => {
+  const run = fixture();
+  ensureOwnedTabLease(run);
+  reserveOwnedTabCreate(run);
+  markOwnedTabStage({...run, state: 'created', ownedTabId: 'tab-fixture'});
+  markOwnedTabStage({...run, state: 'uploading'});
+  markOwnedTabStage({...run, state: 'uploaded'});
+  assert.equal(readOwnedTabLease(run.dir, run).state, 'uploaded');
+  assert.throws(() => markOwnedTabStage({...run, state: 'created'}), error => error.code === 'OWNED_TAB_STAGE_REGRESSION');
+});
+
+test('created and verified close both require the reserved real handle', () => {
+  const run = fixture();
+  ensureOwnedTabLease(run);
+  assert.throws(() => markOwnedTabStage({...run, state: 'created', ownedTabId: 'tab-without-reservation'}), error => error.code === 'OWNED_TAB_CREATE_NOT_RESERVED');
+  reserveOwnedTabCreate(run);
+  assert.throws(() => markOwnedTabCleanup({...run, status: 'closed', verification: 'exact-owned-tab-close-returned'}), error => error.code === 'OWNED_TAB_ID_MISSING');
+  assert.throws(() => markOwnedTabCleanup({...run, status: 'close_failed', error: 'close threw'}), error => error.code === 'OWNED_TAB_ID_MISSING');
+  markOwnedTabStage({...run, state: 'created', ownedTabId: 'tab-close-throw'});
+  const failed = markOwnedTabCleanup({...run, status: 'close_failed', ownedTabId: 'tab-close-throw', error: 'close threw'});
+  assert.equal(failed.state, 'close_unconfirmed');
+  assert.equal(failed.cleanupStatus, 'close_failed');
+  assert.throws(() => markOwnedTabCleanup({...run, status: 'closed', ownedTabId: 'tab-close-throw', verification: 'exact-owned-tab-close-returned'}), error => error.code === 'OWNED_TAB_LEASE_TERMINAL');
+});
+
+test('verified close is distinct from close failure and handle loss', () => {
+  const closed = fixture();
+  ensureOwnedTabLease(closed);
+  reserveOwnedTabCreate(closed);
+  markOwnedTabStage({...closed, state: 'created', ownedTabId: 'tab-closed'});
+  const result = markOwnedTabCleanup({...closed, status: 'closed', ownedTabId: 'tab-closed', verification: 'exact-owned-tab-close-returned'});
+  assert.equal(result.state, 'closed_verified');
+  assert.equal(result.cleanupStatus, 'closed');
+  assert.ok(result.cleanupVerifiedAt);
+  assert.throws(() => markOwnedTabCleanup({...closed, status: 'closed', ownedTabId: 'tab-closed', verification: 'guess'}), error => error.code === 'OWNED_TAB_CLOSE_EVIDENCE_REQUIRED');
+
+  const lost = fixture();
+  ensureOwnedTabLease(lost);
+  reserveOwnedTabCreate(lost);
+  markOwnedTabStage({...lost, state: 'created', ownedTabId: 'tab-lost'});
+  const orphaned = markOwnedTabCleanup({...lost, status: 'not_observed', ownedTabId: 'tab-lost', error: 'kernel reset', kernelReset: true});
+  assert.equal(orphaned.state, 'orphaned');
+  assert.equal(orphaned.cleanupStatus, 'not_observed');
+  assert.equal(orphaned.kernelReset, true);
+  assert.equal(orphaned.cleanupVerifiedAt, null);
+});
+
+test('a downloaded run still records verified cleanup evidence', () => {
+  const run = fixture();
+  ensureOwnedTabLease(run);
+  reserveOwnedTabCreate(run);
+  markOwnedTabStage({...run, state: 'created', ownedTabId: 'tab-downloaded'});
+  for (const state of ['uploading', 'uploaded', 'sent', 'generating', 'downloaded']) {
+    markOwnedTabStage({...run, state});
+  }
+  const downloaded = readOwnedTabLease(run.dir, run);
+  assert.equal(downloaded.state, 'downloaded');
+  const closed = markOwnedTabCleanup({...run, status: 'closed', ownedTabId: 'tab-downloaded', verification: 'exact-owned-tab-close-returned'});
+  assert.equal(closed.state, 'closed_verified');
+  assert.equal(closed.cleanupStatus, 'closed');
+  assert.ok(closed.cleanupVerifiedAt);
+  assert.equal(closed.kernelReset, false);
+});
+
+test('executor exit writes unconfirmed cleanup and never claims a tab closed', () => {
+  const run = fixture();
+  ensureOwnedTabLease(run);
+  reserveOwnedTabCreate(run);
+  markOwnedTabStage({...run, state: 'created', ownedTabId: 'tab-exit'});
+  const result = finalizeOwnedTabLease({...run, reason: 'timeout'});
+  assert.equal(result.state, 'orphaned');
+  assert.equal(result.cleanupStatus, 'not_observed');
+  assert.equal(result.cleanupVerifiedAt, null);
+  assert.match(result.cleanupError, /无法直接调用 CUA close/);
+});
+
+test('approval, abort, timeout, and CLI exit all use the same conservative finalizer', () => {
+  for (const reason of ['approval-failure', 'abort', 'timeout', 'cli-exit']) {
+    const run = fixture();
+    ensureOwnedTabLease(run);
+    reserveOwnedTabCreate(run);
+    markOwnedTabStage({...run, state: 'created', ownedTabId: `tab-${reason}`});
+    const result = finalizeOwnedTabLease({...run, reason});
+    assert.equal(result.state, 'orphaned');
+    assert.equal(result.cleanupStatus, 'not_observed');
+    assert.equal(result.ownedTabId, `tab-${reason}`);
+    assert.match(result.cleanupError, new RegExp(reason));
+  }
+});
+
+test('executor exit with no observed handle becomes orphaned/not_observed', () => {
+  const run = fixture();
+  ensureOwnedTabLease(run);
+  reserveOwnedTabCreate(run);
+  const result = finalizeOwnedTabLease({...run, reason: 'kernel-reset', kernelReset: true});
+  assert.equal(result.state, 'orphaned');
+  assert.equal(result.cleanupStatus, 'not_observed');
+  assert.equal(result.ownedTabId, null);
+  assert.equal(result.kernelReset, true);
+});

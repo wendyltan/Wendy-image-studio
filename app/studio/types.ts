@@ -72,6 +72,13 @@ export type Task = {
   errorCode?: string;
   webState?: string | null;
   webTimings?: Record<string, string | null> | null;
+  ownedTabId?: string | null;
+  sessionName?: string | null;
+  ownedTabState?: string | null;
+  cleanupStatus?: string | null;
+  cleanupVerifiedAt?: string | null;
+  cleanupError?: string | null;
+  kernelReset?: boolean;
 };
 
 export type Pending = {
@@ -88,6 +95,13 @@ export type Pending = {
   submittedAt?: string | null;
   downloadedAt?: string | null;
   errorCode?: string | null;
+  ownedTabId?: string | null;
+  sessionName?: string | null;
+  ownedTabState?: string | null;
+  cleanupStatus?: string | null;
+  cleanupVerifiedAt?: string | null;
+  cleanupError?: string | null;
+  kernelReset?: boolean;
 };
 
 export type ProgressStage = {

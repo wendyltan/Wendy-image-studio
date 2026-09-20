@@ -8,7 +8,7 @@ import {inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence} f
 
 const MANIFEST_STATES=new Set(['queued','accepted','ready','submitted','downloaded','failed']);
 const URL_RE=/^https:\/\/chatgpt\.com\/(?:c\/[^\s?#]+)?(?:[?#][^\s]*)?$/;
-const VALUE_KEYS=new Set(['conversationUrl','referenceCount','errorCode','error','submissionConfirmedBy','artifactPath','accepted','submitted','submissionIntent','submissionUncertain','preSubmissionFailure','resumeCount','resumedAt','lastPreAcceptanceAttempt','lastConfirmedUnsentAttempt','confirmedUnsentAudit','role','executorModel','executorReasoningEffort','focusPolicy','ownedTabId','ownedTabCleanupStatus','kernelReset']);
+const VALUE_KEYS=new Set(['conversationUrl','referenceCount','errorCode','error','submissionConfirmedBy','artifactPath','accepted','submitted','submissionIntent','submissionUncertain','preSubmissionFailure','resumeCount','resumedAt','lastPreAcceptanceAttempt','lastConfirmedUnsentAttempt','confirmedUnsentAudit','role','executorModel','executorReasoningEffort','focusPolicy','ownedTabId','ownedTabCleanupStatus','ownedTabState','sessionName','ownedTabCreatedAt','cleanupStatus','cleanupVerifiedAt','cleanupError','kernelReset']);
 
 function now(){return new Date().toISOString();}
 function usageError(message){const error=new Error(message);error.code='MANIFEST_PATCH_REJECTED';return error;}
@@ -44,8 +44,35 @@ function ownedTabId(value){
 }
 function cleanupStatus(value){
   const normalized=String(value??'').trim();
-  if(!['open','closed','close_failed','not_observed','not_attempted'].includes(normalized))throw usageError('ownedTabCleanupStatus 必须是 open、closed、close_failed、not_observed 或 not_attempted。');
+  if(!['open','closed','close_failed','not_observed','not_attempted','orphaned'].includes(normalized))throw usageError('ownedTabCleanupStatus 必须是 open、closed、close_failed、not_observed、orphaned 或 not_attempted。');
   return normalized;
+}
+function optionalText(value,max=1000){
+  if(value===undefined)return undefined;
+  if(value===null||String(value).trim()==='')return null;
+  return String(value).trim().slice(0,max);
+}
+function ownedTabState(value){
+  const normalized=String(value??'').trim();
+  const allowed=['not_created','creating','created','uploading','uploaded','sent','generating','downloaded','closing','closed_verified','close_unconfirmed','orphaned'];
+  if(!allowed.includes(normalized))throw usageError(`ownedTabState 不支持：${normalized}`);
+  return normalized;
+}
+function applyOwnedTabPatch(patch,args,{requireCleanup=false}={}){
+  if(args.ownedTabId!==undefined)patch.ownedTabId=ownedTabId(args.ownedTabId);
+  if(args.ownedTabCleanupStatus!==undefined)patch.ownedTabCleanupStatus=cleanupStatus(args.ownedTabCleanupStatus);
+  if(args.cleanupStatus!==undefined)patch.cleanupStatus=cleanupStatus(args.cleanupStatus);
+  if(args.ownedTabState!==undefined)patch.ownedTabState=ownedTabState(args.ownedTabState);
+  if(args.sessionName!==undefined)patch.sessionName=optionalText(args.sessionName,200);
+  if(args.ownedTabCreatedAt!==undefined)patch.ownedTabCreatedAt=optionalText(args.ownedTabCreatedAt,80);
+  if(args.cleanupVerifiedAt!==undefined)patch.cleanupVerifiedAt=optionalText(args.cleanupVerifiedAt,80);
+  if(args.cleanupError!==undefined)patch.cleanupError=optionalText(args.cleanupError,1000);
+  if(args.kernelReset!==undefined)patch.kernelReset=bool(args.kernelReset,'kernelReset');
+  if(requireCleanup){
+    const status=patch.cleanupStatus??patch.ownedTabCleanupStatus??null;
+    if(!status)throw usageError('cleanup 阶段必须记录 cleanupStatus。');
+    if(status==='closed'&&!patch.cleanupVerifiedAt&&!args.cleanupVerifiedAt)throw usageError('closed 必须记录 cleanupVerifiedAt。');
+  }
 }
 function outputPath(record){return record.workerOutput||record.expectedOutput||record.manifestOutput;}
 function manifestFileFrom(args){
@@ -127,6 +154,7 @@ function stagePatch(stage,args,record){
       if(!validation.ok)throw usageError(`结构化 pageAssets 下载证据未通过校验：${validation.errors.slice(0,4).join('；')}`);
     }
     patch.state='downloaded';patch.accepted=true;patch.submitted=true;patch.submissionIntent=true;patch.submissionUncertain=false;patch.preSubmissionFailure=false;patch.artifactPath=artifact;patch.downloadedAt=now();patch.errorCode=null;patch.error=null;patch.failedAt=null;
+    applyOwnedTabPatch(patch,args);
     if(args.conversationUrl)patch.conversationUrl=validateUrl(args.conversationUrl);
   }else if(stage==='failed'){
     const flags=failureFlags(args,current),{submitted,submissionIntent,submissionUncertain,preSubmissionFailure}=flags;
@@ -135,9 +163,7 @@ function stagePatch(stage,args,record){
     patch.submissionIntent=submissionIntent;
     patch.submissionUncertain=submissionUncertain;
     patch.preSubmissionFailure=preSubmissionFailure;
-    if(args.ownedTabId!==undefined)patch.ownedTabId=ownedTabId(args.ownedTabId);
-    if(args.ownedTabCleanupStatus!==undefined)patch.ownedTabCleanupStatus=cleanupStatus(args.ownedTabCleanupStatus);
-    if(args.kernelReset!==undefined)patch.kernelReset=bool(args.kernelReset,'kernelReset');
+    applyOwnedTabPatch(patch,args);
     if(args.conversationUrl)patch.conversationUrl=validateUrl(args.conversationUrl);
   }else if(stage==='resume'){
     const confirmedUnsent=Boolean(args.confirmedUnsentAudit);
@@ -154,6 +180,14 @@ function stagePatch(stage,args,record){
       if(args[key]!==undefined)patch[key]=args[key]===null?null:String(args[key]);
     }
     if(args.resumeCount!==undefined)patch.resumeCount=integer(args.resumeCount,'resumeCount');
+    applyOwnedTabPatch(patch,args);
+  }else if(stage==='cleanup'){
+    patch.state=current.state;
+    applyOwnedTabPatch(patch,args,{requireCleanup:true});
+    // Keep both names during the migration.  Existing UI/recovery code reads
+    // ownedTabCleanupStatus while new code can use the shorter cleanupStatus.
+    if(patch.cleanupStatus!==undefined&&patch.ownedTabCleanupStatus===undefined)patch.ownedTabCleanupStatus=patch.cleanupStatus;
+    if(patch.ownedTabCleanupStatus!==undefined&&patch.cleanupStatus===undefined)patch.cleanupStatus=patch.ownedTabCleanupStatus;
   }else throw usageError(`不支持的 manifest 阶段：${stage}`);
   validateLockedPatch(patch);
   ensureState(current.state,patch.state);

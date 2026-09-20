@@ -3,6 +3,7 @@ import path from 'node:path';
 import {spawn, execFileSync} from 'node:child_process';
 import readline from 'node:readline';
 import {APP} from './workflow.mjs';
+import {finalizeOwnedTabLease,readOwnedTabLease,syncOwnedTabLeaseToManifest} from './owned-tab-lease.mjs';
 
 const IMAGE_PATH = /(?:^|[\s"'`(])((?:\/[^\n<>"'`]+?)\.(?:png|webp|jpe?g))(?:$|[\s"'`,)])/gi;
 const CLEAR_NO_IMAGE = /(?:未产生(?:任何)?图片|未产出(?:任何)?图片|未能生成(?:图片)?|没有生成(?:替代品|图片)|没有(?:任何)?图片(?:产出|生成)?|目标路径尚不存在|未写入目标路径|Browser is not available:\s*(?:iab|chrome)|隐藏\s*IAB.*不可用|BROWSER_(?:FOCUS|TAB_BACKGROUND|CHROME)_(?:UNAVAILABLE|RESTORE_FAILED)|BROWSER_ORIGIN_PERMISSION_DENIED|The user declined permission(?: for this action)?|Browser use cannot access\s+https?:\/\/chatgpt\.com\b[^\n]*(?:denied permission|permission denied)|https?:\/\/chatgpt\.com\b[^\n]*browser security policy|browser security policy[^\n]*https?:\/\/chatgpt\.com\b|browser security policy|Chrome management capability is not advertised|焦点(?:恢复|管理)能力(?:不可用|未提供|未广告)|无法恢复创作室焦点|no image (?:was )?(?:generated|produced|created)|image generation (?:did not|failed to) (?:produce|create))/i;
@@ -260,6 +261,19 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
     const finish=(err,result,{responseText='',exitCode=null}={})=>{
       if(settled)return;settled=true;clearTimeout(timer);signal?.removeEventListener('abort',abort);log.end();
       saveExecution({state:err?'failed':'completed',endedAt:new Date().toISOString(),exitCode,durationMs:Math.max(0,Date.now()-Date.parse(startedAt)),error:err?String(err.message||err).slice(0,500):null});
+      // The CUA executor is the only component allowed to close its tab.  If
+      // it exited before writing verified close evidence, persist an explicit
+      // unconfirmed/orphaned lease instead of claiming that the tab vanished.
+      // Runs without a lease (creative/fixture executions) are untouched.
+      try{
+        const lease=readOwnedTabLease(dir,{runId});
+        if(lease){
+          const browserFailure=String(err?.message||error||'');
+          const kernelReset=/kernel\s*reset|globalThis[^\n]*(?:lost|undefined)|owned.?tab[^\n]*(?:lost|handle)/i.test(browserFailure);
+          const finalized=finalizeOwnedTabLease({dir,runId,requestId:lease.requestId,reason:err?'executor-exit':'executor-finished',kernelReset});
+          if(finalized)syncOwnedTabLeaseToManifest({dir,manifestFile:path.join(dir,'web-generation.json'),lease:finalized});
+        }
+      }catch{}
       const runEvidence=evidence(responseText,exitCode);
       if(err){Object.defineProperty(err,'generationEvidence',{value:runEvidence,enumerable:false});return reject(err);}
       if(result&&typeof result==='object'){

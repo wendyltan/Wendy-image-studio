@@ -1,5 +1,6 @@
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {OWNED_TAB_LEASE_FILE} from './owned-tab-lease.mjs';
 
 const DEFAULT_HELPER=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'run-manifest.mjs');
 
@@ -18,6 +19,14 @@ export function manifestCommand(stage,{manifestFile,helperFile=DEFAULT_HELPER,ar
   return `node ${quote(path.resolve(helperFile))} ${stage} --manifest-file ${quote(path.resolve(manifestFile))}${args}`;
 }
 
+function leaseCommand(stage,{manifestFile,runId,requestId,sessionName,ownedTabId,state,status,error,verification,helperFile}={}){
+  if(!manifestFile)throw new Error('manifestFile is required');
+  const dir=path.dirname(path.resolve(manifestFile));
+  const helper=path.resolve(helperFile||path.resolve(path.dirname(fileURLToPath(import.meta.url)),'owned-tab-lease.mjs'));
+  const args=[stage,'--run-dir',dir,'--lease-file',path.join(dir,OWNED_TAB_LEASE_FILE),'--manifest-file',path.resolve(manifestFile),'--run-id',runId||path.basename(dir),...(requestId?['--request-id',requestId]:[]),...(sessionName?['--session-name',sessionName]:[]),...(ownedTabId?['--owned-tab-id',ownedTabId]:[]),...(state?['--state',state]:[]),...(status?['--status',status]:[]),...(error?['--error',error]:[]),...(verification?['--verification',verification]:[])];
+  return `node ${quote(helper)} ${args.map(quote).join(' ')}`;
+}
+
 export function failureArguments({submitted,submissionIntent,submissionUncertain,preSubmissionFailure,errorCode='<错误代码>',error='<简短原始错误>'}={}){
   return ` --error-code ${quote(errorCode)} --error ${quote(error)} --submitted ${flag(Boolean(submitted))} --submission-intent ${flag(Boolean(submissionIntent))} --submission-uncertain ${flag(Boolean(submissionUncertain))} --pre-submission-failure ${flag(Boolean(preSubmissionFailure))}`;
 }
@@ -30,8 +39,10 @@ export function browserHandleLostCommand(manifestFile){
   return manifestCommand('failed',{manifestFile,args:` --error-code "BROWSER_CHROME_UNAVAILABLE" --error "Chrome 专用标签页句柄未能保留，无法继续执行本次上传" --submitted false --submission-intent false --submission-uncertain false --pre-submission-failure true --owned-tab-id "<returned ownedTabId or unknown>" --owned-tab-cleanup-status "<closed|close_failed|not_observed>" --kernel-reset "<true或false>"`});
 }
 
-export function buildManifestCommands(manifestFile,{helperFile=DEFAULT_HELPER}={}){
+export function buildManifestCommands(manifestFile,{helperFile=DEFAULT_HELPER,requestId=null,sessionName=null}={}){
   const command=(stage,args='')=>manifestCommand(stage,{manifestFile,helperFile,args});
+  const dir=path.dirname(path.resolve(manifestFile));
+  const runId=path.basename(dir);
   return Object.freeze({
     accepted:command('accepted'),
     ready:command('ready',' --conversation-url "<当前会话地址>" --reference-count <已确认附件数>'),
@@ -45,6 +56,11 @@ export function buildManifestCommands(manifestFile,{helperFile=DEFAULT_HELPER}={
     originPermissionDenied:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'BROWSER_ORIGIN_PERMISSION_DENIED',error:'chatgpt.com 站点源访问权限被拒绝'}),
     chromeUnavailable:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'BROWSER_CHROME_UNAVAILABLE',error:'Chrome extension 不可用'}),
     browserHandleLost:browserHandleLostCommand(manifestFile),
+    ownedTabEnsure:leaseCommand('ensure',{manifestFile,runId,requestId,sessionName}),
+    ownedTabReserveCreate:leaseCommand('reserve-create',{manifestFile,runId,requestId,sessionName}),
+    ownedTabCreated:(ownedTabId,tabSessionName=sessionName)=>leaseCommand('stage',{manifestFile,runId,requestId,state:'created',ownedTabId,sessionName:tabSessionName}),
+    ownedTabStage:(state,ownedTabId)=>leaseCommand('stage',{manifestFile,runId,requestId,state,ownedTabId}),
+    ownedTabCleanup:(status,ownedTabId,error,verification='exact-owned-tab-close-returned')=>leaseCommand('cleanup',{manifestFile,runId,requestId,status,ownedTabId,error,verification}),
     focusUnavailable:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'BROWSER_FOCUS_UNAVAILABLE',error:'Chrome 专用标签页焦点能力不可用'}),
     confirmedUnsentUploadFailed:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.confirmedUnsent,errorCode:'FILE_UPLOAD_CHROME_UNAVAILABLE',error:'已记录发送意图但页面确认未发送'}),
     submissionUncertain:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.uncertain,errorCode:'SUBMISSION_UNCERTAIN',error:'点击发送后无法确认是否送达'}),

@@ -5,6 +5,7 @@ import {runCodex,findCodex} from './bridge.mjs';
 import {identityFields,sameIdentityValue,readJsonObject as readRunJson,readRunIdentity,compareRunIdentity} from './run-identity.mjs';
 import {patchManifest} from './run-manifest.mjs';
 import {chatGptWebImagePrompt} from './web-executor-instructions.mjs';
+import {ensureOwnedTabLease,ownedTabSessionName,readOwnedTabLease,syncOwnedTabLeaseToManifest} from './owned-tab-lease.mjs';
 import {browserFailurePrefix,browserPreSubmissionUnavailableText,browserRunEvidenceText,structuredBrowserToolResultText,browserOriginPermissionDeniedEvidence,fileUploadChromeUnavailableEvidence,iabUnavailableEvidence,browserTabBackgroundEvidence,chromeUnavailableEvidence,browserFocusEvidence,completeDownloadEvidence,enrichDownloadEvidenceIdentity,extractDownloadEvidence,inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence,writeDownloadEvidence} from './web-download-evidence.mjs';
 // Keep the durable provider id for existing project records. The production
 // transport is direct Chrome; older IAB manifests remain readable for
@@ -309,7 +310,8 @@ export async function dispatchChatGptWebJob({codexBin,dir,outputFile,prompt,refe
   const manifestFile=path.join(dir,'web-generation.json'),instructionFile=path.join(dir,'prompt.txt'),requestFile=path.join(dir,'worker-request.json'),requestMetadataFile=path.join(dir,'request.json');
   if(fs.existsSync(requestFile))throw new Error('这个图片请求已存在，请检查已有结果，不会再次执行。');
   const requestId=crypto.randomUUID(),createdAt=new Date().toISOString(),absoluteOutput=path.resolve(outputFile);
-  const runId=path.basename(path.resolve(dir)),requestIdentity=identityFields(readJsonObject(path.join(dir,'request.json'))),lockedIdentity={...requestIdentity,requestId,runId,outputFile:absoluteOutput};
+  const runId=path.basename(path.resolve(dir)),sessionName=ownedTabSessionName(runId,requestId);
+  const requestIdentity=identityFields(readJsonObject(path.join(dir,'request.json'))),lockedIdentity={...requestIdentity,requestId,runId,outputFile:absoluteOutput};
   const commonIdentity={identitySchemaVersion:2,identityLocked:true,...lockedIdentity};
   const previousRequest=readJsonObject(requestMetadataFile)||{};
   const referenceValidation=validateFrozenReferenceFiles({referenceFiles,expectedEntries:previousRequest.referenceFiles});
@@ -319,12 +321,16 @@ export async function dispatchChatGptWebJob({codexBin,dir,outputFile,prompt,refe
     error.referenceValidation=referenceValidation;
     throw error;
   }
-  writeJson(manifestFile,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,transport:WEB_IMAGE_TRANSPORT,browser:WEB_IMAGE_BROWSER,focusPolicy:WEB_IMAGE_FOCUS_POLICY,role,executorModel:model||null,executorReasoningEffort:reasoningEffort,...commonIdentity,state:'queued',accepted:false,submitted:false,referenceCount:0,createdAt});
+  writeJson(manifestFile,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,transport:WEB_IMAGE_TRANSPORT,browser:WEB_IMAGE_BROWSER,focusPolicy:WEB_IMAGE_FOCUS_POLICY,role,executorModel:model||null,executorReasoningEffort:reasoningEffort,sessionName,ownedTabId:null,ownedTabState:'not_created',ownedTabCleanupStatus:'not_attempted',cleanupStatus:'not_attempted',cleanupVerifiedAt:null,cleanupError:null,kernelReset:false,...commonIdentity,state:'queued',accepted:false,submitted:false,referenceCount:0,createdAt});
   writeJson(requestMetadataFile,{...previousRequest,schemaVersion:Number(previousRequest.schemaVersion||2),provider:previousRequest.provider||WEB_IMAGE_PROVIDER,identitySchemaVersion:2,identityLocked:true,...lockedIdentity,expectedOutput:previousRequest.expectedOutput||path.relative(path.resolve(dir,'..','..'),absoluteOutput)});
-  writeJson(requestFile,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,transport:WEB_IMAGE_TRANSPORT,browser:WEB_IMAGE_BROWSER,focusPolicy:WEB_IMAGE_FOCUS_POLICY,role,executorModel:model||null,executorReasoningEffort:reasoningEffort,...commonIdentity,expectedOutput:path.relative(path.resolve(dir,'..','..'),absoluteOutput),authorization:{confirmed:true,scope:'one_chatgpt_web_image_submission',confirmedAt:createdAt},instructionFile,manifestFile,referenceFiles:referenceValidation.files.map(item=>item.path),referenceEntries:referenceValidation.files.map(({name,sizeBytes,sha256})=>({name,sizeBytes,sha256})),createdAt});
+  writeJson(requestFile,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,transport:WEB_IMAGE_TRANSPORT,browser:WEB_IMAGE_BROWSER,focusPolicy:WEB_IMAGE_FOCUS_POLICY,role,executorModel:model||null,executorReasoningEffort:reasoningEffort,sessionName,...commonIdentity,expectedOutput:path.relative(path.resolve(dir,'..','..'),absoluteOutput),authorization:{confirmed:true,scope:'one_chatgpt_web_image_submission',confirmedAt:createdAt},instructionFile,manifestFile,referenceFiles:referenceValidation.files.map(item=>item.path),referenceEntries:referenceValidation.files.map(({name,sizeBytes,sha256})=>({name,sizeBytes,sha256})),createdAt});
   writeJson(path.join(dir,'run-identity.json'),{schemaVersion:1,identitySchemaVersion:2,identityLocked:true,provider:WEB_IMAGE_PROVIDER,...lockedIdentity,expectedOutput:absoluteOutput,createdAt});
+  ensureOwnedTabLease({dir,runId,requestId,sessionName});
+  const executorPrompt=chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceFiles,editTarget,conversationUrl,capsule,requestId,runId,sessionName});
   let result,failure;
-  try{result=await runCodex({codexBin,dir,image:true,browserMode:'chrome',signal,timeoutMs,model,reasoningEffort,role,writableDirs:[path.dirname(path.resolve(outputFile))],prompt:chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceFiles,editTarget,conversationUrl,capsule,requestId})});}catch(error){failure=error;}
+  try{result=await runCodex({codexBin,dir,image:true,browserMode:'chrome',signal,timeoutMs,model,reasoningEffort,role,writableDirs:[path.dirname(path.resolve(outputFile))],prompt:executorPrompt});}catch(error){failure=error;}
+  const lease=readOwnedTabLease(dir,{runId,requestId});
+  if(lease)syncOwnedTabLeaseToManifest({dir,manifestFile,lease});
   const downloadEvidence=downloadEvidenceFromRun({dir,result,manifestFile,outputFile,requestId});
   return finalizeWorkerResult({dir,manifestFile,outputFile,requestId,result,failure,model,reasoningEffort,role,downloadEvidence});
 }
@@ -355,13 +361,17 @@ export async function resumeChatGptWebJob({codexBin,dir,signal,timeoutMs=900000,
     error.referenceValidation=referenceValidation;
     throw error;
   }
+  const runId=path.basename(path.resolve(dir)),sessionName=String(worker.sessionName||manifest.sessionName||ownedTabSessionName(runId,requestId));
   const instructionFile=String(worker.instructionFile||path.join(dir,'prompt.txt')),nextInstruction=typeof instruction==='string'&&instruction.trim()?instruction:fs.readFileSync(instructionFile,'utf8'),archive=preAcceptance?archivePreAcceptanceAttempt(dir,manifest,execution):archiveConfirmedUnsentAttempt(dir,manifest,execution,audit),resumedAt=new Date().toISOString();
   if(audit&&!(typeof instruction==='string'&&instruction.trim()))throw new Error('已确认未发送的续接缺少更新后执行指令；原记录已保留。');
   fs.writeFileSync(instructionFile,nextInstruction,{mode:0o600});
   const resumeArgs={resumeCount:Number(manifest.resumeCount||0)+1,resumedAt,...(preAcceptance?{lastPreAcceptanceAttempt:archive}:{lastConfirmedUnsentAttempt:archive,confirmedUnsentAudit:'web-audit.json'})};
   patchManifestState(manifestFile,'resume',resumeArgs);
   let result,failure;
+  ensureOwnedTabLease({dir,runId,requestId,sessionName});
   try{result=await runCodex({codexBin,dir,image:true,browserMode:'chrome',signal,timeoutMs,model:model||worker.executorModel||null,reasoningEffort:reasoningEffort||worker.executorReasoningEffort||WEB_IMAGE_EXECUTOR_EFFORT,role:role||worker.role||WEB_IMAGE_EXECUTOR_ROLE,writableDirs:[path.dirname(outputFile)],prompt:nextInstruction});}catch(error){failure=error;}
+  const lease=readOwnedTabLease(dir,{runId,requestId});
+  if(lease)syncOwnedTabLeaseToManifest({dir,manifestFile,lease});
   const downloadEvidence=downloadEvidenceFromRun({dir,result,manifestFile,outputFile,requestId});
   const finalResult=finalizeWorkerResult({dir,manifestFile,outputFile,requestId,result,failure,model:model||worker.executorModel||null,reasoningEffort:reasoningEffort||worker.executorReasoningEffort||WEB_IMAGE_EXECUTOR_EFFORT,role:role||worker.role||WEB_IMAGE_EXECUTOR_ROLE,downloadEvidence});
   try{

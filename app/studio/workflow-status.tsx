@@ -118,6 +118,29 @@ export function WorkflowStatus({
   const webText = project.pending?.webState
     ? webStateLabels[project.pending.webState] || '网页后台处理中'
     : '';
+  const ownedTabState =
+    project.pending?.ownedTabState ||
+    task?.ownedTabState ||
+    (typeof task?.webTimings?.ownedTabState === 'string'
+      ? task.webTimings.ownedTabState
+      : '');
+  const ownedTabLabels: Record<string, string> = {
+    not_created: '专用标签页尚未创建',
+    creating: '正在创建专用标签页',
+    created: '专用标签页已创建',
+    uploading: '附件上传中',
+    uploaded: '附件已上传，尚未发送',
+    sent: '已发送生图请求',
+    generating: '远端生成中',
+    downloaded: '原图已下载，正在收尾',
+    closing: '正在关闭专用标签页',
+    closed_verified: '专用标签页已关闭并核实',
+    close_unconfirmed: '专用标签页关闭未确认',
+    orphaned: '专用标签页句柄未观察到，不能确认已关闭',
+  };
+  const ownedTabText = ownedTabState
+    ? ownedTabLabels[ownedTabState] || '专用标签页状态未知'
+    : '';
   const webFailureMessages: Record<string, string> = {
     IAB_UNAVAILABLE:
       '这是旧请求记录中的 Codex 内嵌浏览器 IAB 失败；没有上传附件或发送消息。当前生产链路使用专用 Chrome 标签页，当前请求已失败，记录仍保留。',
@@ -156,6 +179,11 @@ export function WorkflowStatus({
     task?.errorCode === 'QA_UNAVAILABLE';
   const statusMessage =
     webFailureText ||
+    (ownedTabState === 'uploading' || ownedTabState === 'uploaded'
+      ? `${ownedTabText}；尚未发送消息`
+      : ownedTabText && ['close_unconfirmed', 'orphaned'].includes(ownedTabState)
+        ? ownedTabText
+        : '') ||
     (savedArtifactQaUnavailable
       ? '原图已保存，自动校对未完成，请人工查看；不会自动重生'
       : task?.status === 'not_accepted'
@@ -326,6 +354,7 @@ export function WorkflowStatus({
                 project.brief.reasoningEffort}
               思考{taskText && ` · ${taskText}`}
             </small>
+            {ownedTabText && <small> · {ownedTabText}</small>}
           </span>
         </div>
         {project.busy ? (
