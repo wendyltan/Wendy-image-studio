@@ -5,7 +5,7 @@ import {runCodex,findCodex} from './bridge.mjs';
 import {identityFields,sameIdentityValue,readJsonObject as readRunJson,readRunIdentity,compareRunIdentity} from './run-identity.mjs';
 import {patchManifest} from './run-manifest.mjs';
 import {chatGptWebImagePrompt} from './web-executor-instructions.mjs';
-import {browserFailurePrefix,browserPreSubmissionUnavailableText,browserRunEvidenceText,structuredBrowserToolResultText,browserOriginPermissionDeniedEvidence,fileUploadChromeUnavailableEvidence,iabUnavailableEvidence,browserTabBackgroundEvidence,chromeUnavailableEvidence,browserFocusEvidence,completeDownloadEvidence,extractDownloadEvidence,inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence,writeDownloadEvidence} from './web-download-evidence.mjs';
+import {browserFailurePrefix,browserPreSubmissionUnavailableText,browserRunEvidenceText,structuredBrowserToolResultText,browserOriginPermissionDeniedEvidence,fileUploadChromeUnavailableEvidence,iabUnavailableEvidence,browserTabBackgroundEvidence,chromeUnavailableEvidence,browserFocusEvidence,completeDownloadEvidence,enrichDownloadEvidenceIdentity,extractDownloadEvidence,inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence,writeDownloadEvidence} from './web-download-evidence.mjs';
 // Keep the durable provider id for existing project records. The production
 // transport is direct Chrome; older IAB manifests remain readable for
 // recovery, but IAB is never a fallback for a new request.
@@ -148,13 +148,14 @@ function browserPreSubmissionFailureObserved(dir,failure,manifest=null){
 }
 
 function downloadEvidenceFromRun({dir,result,manifestFile,outputFile,requestId}={}){
-  const manifest=readWebManifest(manifestFile),texts=[result?.text,readDownloadEvidence(dir)];
+  const manifest=readWebManifest(manifestFile),runRecord=(()=>{try{return readRunIdentity(dir,{strict:true});}catch{return readRunIdentity(dir);}})(),request=runRecord?.request||null,worker=runRecord?.worker||null,resultRecord=readRunJson(path.join(dir,'result.json')),texts=[result?.text,readDownloadEvidence(dir)];
   try{texts.push(fs.readFileSync(path.join(dir,'response.txt'),'utf8'));}catch{}
   texts.push(structuredBrowserToolResultText(dir));
   let raw=null;for(const value of texts){raw=extractDownloadEvidence(value);if(raw)break;}
   let actual=null;try{if(fs.existsSync(outputFile))actual=inspectDownloadArtifact(outputFile);}catch(error){return {ok:false,errors:[`原始图片无法读取：${error.message}`],evidence:raw,actual:null};}
   if(!raw)return {ok:false,errors:['执行器没有返回结构化 pageAssets 下载证据。'],evidence:null,actual};
-  const evidence=completeDownloadEvidence(raw,{actual}),validation=validateDownloadEvidence(evidence,{conversationUrl:manifest?.conversationUrl||null,requestId,runId:path.basename(dir),outputFile,actual});
+  const identity={projectId:request?.projectId??worker?.projectId??manifest?.projectId,projectVersion:request?.projectVersion??worker?.projectVersion??manifest?.projectVersion,taskId:request?.taskId??worker?.taskId??manifest?.taskId,target:request?.target??worker?.target??manifest?.target,requestId,runId:path.basename(dir),conversationUrl:manifest?.conversationUrl||null,outputFile};
+  const evidence=enrichDownloadEvidenceIdentity(completeDownloadEvidence(raw,{actual}),identity),validation=validateDownloadEvidence(evidence,{expectedIdentity:identity,requestId,runId:path.basename(dir),outputFile,actual,request,worker,result:resultRecord,manifest});
   try{writeDownloadEvidence(dir,evidence);}catch(error){validation.ok=false;validation.errors=[...validation.errors,`download-evidence.json 写入失败：${error.message}`];}
   return {...validation,evidence,actual};
 }

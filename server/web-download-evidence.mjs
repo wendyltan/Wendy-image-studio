@@ -3,7 +3,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 export const DOWNLOAD_EVIDENCE_FILE='download-evidence.json';
-const DOWNLOAD_EVIDENCE_SCHEMA_VERSION=1;
+export const DOWNLOAD_EVIDENCE_SCHEMA_VERSION=2;
+const DOWNLOAD_EVIDENCE_IDENTITY_FIELDS=['projectId','projectVersion','taskId','requestId','runId','target'];
 const IMAGE_CONTENT_TYPES=new Set(['image/png','image/jpeg','image/webp']);
 const MEDIA_URL=/^https:\/\/chatgpt\.com\/backend-api\/estuary\/content(?:[?#/]|$)/i;
 const HASH=/^[a-f0-9]{64}$/i;
@@ -87,20 +88,62 @@ export function completeDownloadEvidence(evidence,{actual=null}={}){
   return value;
 }
 
+export function enrichDownloadEvidenceIdentity(evidence,identity={}){
+  const value=structuredClone(object(evidence)||{});
+  for(const key of DOWNLOAD_EVIDENCE_IDENTITY_FIELDS){
+    if(value[key]===undefined||value[key]===null||value[key]===''){
+      const candidate=identity[key];
+      if(candidate!==undefined&&candidate!==null&&candidate!=='')value[key]=candidate;
+    }
+  }
+  value.schemaVersion=DOWNLOAD_EVIDENCE_SCHEMA_VERSION;
+  return value;
+}
+
+function normalizedIdentityValue(key,value){
+  if(value===undefined||value===null||value==='')return null;
+  if(key==='projectVersion')return Number.isFinite(Number(value))?Number(value):String(value);
+  if(key==='outputFile')return path.resolve(String(value));
+  return String(value);
+}
+function sourceIdentityValues(source,key){
+  const value=object(source),nested=object(value?.downloadEvidence);
+  if(!value&&!nested)return [];
+  const primary=key==='outputFile'?(value?.outputFile??value?.artifactPath??null):value?.[key],nestedValue=key==='outputFile'?nested?.output?.path:nested?.[key];
+  return [primary,nestedValue].filter(item=>item!==undefined&&item!==null&&item!=='');
+}
+
 /**
  * Validate the page-assets chain and the bytes copied to outputFile.  This is
  * deliberately independent of executor prose: every accepted field is
  * compared with the current run and the local artifact.
  */
-export function validateDownloadEvidence(value,{conversationUrl=null,requestId=null,runId=null,outputFile=null,actual=null}={}){
+export function validateDownloadEvidence(value,{conversationUrl=null,requestId=null,runId=null,outputFile=null,actual=null,expectedIdentity=null,request=null,worker=null,result:resultRecord=null,manifest=null}={}){
   const evidence=object(value),errors=[];
   if(!evidence)errors.push('缺少结构化 pageAssets 下载证据。');
   if(Number(evidence?.schemaVersion)!==DOWNLOAD_EVIDENCE_SCHEMA_VERSION)errors.push('download evidence schemaVersion 无效。');
+  const expected={...object(expectedIdentity),...(conversationUrl?{conversationUrl}:{}),...(requestId?{requestId}:{}),...(runId?{runId}:{}),...(outputFile?{outputFile}: {})};
   const observedConversation=text(evidence?.conversationUrl);
   if(!/^https:\/\/chatgpt\.com\/c\/[^\s?#]+(?:[?#][^\s]*)?$/.test(observedConversation))errors.push('conversationUrl 不是 ChatGPT 会话地址。');
-  if(conversationUrl&&observedConversation!==String(conversationUrl))errors.push('download evidence conversationUrl 与当前会话不一致。');
-  if(requestId&&text(evidence?.requestId)!==String(requestId))errors.push('download evidence requestId 与当前 request 不一致。');
-  if(runId&&text(evidence?.runId)!==String(runId))errors.push('download evidence runId 与当前执行不一致。');
+  if(expected.conversationUrl&&observedConversation!==String(expected.conversationUrl))errors.push('download evidence conversationUrl 与当前会话不一致。');
+  for(const key of DOWNLOAD_EVIDENCE_IDENTITY_FIELDS){
+    const observed=normalizedIdentityValue(key,evidence?.[key]);
+    if(observed===null)errors.push(`download evidence ${key} 缺失。`);
+    const wanted=normalizedIdentityValue(key,expected[key]);
+    if(wanted!==null&&observed!==null&&observed!==wanted)errors.push(`download evidence ${key} 与当前执行身份不一致。`);
+  }
+  const sources=[['request',request],['worker',worker],['result',resultRecord],['manifest',manifest]];
+  for(const [sourceName,source] of sources){
+    if(!object(source))continue;
+    for(const key of DOWNLOAD_EVIDENCE_IDENTITY_FIELDS){
+      const observed=normalizedIdentityValue(key,evidence?.[key]);
+      for(const sourceItem of sourceIdentityValues(source,key)){
+        const sourceValue=normalizedIdentityValue(key,sourceItem);
+        if(sourceValue!==null&&observed!==null&&sourceValue!==observed)errors.push(`download evidence ${key} 与 ${sourceName} 不一致。`);
+      }
+    }
+    for(const sourceConversation of sourceIdentityValues(source,'conversationUrl').map(text))if(sourceConversation&&observedConversation&&sourceConversation!==observedConversation)errors.push(`download evidence conversationUrl 与 ${sourceName} 不一致。`);
+  }
   if(text(evidence?.source)!=='pageAssets')errors.push('download evidence source 必须是 pageAssets。');
   if(!ISO.test(text(evidence?.capturedAt))||!Number.isFinite(Date.parse(evidence?.capturedAt)))errors.push('download evidence capturedAt 无效。');
   const result=object(evidence?.currentResult),src=text(result?.src);
@@ -135,7 +178,7 @@ export function validateDownloadEvidence(value,{conversationUrl=null,requestId=n
   const output=object(evidence?.output);
   if(!output)errors.push('缺少最终原图 output 证据。');
   else{
-    if(outputFile&&!samePath(output.path,outputFile))errors.push('output.path 与当前 worker outputFile 不一致。');
+    if(expected.outputFile&&!samePath(output.path,expected.outputFile))errors.push('output.path 与当前 worker outputFile 不一致。');
     if(!Number.isInteger(Number(output.bytes))||Number(output.bytes)<=0)errors.push('output.bytes 无效。');
     if(!contentTypeForFormat(output.format))errors.push('output.format 不是 PNG、JPEG 或 WEBP。');
     if(!Number.isInteger(Number(output.width))||Number(output.width)<=0||!Number.isInteger(Number(output.height))||Number(output.height)<=0)errors.push('output dimensions 无效。');
@@ -160,9 +203,9 @@ export function writeDownloadEvidence(dir,evidence){
 }
 
 /** Append a durable audit event for evidence recovered after the executor turn. */
-export function appendDownloadEvidenceTrace(dir,evidence,{validation=null,appendResponse=true}={}){
+export function appendDownloadEvidenceTrace(dir,evidence,{validation=null,appendResponse=true,eventType='download.evidence',metadataOnly=false}={}){
   if(!object(evidence))throw new TypeError('download evidence must be an object');
-  const marker=`<download_evidence>${JSON.stringify(evidence)}</download_evidence>`,event={type:'download.evidence',schemaVersion:1,capturedAt:evidence.capturedAt||null,requestId:evidence.requestId||null,runId:evidence.runId||null,downloadEvidence:evidence,validation:validation?{ok:validation.ok===true,errors:Array.isArray(validation.errors)?validation.errors:[]}:null};
+  const marker=`<download_evidence>${JSON.stringify(evidence)}</download_evidence>`,event={type:eventType,schemaVersion:1,metadataOnly:Boolean(metadataOnly),capturedAt:evidence.capturedAt||null,requestId:evidence.requestId||null,runId:evidence.runId||null,downloadEvidence:evidence,validation:validation?{ok:validation.ok===true,errors:Array.isArray(validation.errors)?validation.errors:[]}:null};
   const eventsFile=path.join(dir,'events.jsonl');fs.appendFileSync(eventsFile,JSON.stringify(event)+'\n',{mode:0o600});
   if(appendResponse)fs.appendFileSync(path.join(dir,'response.txt'),`\n${marker}\n`,{encoding:'utf8',mode:0o600});
   return event;

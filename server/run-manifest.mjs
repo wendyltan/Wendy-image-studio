@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import {fileURLToPath} from 'node:url';
-import {RUN_LOCKED_FIELDS,readRunIdentity,compareRunIdentity} from './run-identity.mjs';
+import {RUN_LOCKED_FIELDS,readJsonObject,readRunIdentity,compareRunIdentity} from './run-identity.mjs';
 import {inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence} from './web-download-evidence.mjs';
 
 const MANIFEST_STATES=new Set(['queued','accepted','ready','submitted','downloaded','failed']);
@@ -110,7 +110,7 @@ function stagePatch(stage,args,record){
     if(!artifact||!fs.existsSync(artifact)||!fs.statSync(artifact).isFile()||fs.statSync(artifact).size===0)throw usageError('目标原图不存在或为空，不能写入 downloaded。');
     if(current.transport==='direct-chrome'){
       let actual=null;try{actual=inspectDownloadArtifact(artifact);}catch(error){throw usageError(`原始图片完整性检查失败：${error.message}`);}
-      const evidence=readDownloadEvidence(record.dir),validation=validateDownloadEvidence(evidence,{conversationUrl:String(args.conversationUrl||current.conversationUrl||''),requestId:current.requestId,runId:record.runId,outputFile:artifact,actual});
+      const evidence=readDownloadEvidence(record.dir),result=readJsonObject(path.join(record.dir,'result.json')),validation=validateDownloadEvidence(evidence,{expectedIdentity:{projectId:record.request?.projectId,projectVersion:record.request?.projectVersion,taskId:record.request?.taskId,target:record.request?.target,requestId:current.requestId,runId:record.runId,conversationUrl:String(args.conversationUrl||current.conversationUrl||''),outputFile:artifact},request:record.request,worker:record.worker,result,manifest:current,outputFile:artifact,actual});
       if(!validation.ok)throw usageError(`结构化 pageAssets 下载证据未通过校验：${validation.errors.slice(0,4).join('；')}`);
     }
     patch.state='downloaded';patch.accepted=true;patch.submitted=true;patch.artifactPath=artifact;patch.downloadedAt=now();patch.errorCode=null;patch.error=null;patch.failedAt=null;

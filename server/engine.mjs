@@ -313,7 +313,7 @@ const imageRecovery=createImageRecovery({
   definiteImageFailure,
   failureMessage,
 });
-const {runEvidence,matchingWebRunRecord,matchingPendingManifest,checksum,verifyImage,inspectOrphanImageEvidence,persistImage,writeRunResult,attributableCandidates,recoverImage:recoverImageAction}=imageRecovery;
+const {runEvidence,matchingWebRunRecord,matchingPendingManifest,checksum,verifyImage,inspectOrphanImageEvidence,persistImage,writeRunResult,attributableCandidates,recoverImage:recoverImageAction,syncRecoveredMetadata:syncRecoveredMetadataAction}=imageRecovery;
 export {inspectOrphanImageEvidence};
 function preAcceptanceQuotaEvidence(pending,manifest,failure=null,made=null){
   if(!pending||pending.provider!==WEB_IMAGE_PROVIDER||!manifest||manifest.state!=='queued'||manifest.accepted===true||manifest.submitted===true||Number(manifest.referenceCount)!==0)return null;
@@ -714,7 +714,7 @@ async function generate(p,key,prompt,refnames,signal,prior=null,verify=true,qaKi
     throw failure||new Error('连接在保存结果前中断。当前节点已保存，请先检查已有原图，避免重复生成。');
   }
   file=persisted.file;pending.file=file;pending.integrity=persisted.integrity;
-  writeRunResult(dir,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:task.id,attempt:task.attempt,endedAt:new Date().toISOString(),outcome:'artifact_saved',artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,downloadEvidence:readDownloadEvidence(dir),diagnostics:generationDiagnosticSummary(evidence)});
+  writeRunResult(dir,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,projectId:p.id,projectVersion:p.version,taskId:task.id,target:key,requestId:webManifest?.requestId||null,attempt:task.attempt,endedAt:new Date().toISOString(),outcome:'artifact_saved',artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,downloadEvidence:readDownloadEvidence(dir),diagnostics:generationDiagnosticSummary(evidence)});
   // Persist the recovered file before asking the model to inspect it. A QA
   // timeout is never evidence that the image did not exist, and must not make
   // the next click repeat a paid image request.
@@ -1082,6 +1082,7 @@ export function retryMissingImage(p,target,{allowUnknownResult=false}={}){
   });
 }
 export function recoverImage(p){return recoverImageAction(p);}
+export function syncRecoveredImageMetadata(p,options={}){return syncRecoveredMetadataAction(p,options);}
 export function reviewImage(p,key){
   verifyApproval(p);if(p.pending)throw new Error('请先完成这次原图找回，再重新校对。');
   const sample=/^sample-([12])$/.exec(key);const panel=/^(\d+)-(\d+)$/.exec(key);let record,refs,prompt,kind;

@@ -1,8 +1,19 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import {readRunIdentity,compareRunIdentity,readRunEvidence} from './run-identity.mjs';
-import {readDownloadEvidence} from './web-download-evidence.mjs';
+import {readJsonObject,readRunIdentity,compareRunIdentity,readRunEvidence} from './run-identity.mjs';
+import {appendDownloadEvidenceTrace,enrichDownloadEvidenceIdentity,inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence,writeDownloadEvidence} from './web-download-evidence.mjs';
+
+function iso(value){const parsed=Date.parse(String(value||''));return Number.isFinite(parsed)?new Date(parsed).toISOString():null;}
+function latestIso(values=[]){const times=values.map(iso).filter(Boolean).map(value=>Date.parse(value));return times.length?new Date(Math.max(...times)).toISOString():null;}
+
+export function recoveryTimeline({executionEndedAt=null,priorResult=null,priorTask=null,downloadEvidence=null,downloadedAt=null,recoveryCompletedAt=null,now=Date.now()}={}){
+  const generationCompletedAt=iso(priorResult?.generationCompletedAt)||iso(executionEndedAt)||iso(priorTask?.generationCompletedAt)||iso(priorResult?.priorCompletedAt)||iso(priorResult?.endedAt)||iso(priorTask?.completedAt);
+  const priorCompletedAt=iso(priorResult?.priorCompletedAt)||iso(priorResult?.endedAt)||iso(priorTask?.priorCompletedAt)||iso(priorTask?.completedAt)||generationCompletedAt;
+  const requested=iso(recoveryCompletedAt)||new Date(Number.isFinite(Number(now))?Number(now):Date.now()).toISOString();
+  const recovery=latestIso([requested,downloadEvidence?.capturedAt,downloadedAt])||requested;
+  return {generationCompletedAt,priorCompletedAt,recoveryCompletedAt:recovery,downloadedAt:iso(downloadedAt),capturedAt:iso(downloadEvidence?.capturedAt)};
+}
 
 function browserEvidence(durable){
   const text=durable.responseText,eventText=durable.eventsText;
@@ -155,7 +166,7 @@ export function createImageRecovery({webImageProvider,readGenerationEvidence,gen
   function recoverImage(p){
     verifyApproval(p);if(!p.pending)throw new Error('没有待找回的图片');
     return job(p,'revising',async()=>{
-      const pending=p.pending;assertCurrentPending(p,pending);const webManifest=pending.provider===webImageProvider?matchingManifest(pending):null;
+      const pending=p.pending;assertCurrentPending(p,pending);const task=(p.tasks||[]).find(item=>item.id===pending.taskId),priorResult=pending.dir?readJsonObject(path.join(pending.dir,'result.json')):null,execution=pending.dir?readJsonObject(path.join(pending.dir,'execution.json')):null,webManifest=pending.provider===webImageProvider?matchingManifest(pending):null;
       const recoveryIdentity={projectId:p.id,projectVersion:p.version,target:pending.key,...(webManifest?{requestId:webManifest.requestId||null,acceptanceState:webManifest.state,accepted:webManifest.accepted===true,acceptedAt:webManifest.acceptedAt||null,submitted:webManifest.submitted===true,submittedAt:webManifest.submittedAt||null}: {})};
       let file=pending.file;const {evidence,candidates}=attributableCandidates(pending);let persisted=null,orphanEvidence=null;
       if(pending.provider===webImageProvider&&webManifest?.state==='downloaded'){
@@ -174,17 +185,46 @@ export function createImageRecovery({webImageProvider,readGenerationEvidence,gen
         throw new Error('连接在保存结果前中断，系统仍无法确认是否已经生成。稍后可再次检查已有原图；检查本身不会重新生图。');
       }
       file=persisted.file;pending.file=file;
-      const downloadEvidence=pending.dir?readDownloadEvidence(pending.dir):null;
-      writeRunResult(pending.dir,{schemaVersion:2,provider:pending.provider||'legacy',taskId:pending.taskId||null,endedAt:new Date().toISOString(),outcome:'artifact_recovered',...recoveryIdentity,artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,downloadEvidence,diagnostics:generationDiagnosticSummary(evidence)});
-      const record={key:pending.key,file:path.relative(projectDir(p.id),file),provider:pending.provider||'legacy',prompt:pending.prompt,refs:pending.refs,integrity:persisted.integrity,downloadEvidence,qa:{pass:null,status:'manual_review',summary:'原图已找回，等待人工视觉校对。请查看图片后选择继续或修改。',issues:[],repairPrompt:'',source:'manual_review'},at:new Date().toISOString()};
+      const rawDownloadEvidence=pending.dir?readDownloadEvidence(pending.dir):null,downloadEvidence=rawDownloadEvidence?enrichDownloadEvidenceIdentity(rawDownloadEvidence,{projectId:p.id,projectVersion:p.version,taskId:pending.taskId,target:pending.key,requestId:webManifest?.requestId||rawDownloadEvidence.requestId,runId:path.basename(pending.dir),conversationUrl:webManifest?.conversationUrl||rawDownloadEvidence.conversationUrl,outputFile:file}):null;
+      if(downloadEvidence&&JSON.stringify(downloadEvidence)!==JSON.stringify(rawDownloadEvidence)){
+        writeDownloadEvidence(pending.dir,downloadEvidence);
+        appendDownloadEvidenceTrace(pending.dir,downloadEvidence,{eventType:'download.evidence.metadata',metadataOnly:true});
+      }
+      const timeline=recoveryTimeline({executionEndedAt:execution?.endedAt,priorResult,priorTask:task,downloadEvidence,downloadedAt:webManifest?.downloadedAt});
+      writeRunResult(pending.dir,{schemaVersion:2,provider:pending.provider||'legacy',taskId:pending.taskId||null,endedAt:timeline.recoveryCompletedAt,generationCompletedAt:timeline.generationCompletedAt,priorCompletedAt:timeline.priorCompletedAt,recoveryCompletedAt:timeline.recoveryCompletedAt,downloadedAt:timeline.downloadedAt,...recoveryIdentity,artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,downloadEvidence,diagnostics:generationDiagnosticSummary(evidence)});
+      const record={key:pending.key,file:path.relative(projectDir(p.id),file),provider:pending.provider||'legacy',prompt:pending.prompt,refs:pending.refs,integrity:persisted.integrity,downloadEvidence,generationCompletedAt:timeline.generationCompletedAt,recoveryCompletedAt:timeline.recoveryCompletedAt,qa:{pass:null,status:'manual_review',summary:'原图已找回，等待人工视觉校对。请查看图片后选择继续或修改。',issues:[],repairPrompt:'',source:'manual_review'},at:new Date().toISOString()};
       jsonWrite(file+'.json',record);const recoveredPanelKey=panelKeyFromImageKey?.(pending.key);if(recoveredPanelKey&&invalidatePanelDownstream)invalidatePanelDownstream(p,recoveredPanelKey);
-      recordArtifact(p,artifactIdForImageKey(pending.key),'image',record.file,[],{integrity:persisted.integrity,downloadEvidence});attachImageRecord(p,record);
+      recordArtifact(p,artifactIdForImageKey(pending.key),'image',record.file,[],{integrity:persisted.integrity,downloadEvidence,generationCompletedAt:timeline.generationCompletedAt,recoveryCompletedAt:timeline.recoveryCompletedAt});attachImageRecord(p,record);
       const sampleIndex=sampleIndexFromKey(pending.key);if(sampleIndex!==null)sampleRepairCount(p,sampleIndex);
-      p.pending=null;p.lastFailure=null;p.status='paused';const task=(p.tasks||[]).find(item=>item.id===pending.taskId),downloadedAt=webManifest?.downloadedAt||null,webTimings={...task?.webTimings,downloadedAt};finishTask(p,task,'recovered_local',{artifact:file,qa:'manual_review',qaStatus:'manual_review',webState:webManifest?.state||'downloaded',webTimings,errorCode:null,error:null});activity(p,'原图已找回并挂接到作品，等待人工视觉校对。未重新生图。');
+      p.pending=null;p.lastFailure=null;p.status='paused';const webTimings={...task?.webTimings,downloadedAt:timeline.downloadedAt,generationCompletedAt:timeline.generationCompletedAt,recoveryCompletedAt:timeline.recoveryCompletedAt};finishTask(p,task,'recovered_local',{completedAt:timeline.recoveryCompletedAt,generationCompletedAt:timeline.generationCompletedAt,priorCompletedAt:timeline.priorCompletedAt,recoveryCompletedAt:timeline.recoveryCompletedAt,artifact:file,qa:'manual_review',qaStatus:'manual_review',webState:webManifest?.state||'downloaded',webTimings,errorCode:null,error:null});activity(p,'原图已找回并挂接到作品，等待人工视觉校对。未重新生图。');
     });
   }
 
-  return Object.freeze({checksum,verifyImage,matchingWebRunRecord,matchingPendingManifest:matchingManifest,inspectOrphanImageEvidence,persistImage,writeRunResult,runEvidence,attributableCandidates,assertCurrentPending,recoverImage});
+  function syncRecoveredMetadata(p,{dir,target,taskId,requestId,file}={}){
+    const runDir=path.resolve(String(dir||'')),projectRoot=path.resolve(projectDir(p.id));
+    if(!runDir.startsWith(path.join(projectRoot,'.制作记录')+path.sep))throw new Error('恢复元数据目录不属于当前作品制作记录。');
+    const task=(p.tasks||[]).find(item=>item.id===taskId),recordKey=String(target||task?.target||''),panelKey=panelKeyFromImageKey?.(recordKey),sampleIndex=sampleIndexFromKey(recordKey),record=sampleIndex!==null?p.samples?.[sampleIndex]:p.panels?.[panelKey];
+    if(!task||p.currentTask?.id!==task.id||task.target!==recordKey)throw new Error('当前任务不是待同步的恢复任务。');
+    if(!record?.file)throw new Error('当前作品缺少与恢复任务对应的图片记录。');
+    const run=readRunIdentity(runDir,{strict:true}),manifest=readWebManifest(path.join(runDir,'web-generation.json')),expectedOutput=path.resolve(String(file||inside(projectRoot,record.file))),expected={projectId:p.id,projectVersion:p.version,taskId,target:recordKey,requestId:requestId||manifest?.requestId,runId:run.runId,outputFile:expectedOutput};
+    const comparison=compareRunIdentity({record:run,expected,requireModern:true});
+    if(!comparison.ok)throw new Error(`恢复元数据身份不一致：${comparison.issues.join('；')}`);
+    if(!manifest||manifest.state!=='downloaded'||manifest.submitted!==true||manifest.requestId!==expected.requestId)throw new Error('恢复元数据只能同步已提交且已下载的同一 request。');
+    if(path.resolve(String(record.file&&inside(projectRoot,record.file)))!==expectedOutput)throw new Error('作品记录与恢复输出路径不一致。');
+    const artifactId=artifactIdForImageKey(recordKey),artifact=(p.artifacts||[]).find(item=>item.id===artifactId);
+    if(!artifact||artifact.file!==record.file||artifact.valid===false)throw new Error('作品 artifact 与恢复图片记录不一致。');
+    if(!fs.existsSync(expectedOutput)||!fs.statSync(expectedOutput).isFile())throw new Error('恢复输出文件不存在。');
+    const actual=inspectDownloadArtifact(expectedOutput),rawEvidence=readDownloadEvidence(runDir),evidence=enrichDownloadEvidenceIdentity(rawEvidence,{projectId:p.id,projectVersion:p.version,taskId,target:recordKey,requestId:expected.requestId,runId:run.runId,conversationUrl:manifest.conversationUrl,outputFile:expectedOutput});
+    const result=readJsonObject(path.join(runDir,'result.json')),validation=validateDownloadEvidence(evidence,{expectedIdentity:{...expected,conversationUrl:manifest.conversationUrl},request:run.request,worker:run.worker,result,manifest,outputFile:expectedOutput,actual});
+    if(!validation.ok)throw new Error(`恢复下载证据不一致：${validation.errors.slice(0,5).join('；')}`);
+    const timeline=recoveryTimeline({executionEndedAt:run.execution?.endedAt,priorResult:result,priorTask:task,downloadEvidence:evidence,downloadedAt:manifest.downloadedAt});
+    if(JSON.stringify(evidence)!==JSON.stringify(rawEvidence)){writeDownloadEvidence(runDir,evidence);appendDownloadEvidenceTrace(runDir,evidence,{eventType:'download.evidence.metadata',metadataOnly:true});}
+    jsonWrite(path.join(runDir,'result.json'),{...result,schemaVersion:2,provider:manifest.provider||webImageProvider,projectId:p.id,projectVersion:p.version,taskId,target:recordKey,requestId:expected.requestId,runId:run.runId,acceptanceState:manifest.state,accepted:manifest.accepted===true,submitted:manifest.submitted===true,submittedAt:manifest.submittedAt||null,downloadedAt:timeline.downloadedAt,endedAt:timeline.recoveryCompletedAt,generationCompletedAt:timeline.generationCompletedAt,priorCompletedAt:timeline.priorCompletedAt,recoveryCompletedAt:timeline.recoveryCompletedAt,downloadEvidence:evidence});
+    record.downloadEvidence=evidence;record.generationCompletedAt=timeline.generationCompletedAt;record.recoveryCompletedAt=timeline.recoveryCompletedAt;artifact.downloadEvidence=evidence;artifact.generationCompletedAt=timeline.generationCompletedAt;artifact.recoveryCompletedAt=timeline.recoveryCompletedAt;
+    p.pending=null;p.lastFailure=null;p.status='paused';p.error=null;const webTimings={...task.webTimings,downloadedAt:timeline.downloadedAt,generationCompletedAt:timeline.generationCompletedAt,recoveryCompletedAt:timeline.recoveryCompletedAt};finishTask(p,task,'recovered_local',{completedAt:timeline.recoveryCompletedAt,generationCompletedAt:timeline.generationCompletedAt,priorCompletedAt:timeline.priorCompletedAt,recoveryCompletedAt:timeline.recoveryCompletedAt,artifact:expectedOutput,qa:'manual_review',qaStatus:'manual_review',webState:'downloaded',webTimings,errorCode:null,error:null});saveProject(p);return p;
+  }
+
+  return Object.freeze({checksum,verifyImage,matchingWebRunRecord,matchingPendingManifest:matchingManifest,inspectOrphanImageEvidence,persistImage,writeRunResult,runEvidence,attributableCandidates,assertCurrentPending,recoverImage,syncRecoveredMetadata});
 }
 
 export {generatedCandidates,extensionForImage,checksum};

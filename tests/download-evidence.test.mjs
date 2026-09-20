@@ -16,6 +16,10 @@ import {
 const PNG=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=','base64');
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'wendi-download-evidence-'));
 const conversationUrl='https://chatgpt.com/c/evidence-fixture';
+const projectId='11111111-1111-4111-8111-111111111111';
+const projectVersion=2;
+const taskId='22222222-2222-4222-8222-222222222222';
+const target='第5页-第1格';
 const requestId='11111111-1111-4111-8111-111111111111';
 const runId='1789860378777-fixture';
 
@@ -25,7 +29,7 @@ function fixture(){
   const actual=inspectDownloadArtifact(output);
   const src='https://chatgpt.com/backend-api/estuary/content?id=file_current_fixture&sig=fixture';
   return {dir,output,actual,evidence:{
-    schemaVersion:1,source:'pageAssets',conversationUrl,requestId,runId,
+    schemaVersion:2,source:'pageAssets',projectId,projectVersion,taskId,target,conversationUrl,requestId,runId,
     currentResult:{src,resultId:'file_current_fixture',marker:'暖阳厨房里的手冲咖啡时光'},
     inventory:{id:'inventory-fixture',assetCount:1},exactMatchCount:1,matchedAssetIds:['asset-current'],
     matchedAsset:{id:'asset-current',kind:'image',contentType:'image/png',url:src,sourceUrl:src,role:'generated-result',isThumbnail:false,isPreview:false},
@@ -82,4 +86,13 @@ test('extractor only accepts the machine-readable download evidence marker',()=>
   assert.deepEqual(extractDownloadEvidence(text),run.evidence);
   assert.deepEqual(extractDownloadEvidence(run.evidence),run.evidence);
   assert.equal(extractDownloadEvidence('没有结构化下载记录'),null);
+});
+
+test('validator cross-checks identity against request, worker, result, and manifest records',()=>{
+  const run=fixture(),base={expectedIdentity:{projectId,projectVersion,taskId,target,requestId,runId,conversationUrl,outputFile:run.output},request:{projectId,projectVersion,taskId,target,requestId,runId,outputFile:run.output,conversationUrl},worker:{projectId,projectVersion,taskId,target,requestId,runId,outputFile:run.output},result:{projectId,projectVersion,taskId,target,requestId,runId,downloadEvidence:run.evidence},manifest:{projectId,projectVersion,taskId,target,requestId,runId,outputFile:run.output,conversationUrl},outputFile:run.output,actual:run.actual};
+  assert.equal(validateDownloadEvidence(run.evidence,base).ok,true);
+  for(const source of ['request','worker','result','manifest']){
+    const records=structuredClone(base);if(source==='result')records[source].downloadEvidence={...run.evidence,target:'错误目标'};else records[source]={...records[source],target:'错误目标'};
+    const check=validateDownloadEvidence(run.evidence,records);assert.equal(check.ok,false,source);assert(check.errors.some(error=>/target|目标/.test(error)),source);
+  }
 });
