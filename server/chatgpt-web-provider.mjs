@@ -89,9 +89,14 @@ export function validateFrozenReferenceFiles({referenceFiles=[],expectedEntries}
       const stat=fs.statSync(file);
       if(!stat.isFile())throw new Error('不是普通文件');
       if(stat.size<=0)throw new Error('文件为空');
-      fs.accessSync(file,fs.constants.R_OK);
-      const sha256=crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
-      return {path:file,name:path.basename(file),sizeBytes:stat.size,sha256};
+      // A real read is the authoritative readability check.  `accessSync`
+      // can disagree with the subsequent open on macOS ACLs/remote mounts and
+      // would create a false pre-upload failure; hashing the bytes we read also
+      // keeps the frozen size and digest tied to one snapshot.
+      const bytes=fs.readFileSync(file);
+      if(bytes.length<=0)throw new Error('文件为空');
+      const sha256=crypto.createHash('sha256').update(bytes).digest('hex');
+      return {path:file,name:path.basename(file),sizeBytes:bytes.length,sha256};
     }catch(error){
       errors.push(`第 ${index+1} 个附件不存在或不可读：${file}（${error.message}）`);
       return null;
