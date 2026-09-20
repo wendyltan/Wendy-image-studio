@@ -264,8 +264,13 @@ function assertExpectedIdentity(expected,request,worker,manifest,{dir=null,outpu
 
 function matchingConfirmedUnsentAudit({dir,request,worker,manifest,expected={}}={}){
   const audit=readJsonObject(path.join(dir,'web-audit.json'));
-  if(!audit||audit.result!=='confirmed_unsent'||manifest?.state!=='failed'||manifest?.submissionIntent!==true)return null;
-  if(manifest.errorCode!=='FILE_UPLOAD_CHROME_UNAVAILABLE'||!/^https:\/\/chatgpt\.com\/c\/[\w-]+/.test(String(manifest.conversationUrl||'')))return null;
+  if(!audit||audit.result!=='confirmed_unsent'||manifest?.state!=='failed')return null;
+  const conversationUrl=String(manifest.conversationUrl||'');
+  const stableConversation=/^https:\/\/chatgpt\.com\/c\/[\w-]+/.test(conversationUrl);
+  const homeConversation=/^https:\/\/chatgpt\.com\/?$/.test(conversationUrl);
+  const definitePreIntent=manifest.submitted!==true&&manifest.submissionIntent!==true&&manifest.preSubmissionFailure===true&&Number(manifest.referenceCount)===0&&!manifest.readyAt&&!manifest.submittedAt&&!manifest.downloadedAt;
+  const noConversation=!conversationUrl;
+  if(manifest.errorCode!=='FILE_UPLOAD_CHROME_UNAVAILABLE'||(!stableConversation&&!homeConversation&&!noConversation)||(!stableConversation&&!definitePreIntent&&manifest.submissionIntent!==true))return null;
   if(String(audit.conversationUrl||'')!==String(manifest.conversationUrl||''))return null;
   for(const key of ['projectId','projectVersion','taskId','target','requestId']){
     const wanted=expected?.[key]??manifest?.[key]??worker?.[key]??request?.[key];

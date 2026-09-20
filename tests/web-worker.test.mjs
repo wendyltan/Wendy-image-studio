@@ -22,6 +22,7 @@ let input='';process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>{
  if(mode==='empty')return;
  if(mode==='usage-limit-once'){const marker=path.join(dir,'usage-limit-once');if(!fs.existsSync(marker)){fs.writeFileSync(marker,'1');console.log(JSON.stringify({type:'error',message:"You've hit your usage limit. Try again later."}));process.exitCode=1;return;}}
  if(mode==='legacy-confirmed-unsent-once'){const marker=path.join(dir,'legacy-confirmed-unsent-once');if(!fs.existsSync(marker)){fs.writeFileSync(marker,'1');write({...base,state:'failed',submitted:true,submissionIntent:true,referenceCount:2,readyAt:new Date().toISOString(),submittedAt:new Date().toISOString(),conversationUrl:'https://chatgpt.com/c/fixture-conversation',errorCode:'FILE_UPLOAD_CHROME_UNAVAILABLE',error:'upload wait remained disabled; no user message appeared'});process.exitCode=1;return;}}
+ if(mode==='home-confirmed-unsent-once'){const marker=path.join(dir,'home-confirmed-unsent-once');if(!fs.existsSync(marker)){fs.writeFileSync(marker,'1');write({...base,state:'failed',submitted:false,submissionIntent:false,referenceCount:0,conversationUrl:'https://chatgpt.com/',errorCode:'FILE_UPLOAD_CHROME_UNAVAILABLE',error:'chooser failed before submission; no user message appeared'});process.exitCode=1;return;}}
  if(mode==='focus-unavailable'){process.stderr.write('BROWSER_FOCUS_UNAVAILABLE: Chrome management capability is not advertised');process.exitCode=1;return;}
  if(mode==='origin-permission-denied'){console.log(JSON.stringify({type:'item.completed',item:{type:'mcp_tool_call',server:'cua_repl',tool:'js',result:{content:[{type:'text',text:'The user declined permission for this action. Browser use cannot access https://chatgpt.com because the user denied permission for this request.'}]}}}));write({...base,state:'accepted'});process.stderr.write('The user declined permission for this action. Browser use cannot access https://chatgpt.com because the user denied permission for this request.');process.exitCode=1;return;}
  if(mode==='origin-permission-denied-exit0'){write({...base,state:'failed',errorCode:'BROWSER_CHROME_UNAVAILABLE',error:'Chrome extension unavailable'});process.stderr.write('The user declined permission for this action. Browser use cannot access https://chatgpt.com because the user denied permission for this request.');return;}
@@ -89,6 +90,17 @@ test('a separately audited legacy false submission resumes the same request only
  assert.equal(result.manifest.requestId,requestId);assert.equal(result.manifest.state,'downloaded');assert.equal(result.manifest.submitted,true);assert.equal(result.manifest.resumeCount,1);
  assert.equal(result.manifest.lastConfirmedUnsentAttempt,'attempts/001-confirmed-unsent');
  const attempt=JSON.parse(fs.readFileSync(path.join(args.dir,'attempts','001-confirmed-unsent','attempt.json'),'utf8'));assert.equal(attempt.requestId,requestId);assert.equal(attempt.auditResult,'confirmed_unsent');
+});
+test('a separately audited home pre-intent upload failure resumes the same request',async()=>{
+ const args=setup('home-confirmed-unsent-once'),identity={provider:WEB_IMAGE_PROVIDER,projectId:'55555555-5555-4555-8555-555555555555',projectVersion:5,taskId:'66666666-6666-4666-8666-666666666666',target:'第6页-第1格'};
+ fs.writeFileSync(path.join(args.dir,'request.json'),JSON.stringify(identity));
+ await assert.rejects(dispatchChatGptWebJob({...args,model:'gpt-5.6-luna'}));
+ const before=readWebManifest(path.join(args.dir,'web-generation.json')),requestId=before.requestId;
+ assert.equal(before.conversationUrl,'https://chatgpt.com/');assert.equal(before.submitted,false);assert.equal(before.submissionIntent,false);assert.equal(before.preSubmissionFailure,true);
+ fs.writeFileSync(path.join(args.dir,'web-audit.json'),JSON.stringify({schemaVersion:1,...identity,requestId,result:'confirmed_unsent',conversationUrl:before.conversationUrl,auditedAt:new Date(Date.now()+1000).toISOString(),evidence:{composerContainsPrompt:true,newUserMessagePresent:false,generatedResultPresent:false,sendButtonPresent:true,executorOwnedTabClosed:true}}));
+ const instruction=fs.readFileSync(path.join(args.dir,'prompt.txt'),'utf8');
+ const result=await resumeChatGptWebJob({...args,model:'gpt-5.6-luna',instruction,expected:{...identity,requestId}});
+ assert.equal(result.manifest.requestId,requestId);assert.equal(result.manifest.state,'downloaded');assert.equal(result.manifest.submitted,true);assert.equal(result.manifest.resumeCount,1);
 });
 test('wrong request download is never acknowledged as success',async()=>{await assert.rejects(dispatchChatGptWebJob(setup('wrong')),/没有取得已核实原图/);});
 test('login failure is returned immediately as its actual error',async()=>{await assert.rejects(dispatchChatGptWebJob(setup('failed')),e=>e.code==='CHATGPT_LOGIN_REQUIRED'&&e.webManifest.submitted===false);});
