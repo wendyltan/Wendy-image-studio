@@ -6,7 +6,8 @@ import {identityFields,sameIdentityValue,readJsonObject as readRunJson,readRunId
 import {patchManifest} from './run-manifest.mjs';
 import {chatGptWebImagePrompt} from './web-executor-instructions.mjs';
 import {ensureOwnedTabLease,ownedTabSessionName,readOwnedTabLease,syncOwnedTabLeaseToManifest} from './owned-tab-lease.mjs';
-import {browserFailurePrefix,browserPreSubmissionUnavailableText,browserRunEvidenceText,structuredBrowserToolResultText,browserOriginPermissionDeniedEvidence,fileUploadChromeUnavailableEvidence,iabUnavailableEvidence,browserTabBackgroundEvidence,chromeUnavailableEvidence,browserFocusEvidence,completeDownloadEvidence,enrichDownloadEvidenceIdentity,extractDownloadEvidence,inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence,writeDownloadEvidence} from './web-download-evidence.mjs';
+import {browserFailurePrefix,browserPreSubmissionUnavailableText,browserRunEvidenceText,structuredBrowserToolResultText,browserOriginPermissionDeniedEvidence,fileUploadChromeUnavailableEvidence,browserCreateUnavailableEvidence,browserHandleLostEvidence,browserModeEntryUnavailableEvidence,fileChooserEventTimeoutEvidence,fileChooserRouteUnavailableEvidence,fileSetFailedEvidence,attachmentVerificationTimeoutEvidence,downloadFailedEvidence,iabUnavailableEvidence,browserTabBackgroundEvidence,chromeUnavailableEvidence,browserFocusEvidence,completeDownloadEvidence,enrichDownloadEvidenceIdentity,extractDownloadEvidence,inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence,writeDownloadEvidence} from './web-download-evidence.mjs';
+import {uploadEvidenceFailureCode,uploadEvidenceFromRun,validateUploadEvidence} from './web-upload-evidence.mjs';
 // Keep the durable provider id for existing project records. The production
 // transport is direct Chrome; older IAB manifests remain readable for
 // recovery, but IAB is never a fallback for a new request.
@@ -39,7 +40,7 @@ function normalizeTimestamp(value){
 
 export function webWorkerStatus(){
   const available=Boolean(findCodex());
-  return {ready:available,state:available?'available':'unavailable',transport:WEB_IMAGE_TRANSPORT,browser:WEB_IMAGE_BROWSER,focusPolicy:WEB_IMAGE_FOCUS_POLICY,focusSafe:false,focusRestoration:'unsupported',message:available?'执行器可用，站点访问权限将在任务中验证。':'请先安装 Codex 并登录。'};
+  return {ready:available,executableReady:available,chromeCapabilityVerified:false,state:available?'available':'unavailable',transport:WEB_IMAGE_TRANSPORT,browser:WEB_IMAGE_BROWSER,focusPolicy:WEB_IMAGE_FOCUS_POLICY,focusSafe:false,focusRestoration:'unsupported',message:available?'Codex executable ready；Chrome capability 未验证。':'请先安装 Codex 并登录。'};
 }
 export function readWebManifest(file){
   try{
@@ -149,8 +150,42 @@ function uploadUnavailableForRun({dir,manifestFile,outputFile,requestId,manifest
   if(!manifest||manifest.state!=='failed'||manifest.submitted!==false)return false;
   if(!browserRunIdentityMatches({dir,manifestFile,outputFile,requestId,manifest}))return false;
   const explicit=explicitManifestErrorCode(manifest);
-  if(explicit)return explicit==='FILE_UPLOAD_CHROME_UNAVAILABLE';
-  return fileUploadChromeUnavailableEvidence(structuredBrowserToolResultText(dir));
+  if(explicit)return ['FILE_UPLOAD_CHROME_UNAVAILABLE','FILE_CHOOSER_EVENT_TIMEOUT','FILE_CHOOSER_ROUTE_UNAVAILABLE','FILE_SET_FAILED','ATTACHMENT_VERIFICATION_TIMEOUT','BROWSER_MODE_ENTRY_UNAVAILABLE','BROWSER_CREATE_UNAVAILABLE','BROWSER_HANDLE_LOST'].includes(explicit);
+  const worker=readJsonObject(path.join(dir,'worker-request.json'));
+  const modern=Number(worker?.schemaVersion||0)>=2||Number(manifest?.schemaVersion||0)>=2;
+  const evidence=uploadEvidenceFromRun(dir);
+  if(evidence){
+    const expectedCount=Array.isArray(worker?.referenceEntries)?worker.referenceEntries.length:Array.isArray(worker?.referenceFiles)?worker.referenceFiles.length:(Number.isInteger(Number(manifest.referenceCount))?Number(manifest.referenceCount):null);
+    const expectedNames=Array.isArray(worker?.referenceEntries)?worker.referenceEntries.map(item=>item?.name).filter(Boolean):[];
+    const validation=validateUploadEvidence(evidence,{expectedCount,expectedNames});
+    if(validation.ok&&uploadEvidenceFailureCode(evidence))return true;
+  }
+  // Modern workers must emit a typed upload-evidence block or a manifest
+  // helper error code.  Natural-language browser output is retained only for
+  // pre-schema legacy runs and can never classify a current upload failure.
+  return !modern&&fileUploadChromeUnavailableEvidence(structuredBrowserToolResultText(dir));
+}
+
+function structuredUploadFailureCode(dir){
+  const evidence=uploadEvidenceFromRun(dir);
+  if(!evidence)return null;
+  const validation=validateUploadEvidence(evidence);
+  if(!validation.ok)return null;
+  return uploadEvidenceFailureCode(evidence);
+}
+
+function knownBrowserFailureCode(detail,dir){
+  const structured=structuredUploadFailureCode(dir);
+  if(structured)return structured;
+  if(browserCreateUnavailableEvidence(detail))return 'BROWSER_CREATE_UNAVAILABLE';
+  if(browserHandleLostEvidence(detail))return 'BROWSER_HANDLE_LOST';
+  if(browserModeEntryUnavailableEvidence(detail))return 'BROWSER_MODE_ENTRY_UNAVAILABLE';
+  if(fileChooserEventTimeoutEvidence(detail))return 'FILE_CHOOSER_EVENT_TIMEOUT';
+  if(fileChooserRouteUnavailableEvidence(detail))return 'FILE_CHOOSER_ROUTE_UNAVAILABLE';
+  if(fileSetFailedEvidence(detail))return 'FILE_SET_FAILED';
+  if(attachmentVerificationTimeoutEvidence(detail))return 'ATTACHMENT_VERIFICATION_TIMEOUT';
+  if(downloadFailedEvidence(detail))return 'DOWNLOAD_FAILED';
+  return null;
 }
 
 function recordBrowserPreSubmissionFailure(manifestFile,requestId,failure,dir){
@@ -169,7 +204,8 @@ function recordBrowserPreSubmissionFailure(manifestFile,requestId,failure,dir){
   const originPermissionDenied=!explicit&&browserRunIdentityMatches(identity)&&browserOriginPermissionDeniedEvidence(structured);
   const uploadUnavailable=!explicit&&uploadUnavailableForRun({dir,manifestFile,outputFile:worker?.outputFile,requestId,manifest});
   const historicalIab=!explicit&&iabUnavailableEvidence(String(failure?.code||failure?.message||''));
-  const errorCode=explicit|| (uploadUnavailable?'FILE_UPLOAD_CHROME_UNAVAILABLE':originPermissionDenied?'BROWSER_ORIGIN_PERMISSION_DENIED':historicalIab?'IAB_UNAVAILABLE':browserTabBackgroundEvidence(detail)?'BROWSER_TAB_BACKGROUND_UNAVAILABLE':chromeUnavailableEvidence(detail)?'BROWSER_CHROME_UNAVAILABLE':browserFocusEvidence(detail)&&/RESTORE_FAILED_AFTER_CLOSE/i.test(detail)?'BROWSER_FOCUS_RESTORE_FAILED_AFTER_CLOSE':browserFocusEvidence(detail)&&/RESTORE_FAILED/i.test(detail)?'BROWSER_FOCUS_RESTORE_FAILED':'BROWSER_FOCUS_UNAVAILABLE');
+  const inferredCode=modern?(structuredUploadFailureCode(dir)):knownBrowserFailureCode(detail,dir);
+  const errorCode=explicit|| (inferredCode|| (uploadUnavailable?'FILE_UPLOAD_CHROME_UNAVAILABLE':originPermissionDenied?'BROWSER_ORIGIN_PERMISSION_DENIED':historicalIab?'IAB_UNAVAILABLE':browserTabBackgroundEvidence(detail)?'BROWSER_TAB_BACKGROUND_UNAVAILABLE':chromeUnavailableEvidence(detail)?'BROWSER_CHROME_UNAVAILABLE':browserFocusEvidence(detail)&&/RESTORE_FAILED_AFTER_CLOSE/i.test(detail)?'BROWSER_FOCUS_RESTORE_FAILED_AFTER_CLOSE':browserFocusEvidence(detail)&&/RESTORE_FAILED/i.test(detail)?'BROWSER_FOCUS_RESTORE_FAILED':'BROWSER_FOCUS_UNAVAILABLE'));
   const prefix=browserFailurePrefix(errorCode);
   try{
     patchManifestState(manifestFile,'failed',{submitted:'false',submissionIntent:manifest.submissionIntent===true?'true':'false',preSubmissionFailure:'true',errorCode,error:`${prefix}；未上传附件或发送消息。原始错误：${detail}`});
@@ -196,12 +232,27 @@ function downloadEvidenceFromRun({dir,result,manifestFile,outputFile,requestId}=
   try{texts.push(fs.readFileSync(path.join(dir,'response.txt'),'utf8'));}catch{}
   texts.push(structuredBrowserToolResultText(dir));
   let raw=null;for(const value of texts){raw=extractDownloadEvidence(value);if(raw)break;}
-  let actual=null;try{if(fs.existsSync(outputFile))actual=inspectDownloadArtifact(outputFile);}catch(error){return {ok:false,errors:[`原始图片无法读取：${error.message}`],evidence:raw,actual:null};}
-  if(!raw)return {ok:false,errors:['执行器没有返回结构化 pageAssets 下载证据。'],evidence:null,actual};
+  let actual=null;try{if(fs.existsSync(outputFile))actual=inspectDownloadArtifact(outputFile);}catch(error){return {ok:false,errors:[`原始图片无法读取：${error.message}`],evidence:raw,actual:null,uploadEvidence:uploadEvidenceFromRun(dir)};}
+  const uploadEvidence=uploadEvidenceFromRun(dir);
+  let uploadValidation=null;
+  if(uploadEvidence){
+    const expectedCount=Array.isArray(worker?.referenceEntries)?worker.referenceEntries.length:Array.isArray(worker?.referenceFiles)?worker.referenceFiles.length:(Number.isInteger(Number(manifest?.referenceCount))?Number(manifest.referenceCount):null);
+    const expectedNames=Array.isArray(worker?.referenceEntries)?worker.referenceEntries.map(item=>item?.name).filter(Boolean):[];
+    uploadValidation=validateUploadEvidence(uploadEvidence,{expectedCount,expectedNames,requireComplete:manifest?.submitted===true||manifest?.state==='downloaded'});
+  }
+  if(!raw){
+    const errors=['执行器没有返回结构化 pageAssets 下载证据。'];
+    if(uploadValidation&&!uploadValidation.ok)errors.push(...uploadValidation.errors);
+    return {ok:false,errors:[...new Set(errors)],evidence:null,actual,uploadEvidence};
+  }
   const identity={projectId:request?.projectId??worker?.projectId??manifest?.projectId,projectVersion:request?.projectVersion??worker?.projectVersion??manifest?.projectVersion,taskId:request?.taskId??worker?.taskId??manifest?.taskId,target:request?.target??worker?.target??manifest?.target,requestId,runId:path.basename(dir),conversationUrl:manifest?.conversationUrl||null,outputFile};
   const evidence=enrichDownloadEvidenceIdentity(completeDownloadEvidence(raw,{actual}),identity),validation=validateDownloadEvidence(evidence,{expectedIdentity:identity,requestId,runId:path.basename(dir),outputFile,actual,request,worker,result:resultRecord,manifest});
   try{writeDownloadEvidence(dir,evidence);}catch(error){validation.ok=false;validation.errors=[...validation.errors,`download-evidence.json 写入失败：${error.message}`];}
-  return {...validation,evidence,actual};
+  if(uploadValidation&&!uploadValidation.ok){
+    validation.ok=false;
+    validation.errors=[...new Set([...validation.errors,...uploadValidation.errors.map(error=>`上传证据：${error}`)])];
+  }
+  return {...validation,evidence,actual,uploadEvidence,uploadValidation};
 }
 
 function finalizeWorkerResult({dir,manifestFile,outputFile,requestId,result,failure,model,reasoningEffort,role,downloadEvidence=null}){

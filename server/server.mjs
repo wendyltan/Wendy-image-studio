@@ -5,7 +5,7 @@ import {execFile,spawn} from 'node:child_process';
 import {APP,ROOT,REFS,CHECKS,inside,digest} from './workflow.mjs';
 import {connectionStatus,appServerSnapshot,normalizeRateLimits} from './bridge.mjs';
 import {WEB_IMAGE_PROVIDER,readWebManifest,webWorkerStatus} from './chatgpt-web-provider.mjs';
-import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,decidePanel,rejectPanel,resume,reviseImage,repairPageLayout,unifyPageLayouts,recoverImage,reviewImage,retryMissingImage,imageRetryState,accept,recover,projectDir,syncRunningProject,refreshQuotaPauses} from './engine.mjs';
+import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,decidePanel,rejectPanel,resume,reviseImage,repairPageLayout,unifyPageLayouts,recoverImage,reviewImage,retryMissingImage,imageRetryState,accept,recover,projectDir,syncRunningProject,refreshQuotaPauses,hasLiveWork} from './engine.mjs';
 import {CATEGORIES,listDocuments,listAssets,discoverArchiveStories,archiveStory,stageUpload,readCandidate,inspectStagedCandidate,saveManualAsset,searchAssets,analyzeAsset,saveAssetProposal,applyAssetProposal,saveDocument,suggestDocument,deleteProjectFolder,deleteArchiveStory} from './library.mjs';
 import {applyProjectStorageCleanup,reportDownloadsRedundancy,reportProjectStorage} from './storage-hygiene.mjs';
 const PORT=Number(process.env.PORT||4318);const HOST='127.0.0.1';
@@ -266,7 +266,7 @@ const server=http.createServer(async(req,res)=>{
         // If the response was lost, returning the persisted state is safer than
         // re-entering the workflow and possibly spending another image request.
         if(command.existing)return send(res,{...publicProject(p),idempotent:true,command:{key:command.key,acceptedAt:command.existing.at}});
-        if(active.has(p.id))throw new Error('这篇仍在制作，请稍候。');
+        if(active.has(p.id)||hasLiveWork(p.id))throw new Error('这篇仍在制作或等待执行，请稍候。');
         const retryState=imageRetryState(p),confirmed=retryState?.certainty==='confirmed_missing'&&b.confirmNoImage===true,unknownApproved=retryState?.certainty==='unknown_result'&&b.confirmUnknownResult===true;
         if(!retryState||retryState.target!==command.target||(!confirmed&&!unknownApproved))throw new Error(retryState?.certainty==='unknown_result'?'请明确确认仍要重新生成这张结果未知的图片。':'请先确认没有生成图片。');
         p.retryCommands=Array.isArray(p.retryCommands)?p.retryCommands:[];

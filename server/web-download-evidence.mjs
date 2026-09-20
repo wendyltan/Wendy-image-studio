@@ -256,6 +256,14 @@ const IAB_UNAVAILABLE_ERROR=/(?:Browser is not available:\s*iab|IAB[_\s-]*(?:UNA
 const BROWSER_FOCUS_ERROR=/(?:BROWSER_FOCUS_(?:UNAVAILABLE|RESTORE_FAILED|RESTORE_FAILED_AFTER_CLOSE)|Chrome management capability is not advertised|焦点(?:恢复|管理)能力(?:不可用|未提供|未广告)|无法恢复创作室焦点)/i;
 const BROWSER_TAB_BACKGROUND_ERROR=/(?:BROWSER_TAB_BACKGROUND_UNAVAILABLE|非前台(?:标签页|tab).*(?:不可用|失败)|后台标签页.*(?:不可用|失败))/i;
 const CHROME_UNAVAILABLE_ERROR=/(?:BROWSER_CHROME_UNAVAILABLE|Browser is not available:\s*chrome|Chrome extension.*(?:不可用|unavailable))/i;
+const BROWSER_CREATE_UNAVAILABLE_ERROR=/(?:BROWSER_CREATE_UNAVAILABLE|createBrowserTab[^\n]*(?:failed|error|不可用|失败)|创建(?:专用)?(?:Chrome )?标签页[^\n]*(?:失败|不可用))/i;
+const BROWSER_HANDLE_LOST_ERROR=/(?:BROWSER_HANDLE_LOST|owned.?tab[^\n]*(?:handle|句柄)[^\n]*(?:lost|missing|失效|丢失)|globalThis\.__wendiOwnedTab[^\n]*(?:undefined|lost|不存在))/i;
+const BROWSER_MODE_ENTRY_UNAVAILABLE_ERROR=/(?:BROWSER_MODE_ENTRY_UNAVAILABLE|(?:聊天模式|创建图片入口|image creation entry)[^\n]*(?:不可用|失败|missing|未找到))/i;
+const FILE_CHOOSER_EVENT_TIMEOUT_ERROR=/(?:FILE_CHOOSER_EVENT_TIMEOUT|filechooser[^\n]*(?:timeout|timed out|超时)|文件选择器[^\n]*(?:超时|等待失败))/i;
+const FILE_CHOOSER_ROUTE_UNAVAILABLE_ERROR=/(?:FILE_CHOOSER_ROUTE_UNAVAILABLE|(?:附件入口|上传照片|上传文件|from computer|upload route)[^\n]*(?:不可用|失败|未找到|unavailable))/i;
+const FILE_SET_FAILED_ERROR=/(?:FILE_SET_FAILED|(?:setFiles|设置附件|写入选择器)[^\n]*(?:失败|error|failed))/i;
+const ATTACHMENT_VERIFICATION_TIMEOUT_ERROR=/(?:ATTACHMENT_VERIFICATION_TIMEOUT|(?:附件|attachment)[^\n]*(?:verification|验证|核对)[^\n]*(?:timeout|超时|失败))/i;
+const DOWNLOAD_FAILED_ERROR=/(?:DOWNLOAD_FAILED|DOWNLOAD_CHROME_UNAVAILABLE|原始图片[^\n]*(?:下载|复制|校验)[^\n]*(?:失败|不可用)|download[^\n]*(?:failed|unavailable))/i;
 const FILE_UPLOAD_CHROME_UNAVAILABLE_ERROR=/(?:^|[^A-Z0-9_])FILE_UPLOAD_CHROME_UNAVAILABLE(?:$|[^A-Z0-9_])|(?:UPLOAD_ERROR[^\n]*(?:file chooser|文件选择器|附件入口|attachment control))/i;
 // Prompt text and command arguments are not browser evidence. This matcher is
 // intentionally limited to the terminal result returned by the owned browser.
@@ -294,7 +302,7 @@ export function browserRunEvidenceText(dir,{manifest=null,failure=null}={}){
 
 export function browserPreSubmissionUnavailableText(value){
   const text=String(value||'');
-  return IAB_UNAVAILABLE_ERROR.test(text)||FILE_UPLOAD_CHROME_UNAVAILABLE_ERROR.test(text)||BROWSER_ORIGIN_PERMISSION_DENIED_ERROR.test(text)||BROWSER_FOCUS_ERROR.test(text)||BROWSER_TAB_BACKGROUND_ERROR.test(text)||CHROME_UNAVAILABLE_ERROR.test(text);
+  return IAB_UNAVAILABLE_ERROR.test(text)||FILE_UPLOAD_CHROME_UNAVAILABLE_ERROR.test(text)||BROWSER_CREATE_UNAVAILABLE_ERROR.test(text)||BROWSER_HANDLE_LOST_ERROR.test(text)||BROWSER_MODE_ENTRY_UNAVAILABLE_ERROR.test(text)||FILE_CHOOSER_EVENT_TIMEOUT_ERROR.test(text)||FILE_CHOOSER_ROUTE_UNAVAILABLE_ERROR.test(text)||FILE_SET_FAILED_ERROR.test(text)||ATTACHMENT_VERIFICATION_TIMEOUT_ERROR.test(text)||DOWNLOAD_FAILED_ERROR.test(text)||BROWSER_ORIGIN_PERMISSION_DENIED_ERROR.test(text)||BROWSER_FOCUS_ERROR.test(text)||BROWSER_TAB_BACKGROUND_ERROR.test(text)||CHROME_UNAVAILABLE_ERROR.test(text);
 }
 
 export function browserOriginPermissionDeniedEvidence(value){
@@ -303,6 +311,38 @@ export function browserOriginPermissionDeniedEvidence(value){
 
 export function fileUploadChromeUnavailableEvidence(value){
   return FILE_UPLOAD_CHROME_UNAVAILABLE_ERROR.test(String(value||''));
+}
+
+export function browserCreateUnavailableEvidence(value){
+  return BROWSER_CREATE_UNAVAILABLE_ERROR.test(String(value||''));
+}
+
+export function browserHandleLostEvidence(value){
+  return BROWSER_HANDLE_LOST_ERROR.test(String(value||''));
+}
+
+export function browserModeEntryUnavailableEvidence(value){
+  return BROWSER_MODE_ENTRY_UNAVAILABLE_ERROR.test(String(value||''));
+}
+
+export function fileChooserEventTimeoutEvidence(value){
+  return FILE_CHOOSER_EVENT_TIMEOUT_ERROR.test(String(value||''));
+}
+
+export function fileChooserRouteUnavailableEvidence(value){
+  return FILE_CHOOSER_ROUTE_UNAVAILABLE_ERROR.test(String(value||''));
+}
+
+export function fileSetFailedEvidence(value){
+  return FILE_SET_FAILED_ERROR.test(String(value||''));
+}
+
+export function attachmentVerificationTimeoutEvidence(value){
+  return ATTACHMENT_VERIFICATION_TIMEOUT_ERROR.test(String(value||''));
+}
+
+export function downloadFailedEvidence(value){
+  return DOWNLOAD_FAILED_ERROR.test(String(value||''));
 }
 
 export function iabUnavailableEvidence(value){
@@ -324,9 +364,17 @@ export function browserFocusEvidence(value){
 export function browserFailureCode({explicitCode=null,uploadUnavailable=false,originPermissionDenied=false,failure=null,detail=''}={}){
   if(explicitCode)return explicitCode;
   const source=String(failure?.code||failure?.message||'');
+  if(IAB_UNAVAILABLE_ERROR.test(source))return 'IAB_UNAVAILABLE';
+  if(BROWSER_CREATE_UNAVAILABLE_ERROR.test(detail))return 'BROWSER_CREATE_UNAVAILABLE';
+  if(BROWSER_HANDLE_LOST_ERROR.test(detail))return 'BROWSER_HANDLE_LOST';
+  if(BROWSER_MODE_ENTRY_UNAVAILABLE_ERROR.test(detail))return 'BROWSER_MODE_ENTRY_UNAVAILABLE';
+  if(FILE_CHOOSER_EVENT_TIMEOUT_ERROR.test(detail))return 'FILE_CHOOSER_EVENT_TIMEOUT';
+  if(FILE_CHOOSER_ROUTE_UNAVAILABLE_ERROR.test(detail))return 'FILE_CHOOSER_ROUTE_UNAVAILABLE';
+  if(FILE_SET_FAILED_ERROR.test(detail))return 'FILE_SET_FAILED';
+  if(ATTACHMENT_VERIFICATION_TIMEOUT_ERROR.test(detail))return 'ATTACHMENT_VERIFICATION_TIMEOUT';
+  if(DOWNLOAD_FAILED_ERROR.test(detail))return 'DOWNLOAD_FAILED';
   if(uploadUnavailable)return 'FILE_UPLOAD_CHROME_UNAVAILABLE';
   if(originPermissionDenied)return 'BROWSER_ORIGIN_PERMISSION_DENIED';
-  if(IAB_UNAVAILABLE_ERROR.test(source))return 'IAB_UNAVAILABLE';
   if(BROWSER_TAB_BACKGROUND_ERROR.test(detail))return 'BROWSER_TAB_BACKGROUND_UNAVAILABLE';
   if(CHROME_UNAVAILABLE_ERROR.test(detail))return 'BROWSER_CHROME_UNAVAILABLE';
   if(BROWSER_FOCUS_ERROR.test(detail)&&/RESTORE_FAILED_AFTER_CLOSE/i.test(detail))return 'BROWSER_FOCUS_RESTORE_FAILED_AFTER_CLOSE';
@@ -335,6 +383,14 @@ export function browserFailureCode({explicitCode=null,uploadUnavailable=false,or
 }
 
 export function browserFailurePrefix(errorCode){
+  if(errorCode==='BROWSER_CREATE_UNAVAILABLE')return 'Chrome 专用标签页创建能力不可用；本次未上传附件或发送消息';
+  if(errorCode==='BROWSER_HANDLE_LOST')return 'Chrome 专用标签页句柄在提交前丢失；本次未上传附件或发送消息，关闭状态未确认';
+  if(errorCode==='BROWSER_MODE_ENTRY_UNAVAILABLE')return 'ChatGPT 聊天或创建图片入口不可用；本次未上传附件或发送消息';
+  if(errorCode==='FILE_CHOOSER_EVENT_TIMEOUT')return '附件入口已定位，但 filechooser 事件未在点击前后有界时间内出现；本次未上传附件或发送消息';
+  if(errorCode==='FILE_CHOOSER_ROUTE_UNAVAILABLE')return '附件入口或“从电脑上传”菜单不可用；本次未上传附件或发送消息';
+  if(errorCode==='FILE_SET_FAILED')return '浏览器文件选择器未能接收冻结附件；本次未上传附件或发送消息';
+  if(errorCode==='ATTACHMENT_VERIFICATION_TIMEOUT')return '附件数量、名称、顺序或上传状态未能在有界时间内核实；本次未发送消息';
+  if(errorCode==='DOWNLOAD_FAILED')return '网页原图已提交，但原始图片下载或校验失败；不会自动重发';
   if(errorCode==='FILE_UPLOAD_CHROME_UNAVAILABLE')return '专用 Chrome 标签页的附件入口未能打开浏览器文件选择器';
   if(errorCode==='BROWSER_ORIGIN_PERMISSION_DENIED')return 'Chrome 已连接，但 chatgpt.com 访问权限被拒绝；下次重试出现浏览器访问询问时请选择“允许”';
   if(errorCode==='IAB_UNAVAILABLE')return '历史 Codex 内嵌浏览器 IAB 不可用';

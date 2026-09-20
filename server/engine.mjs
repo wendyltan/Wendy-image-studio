@@ -12,6 +12,7 @@ import {buildRevisionPrompt,revisionPromptTelemetry} from './revision-prompt.mjs
 import {createProjectStore} from './project-store.mjs';
 import {createJobRunner} from './job-runner.mjs';
 import {createImageWorkflow,preAcceptanceQuotaEvidence as classifyPreAcceptanceQuotaEvidence,confirmedUnsentEvidence as classifyConfirmedUnsentEvidence,quotaPauseMessage as formatQuotaPauseMessage} from './image-workflow.mjs';
+import {canonicalPanelKey} from './image-single-flight.mjs';
 export {buildRevisionPrompt,revisionPromptTelemetry};
 export const active = new Map();
 export const COMPOSITION_VERSION='no-page-title-v1';
@@ -31,9 +32,35 @@ const FILE_UPLOAD_CHROME_UNAVAILABLE=/(?:^|[^A-Z0-9_])FILE_UPLOAD_CHROME_UNAVAIL
 const BROWSER_ORIGIN_PERMISSION_DENIED=/(?:^|[^A-Z0-9_])BROWSER_ORIGIN_PERMISSION_DENIED(?:$|[^A-Z0-9_])|Browser use cannot access\s+https?:\/\/chatgpt\.com\b[^\n]*(?:denied permission|permission denied|拒绝)|https?:\/\/chatgpt\.com\b[^\n]*(?:browser security policy|origin permission|访问权限被拒绝)/i;
 const BROWSER_FOCUS_UNAVAILABLE=/(?:BROWSER_(?:FOCUS|TAB_BACKGROUND|CHROME)_(?:UNAVAILABLE|RESTORE_FAILED)|Browser is not available:\s*chrome|Chrome management capability is not advertised|焦点(?:恢复|管理)能力(?:不可用|未提供|未广告)|非前台(?:标签页|tab).*(?:不可用|失败)|后台标签页.*(?:不可用|失败)|无法恢复创作室焦点)/i;
 const USAGE_LIMIT_BEFORE_START='USAGE_LIMIT_BEFORE_START';
-const CONFIRMED_PRE_SUBMISSION_KINDS=new Set(['no-output','browser-unavailable','browser-origin-permission-denied','browser-upload-unavailable']);
+const BROWSER_STAGE_FAILURE_KIND=Object.freeze({
+  BROWSER_CREATE_UNAVAILABLE:'browser-create-unavailable',
+  BROWSER_HANDLE_LOST:'browser-handle-lost',
+  BROWSER_MODE_ENTRY_UNAVAILABLE:'browser-mode-entry-unavailable',
+  FILE_CHOOSER_EVENT_TIMEOUT:'file-chooser-event-timeout',
+  FILE_CHOOSER_ROUTE_UNAVAILABLE:'file-chooser-route-unavailable',
+  FILE_SET_FAILED:'file-set-failed',
+  ATTACHMENT_VERIFICATION_TIMEOUT:'attachment-verification-timeout',
+  REFERENCE_FILES_INVALID:'reference-files-invalid',
+});
+const CONFIRMED_PRE_SUBMISSION_KINDS=new Set(['no-output','browser-unavailable','browser-origin-permission-denied','browser-upload-unavailable',...Object.values(BROWSER_STAGE_FAILURE_KIND)]);
+function browserFailureKindFromCode(value){
+  const text=String(value||'').trim();
+  if(BROWSER_STAGE_FAILURE_KIND[text])return BROWSER_STAGE_FAILURE_KIND[text];
+  if(text==='FILE_UPLOAD_CHROME_UNAVAILABLE')return 'browser-upload-unavailable';
+  if(text==='BROWSER_ORIGIN_PERMISSION_DENIED')return 'browser-origin-permission-denied';
+  if(text==='BROWSER_CHROME_UNAVAILABLE'||text==='BROWSER_FOCUS_UNAVAILABLE'||text==='BROWSER_TAB_BACKGROUND_UNAVAILABLE')return 'browser-unavailable';
+  return null;
+}
+function browserFailureKindFromText(value){
+  const text=String(value||'');
+  for(const [code,kind] of Object.entries(BROWSER_STAGE_FAILURE_KIND))if(text.includes(code))return kind;
+  if(FILE_UPLOAD_CHROME_UNAVAILABLE.test(text))return 'browser-upload-unavailable';
+  if(BROWSER_ORIGIN_PERMISSION_DENIED.test(text))return 'browser-origin-permission-denied';
+  return null;
+}
 export {projectDir,readProject,syncRunningProject,saveProject,listProjects,createProject};
-const taskState=createTaskState({saveProject});
+export function hasLiveWork(projectId){return jobStore.hasLiveWork(projectId);}
+const taskState=createTaskState({saveProject,canonicalizeTarget:canonicalPanelKey});
 const {beginTask,finishTask}=taskState;
 const {job}=createJobRunner({active,runningProjects,jobStore,queueOwner,saveProject,finishTask,finishProgressStage});
 export {job};
@@ -212,12 +239,14 @@ const imageWorkflow=createImageWorkflow({
 });
 const {generate,resumeSameRequestImage}=imageWorkflow;
 function manifestBrowserUnavailable(manifest){
-  return /(?:IAB|WEB_WORKER_ARCHIVED|BROWSER(?:_[A-Z]+)*(?:_UNAVAILABLE|_FAILED)|BROWSER_ORIGIN_PERMISSION_DENIED|FILE_UPLOAD_CHROME_UNAVAILABLE|CHATGPT_LOGIN_REQUIRED|Browser is not available|Chrome management capability is not advertised|焦点(?:恢复|管理)能力)/i.test(String(manifest?.errorCode||manifest?.error||''));
+  return /(?:IAB|WEB_WORKER_ARCHIVED|BROWSER(?:_[A-Z]+)*(?:_UNAVAILABLE|_FAILED)|BROWSER_ORIGIN_PERMISSION_DENIED|FILE_UPLOAD_CHROME_UNAVAILABLE|FILE_CHOOSER_EVENT_TIMEOUT|FILE_CHOOSER_ROUTE_UNAVAILABLE|FILE_SET_FAILED|ATTACHMENT_VERIFICATION_TIMEOUT|BROWSER_MODE_ENTRY_UNAVAILABLE|BROWSER_CREATE_UNAVAILABLE|BROWSER_HANDLE_LOST|REFERENCE_FILES_INVALID|CHATGPT_LOGIN_REQUIRED|Browser is not available|Chrome management capability is not advertised|焦点(?:恢复|管理)能力)/i.test(String(manifest?.errorCode||manifest?.error||''));
 }
 function manifestBrowserFailureKind(manifest){
   const text=String(manifest?.errorCode||manifest?.error||'');
-  if(FILE_UPLOAD_CHROME_UNAVAILABLE.test(text))return 'browser-upload-unavailable';
-  if(BROWSER_ORIGIN_PERMISSION_DENIED.test(text))return 'browser-origin-permission-denied';
+  const structured=browserFailureKindFromCode(String(manifest?.errorCode||''));
+  if(structured)return structured;
+  const inferred=browserFailureKindFromText(text);
+  if(inferred)return inferred;
   return manifestBrowserUnavailable(manifest)?'browser-unavailable':null;
 }
 function originPermissionManifestForTask(p,task){
@@ -325,6 +354,8 @@ function definiteImageFailure(pending,extra=''){
   }
   if(NETWORK_FAILURE.test(combined)||classified.connectionRelated)return null;
   const manifestError=[manifest?.errorCode,manifest?.error].filter(Boolean).join(' ');
+  const stagedKind=browserFailureKindFromText([manifestError,evidence.browserText].join('\n'));
+  if(stagedKind)return {kind:stagedKind,definiteNoOutput:true,key:pending.key,attempts:0,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString()};
   if(FILE_UPLOAD_CHROME_UNAVAILABLE.test(manifestError)||FILE_UPLOAD_CHROME_UNAVAILABLE.test(evidence.browserText))return {kind:'browser-upload-unavailable',definiteNoOutput:true,key:pending.key,attempts:0,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString()};
   if(BROWSER_ORIGIN_PERMISSION_DENIED.test(manifestError)||BROWSER_ORIGIN_PERMISSION_DENIED.test(evidence.browserText))return {kind:'browser-origin-permission-denied',definiteNoOutput:true,key:pending.key,attempts:0,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString()};
   if(IAB_UNAVAILABLE.test(safeFailureText)||IAB_UNAVAILABLE.test(manifestError)||BROWSER_FOCUS_UNAVAILABLE.test(safeFailureText)||BROWSER_FOCUS_UNAVAILABLE.test(manifestError))return {kind:'browser-unavailable',definiteNoOutput:true,key:pending.key,attempts:0,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString()};
@@ -332,7 +363,26 @@ function definiteImageFailure(pending,extra=''){
   const attempts=Math.max(1,(evidence.eventText.match(/image generation failed/gi)||[]).length);
   return {kind:'no-output',definiteNoOutput:true,key:pending.key,attempts,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString()};
 }
-function failureMessage(failure){const usage=failure.inputTokens?`本次后台处理记录约 ${failure.inputTokens.toLocaleString('zh-CN')} 输入 tokens；`:'';const action=String(failure.key||'').includes('样张')?'重试当前样张':'重试当前图片';if(failure.kind==='browser-upload-unavailable')return `专用 Chrome 标签页的附件入口未能打开浏览器文件选择器；本次未上传附件或发送消息，${usage}上一版原图仍保留。修复浏览器附件入口后点击“${action}”，只会重试这一张。`;if(failure.kind==='browser-origin-permission-denied')return `Chrome 已连接，但 chatgpt.com 访问权限被拒绝；下次重试出现浏览器访问询问时请选择“允许”。本次未上传附件或发送消息，${usage}当前节点已经保存；处理权限后点击“${action}”，只会重试这一张。`;if(failure.kind==='browser-unavailable'){const historical=IAB_UNAVAILABLE.test(String(failure.message||''));return `${historical?'历史 Codex 内嵌浏览器 IAB':'专用 Chrome 标签页的公开焦点恢复能力'}暂不可用，本次未提交图片请求。${usage}当前节点已经保存；${historical?'当前生产链路不会退回 IAB，请确认 Chrome Computer Use 与焦点安全能力':'当前公开 CUA 无法保证零焦点切换，请等待支持焦点恢复的能力'}后点击“${action}”，只会重试这一张。`;}if(failure.message)return failure.message;return `${failure.kind==='network'?'生图服务连接失败':'本次生图未完成'}：已发起 ${failure.attempts} 次图片请求，但没有取得图片。${usage}自动重试已停止，上一张样张和当前节点都已保存。实际订阅余额以页面顶部为准；网络稳定后点击“${action}”，只会重试这一张。`;}
+function failureMessage(failure){
+  const usage=failure.inputTokens?`本次后台处理记录约 ${failure.inputTokens.toLocaleString('zh-CN')} 输入 tokens；`:'';
+  const action=String(failure.key||'').includes('样张')?'重试当前样张':'重试当前图片';
+  const stageMessages={
+    'browser-create-unavailable':'Chrome 专用标签页创建能力不可用；本次未上传附件或发送消息。',
+    'browser-handle-lost':'Chrome 专用标签页句柄在提交前丢失，关闭状态未确认；本次未上传附件或发送消息。',
+    'browser-mode-entry-unavailable':'ChatGPT 聊天或创建图片入口不可用；本次未上传附件或发送消息。',
+    'file-chooser-event-timeout':'附件入口已定位，但 filechooser 事件未在有界时间内出现；本次未上传附件或发送消息。',
+    'file-chooser-route-unavailable':'附件按钮及同一标签页菜单 fallback 均不可用；本次未上传附件或发送消息。',
+    'file-set-failed':'浏览器文件选择器未能接收冻结附件；本次未上传附件或发送消息。',
+    'attachment-verification-timeout':'附件数量、名称、顺序或上传状态未能在有界时间内核实；本次未发送消息。',
+    'reference-files-invalid':'服务端冻结附件台账无效；本次未打开浏览器、上传附件或发送消息。',
+  };
+  if(stageMessages[failure.kind])return `${stageMessages[failure.kind]}${usage}上一版原图仍保留；修复对应阶段后点击“${action}”，只会重试这一张。`;
+  if(failure.kind==='browser-upload-unavailable')return `专用 Chrome 标签页的附件入口未能打开浏览器文件选择器；本次未上传附件或发送消息，${usage}上一版原图仍保留。修复浏览器附件入口后点击“${action}”，只会重试这一张。`;
+  if(failure.kind==='browser-origin-permission-denied')return `Chrome 已连接，但 chatgpt.com 访问权限被拒绝；下次重试出现浏览器访问询问时请选择“允许”。本次未上传附件或发送消息，${usage}当前节点已经保存；处理权限后点击“${action}”，只会重试这一张。`;
+  if(failure.kind==='browser-unavailable'){const historical=IAB_UNAVAILABLE.test(String(failure.message||''));return `${historical?'历史 Codex 内嵌浏览器 IAB':'专用 Chrome 标签页的公开焦点恢复能力'}暂不可用，本次未提交图片请求。${usage}当前节点已经保存；${historical?'当前生产链路不会退回 IAB，请确认 Chrome Computer Use 与焦点安全能力':'当前公开 CUA 无法保证零焦点切换，请等待支持焦点恢复的能力'}后点击“${action}”，只会重试这一张。`;}
+  if(failure.message)return failure.message;
+  return `${failure.kind==='network'?'生图服务连接失败':'本次生图未完成'}：已发起 ${failure.attempts} 次图片请求，但没有取得图片。${usage}自动重试已停止，上一张样张和当前节点都已保存。实际订阅余额以页面顶部为准；网络稳定后点击“${action}”，只会重试这一张。`;
+}
 function sampleRepairCount(p,index){
   p.sampleRepairCounts=Array.isArray(p.sampleRepairCounts)?p.sampleRepairCounts:[0,0];
   const parsed=Number(/自动修订(\d+)/.exec(p.samples[index]?.key||'')?.[1])||0;
@@ -806,10 +856,14 @@ export function imageRetryState(p){
 }
 function unknownResultMessage(target='当前图片'){return deriveUnknownResultMessage(target);}
 export function retryMissingImage(p,target,{allowUnknownResult=false}={}){
-  verifyApproval(p);const state=imageRetryState(p),failure=state?.failure;
+  verifyApproval(p);
+  if(active.has(p.id)||jobStore.hasLiveWork(p.id))throw new Error('这篇仍在制作或等待执行，请稍候。');
+  const state=imageRetryState(p),failure=state?.failure;
   if(p.pending&&!(allowUnknownResult&&state?.certainty==='unknown_result'))throw new Error('上次生成结果尚未确认，请先检查已保存图片。');
-  if(!state||state.target!==target||(state.certainty==='unknown_result'&&!allowUnknownResult))throw new Error('当前没有可安全重试的这张图片。');
-  const sampleIndex=sampleIndexFromKey(target),panelKey=panelKeyFromImageKey(target),panelRevision=panelKey?latestImageRevision(p,panelKey):null;
+  const canonicalTarget=canonicalPanelKey(target),stateTarget=canonicalPanelKey(state?.target);
+  if(!state||stateTarget!==canonicalTarget||(state.certainty==='unknown_result'&&!allowUnknownResult))throw new Error('当前没有可安全重试的这张图片。');
+  const retryTarget=canonicalTarget||target;
+  const sampleIndex=sampleIndexFromKey(retryTarget),panelKey=panelKeyFromImageKey(retryTarget),panelRevision=panelKey?latestImageRevision(p,panelKey):null;
   if(sampleIndex===null&&!panelKey)throw new Error('无法识别需要重试的图片。');
   if(p.pending){
     p.supersededPending=Array.isArray(p.supersededPending)?p.supersededPending:[];
@@ -817,11 +871,11 @@ export function retryMissingImage(p,target,{allowUnknownResult=false}={}){
   }
   p.lastFailure=null;p.error=null;
   return job(p,'revising',async signal=>{
-    activity(p,`正在只重新生成 ${target}…`);
+    activity(p,`正在只重新生成 ${state.target||target}…`);
     if(sampleIndex!==null){
       const sample=p.plan.samples[sampleIndex];if(!sample)throw new Error('对应样张不存在。');
       const result=await generate(p,`样张-${sampleIndex+1}`,`${sample.prompt}。单幅竖图，优先3:4；若内置生图返回标准2:3竖幅，保留原图，不裁切，也不要因此再次生图。`,sample.references,signal,null,true,'方向样张',Math.max(1,Number(failure.attempts||0)+1));
-      p.samples[sampleIndex]=result;p.samplesApproved=false;p.samplesDecision=null;p.status='paused';activity(p,`${target} 已重新生成并保存，请查看后继续。`,p.samples.filter(Boolean).length,2,'样张');return;
+      p.samples[sampleIndex]=result;p.samplesApproved=false;p.samplesDecision=null;p.status='paused';activity(p,`${state.target||target} 已重新生成并保存，请查看后继续。`,p.samples.filter(Boolean).length,2,'样张');return;
     }
     const [pageNumber,panelNumber]=panelKey.split('-').map(Number),page=p.plan.pages[pageNumber-1],panel=page?.panels[panelNumber-1];if(!panel)throw new Error('对应分镜不存在。');
     const geoFile=path.join(runDir(p,'分镜比例'),'page.json');jsonWrite(geoFile,page);const geometry=JSON.parse(await pythonRun(['geometry',geoFile]))[panelNumber-1];
@@ -835,7 +889,7 @@ export function retryMissingImage(p,target,{allowUnknownResult=false}={}){
     // must run visual QA even when the project predates workflowPreset or was
     // created in quick/balanced mode; batch settings never waive this check.
     const result=await generate(p,`第${pageNumber}页-第${panelNumber}格`,finalPrompt,panel.references,signal,prior,true,'原始分镜',Math.max(1,Number(failure.attempts||0)+1),revisionMeta);
-    p.panels[panelKey]=result;p.accepted=false;p.status='paused';const totalPanels=p.plan.pages.reduce((total,item)=>total+item.panels.length,0);activity(p,`${target} 已重新生成并保存；本次不会继续生成其他分镜。`,Object.keys(p.panels).length,totalPanels,'分镜');
+    p.panels[panelKey]=result;p.accepted=false;p.status='paused';const totalPanels=p.plan.pages.reduce((total,item)=>total+item.panels.length,0);activity(p,`${state.target||target} 已重新生成并保存；本次不会继续生成其他分镜。`,Object.keys(p.panels).length,totalPanels,'分镜');
   });
 }
 export function recoverImage(p){return recoverImageAction(p);}

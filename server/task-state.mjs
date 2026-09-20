@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
  * The engine owns persistence and orchestration; this module owns the shape of
  * a task transition so a new path cannot forget currentTask or task history.
  */
-export function createTaskState({saveProject, now=()=>new Date().toISOString(), randomUUID=()=>crypto.randomUUID()}={}){
+export function createTaskState({saveProject, now=()=>new Date().toISOString(), randomUUID=()=>crypto.randomUUID(), canonicalizeTarget=value=>value}={}){
   if(typeof saveProject!=='function')throw new TypeError('task state requires saveProject');
 
   function beginTask(p,kind,target,detail={}){
@@ -13,8 +13,12 @@ export function createTaskState({saveProject, now=()=>new Date().toISOString(), 
     p.tasks=Array.isArray(p.tasks)?p.tasks:[];
     // A user-requested retry is a new attempt, never an invisible continuation
     // of the failed provider call.
-    const attempt=p.tasks.filter(item=>item.kind===kind&&item.target===target).length+1;
-    const task={id:randomUUID(),kind,target,status:'running',attempt,startedAt,lastProgressAt:startedAt,projectId:p.id,projectVersion:p.version,...detail};
+    const canonical=canonicalizeTarget(target) || target;
+    const attempt=p.tasks.filter(item=>item.kind===kind&&(canonicalizeTarget(item.target) || item.target)===canonical).reduce((max,item)=>Math.max(max,Number(item.attempt)||0),0)+1;
+    // `detail` may come from a legacy caller with an attempt hint.  The
+    // canonical target history is authoritative so a retry cannot silently
+    // overwrite its incremented attempt with `1`.
+    const task={id:randomUUID(),kind,target,status:'running',startedAt,lastProgressAt:startedAt,projectId:p.id,projectVersion:p.version,...detail,attempt};
     p.tasks.push(task);p.tasks=p.tasks.slice(-80);p.currentTask=task;saveProject(p);return task;
   }
 

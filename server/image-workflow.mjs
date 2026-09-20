@@ -4,6 +4,7 @@ import {readDownloadEvidence} from './web-download-evidence.mjs';
 import {IMAGE_OUTCOME,SavedArtifactQaUnavailableError,savedArtifactQaUnavailable,applySavedArtifactQaOutcome} from './image-lifecycle.mjs';
 import {createImagePreparation} from './image-preparation.mjs';
 import {cleanupRequestStaging} from './storage-hygiene.mjs';
+import {acquireImageFlight,releaseImageFlight} from './image-single-flight.mjs';
 
 const USAGE_LIMIT_ERROR=/(?:you'?ve hit your usage limit|usage limit(?: has been)? reached|rate limit reached|额度(?:已用尽|不足|限制)|使用额度(?:已用尽|不足)|hit your limit)/i;
 
@@ -102,7 +103,7 @@ export function createImageWorkflow({
     }
   }
 
-  async function generate(project, key, prompt, refnames, signal, prior = null, verify = true, qaKind = '原始分镜', attempt = 1, revisionMeta = {}) {
+  async function generateLocked(project, key, prompt, refnames, signal, prior = null, verify = true, qaKind = '原始分镜', attempt = 1, revisionMeta = {}) {
     checkpoint(signal);
     if (!process.env.WENDI_TEST_PLAN_FILE) {
       const worker = webWorkerStatus();
@@ -176,6 +177,24 @@ export function createImageWorkflow({
       if (made?.usage) addUsage(project, made.usage, executor);
     } catch (error) { failure = error; }
     const webManifest = readWebManifest(manifestFile) || failure?.webManifest || made?.manifest || null;
+    // The provider validates the frozen attachment ledger before creating the
+    // browser request. That deterministic failure therefore has no manifest
+    // to match; do not let the later identity guard downgrade it to an
+    // unknown result (or leave a live pending task behind).
+    if (failure?.code === 'REFERENCE_FILES_INVALID') {
+      const message = String(failure.message || '服务端冻结附件台账无效；本次未打开浏览器、上传附件或发送消息。').slice(0, 1000);
+      const known = {kind: 'reference-files-invalid', definiteNoOutput: true, key, attempts: 0, inputTokens: 0, at: new Date().toISOString(), message};
+      writeRunResult(dir, {schemaVersion: 2, provider: webImageProvider, projectId: project.id, projectVersion: project.version, taskId: task.id, target: key, attempt: task.attempt, endedAt: new Date().toISOString(), outcome: 'pre_submission_failure', errorCode: 'REFERENCE_FILES_INVALID', error: message});
+      project.pending = null;
+      project.lastFailure = {...known, taskId: task.id};
+      cleanupOwnStaging(project, dir, 'pre_submission_failure', {submitted: false, submissionUncertain: false, reason: known.kind});
+      finishTask(project, task, 'failed_no_output', {errorCode: known.kind, providerInvocations: 0});
+      saveProject(project);
+      const error = new Error(message);
+      error.code = 'IMAGE_NO_OUTPUT';
+      error.referenceValidation = failure.referenceValidation || null;
+      throw error;
+    }
     if (webManifest?.requestId) {
       pending.requestId = webManifest.requestId;
       task.requestId = webManifest.requestId;
@@ -232,7 +251,7 @@ export function createImageWorkflow({
       writeRunResult(dir, {schemaVersion: 2, provider: webImageProvider, taskId: task.id, attempt: task.attempt, endedAt: new Date().toISOString(), outcome: 'artifact_not_located', diagnostics: generationDiagnosticSummary(evidence), candidateCount: candidateNames.length, candidateNames, error: failure ? String(failure.message || failure).slice(0, 500) : null});
       const known = definiteImageFailure(pending, [made?.text, failure?.message, webManifest?.errorCode, webManifest?.error].filter(Boolean).join('\n'));
       if (known) {
-        if (new Set(['no-output', 'browser-unavailable', 'browser-origin-permission-denied', 'browser-upload-unavailable']).has(known.kind) && known.kind !== 'no-output') task.providerInvocations = 0;
+        if (new Set(['no-output', 'browser-unavailable', 'browser-origin-permission-denied', 'browser-upload-unavailable', 'browser-create-unavailable', 'browser-handle-lost', 'browser-mode-entry-unavailable', 'file-chooser-event-timeout', 'file-chooser-route-unavailable', 'file-set-failed', 'attachment-verification-timeout', 'reference-files-invalid']).has(known.kind) && known.kind !== 'no-output') task.providerInvocations = 0;
         project.pending = null;
         project.lastFailure = {...known, taskId: task.id};
         cleanupOwnStaging(project, dir, 'pre_submission_failure', {submitted: webManifest?.submitted === true, submissionUncertain: webManifest?.submissionUncertain === true, reason: known.kind});
@@ -284,6 +303,15 @@ export function createImageWorkflow({
     }
   }
 
+  async function generate(project, key, prompt, refnames, signal, prior = null, verify = true, qaKind = '原始分镜', attempt = 1, revisionMeta = {}) {
+    const flight = acquireImageFlight({projectId: project.id, projectDir: projectDir(project.id), projectVersion: project.version, panelKey: key, mode: prior ? 'revise' : 'generate'});
+    try {
+      return await generateLocked(project, key, prompt, refnames, signal, prior, verify, qaKind, attempt, revisionMeta);
+    } finally {
+      releaseImageFlight(flight, {outcome: 'workflow-finished'});
+    }
+  }
+
   function resumeSameRequestImage(project) {
     verifyApproval(project);
     const pending = project.pending;
@@ -295,6 +323,8 @@ export function createImageWorkflow({
     const task = (project.tasks || []).find(item => item.id === pending.taskId);
     if (!task || task.projectId !== project.id || Number(task.projectVersion) !== Number(project.version) || task.target !== pending.key) throw new Error('待续接任务与当前作品版本不匹配；原记录已保留。');
     return job(project, 'revising', async signal => {
+      const flight = acquireImageFlight({projectId: project.id, projectDir: projectDir(project.id), projectVersion: project.version, panelKey: pending.key, taskId: pending.taskId, requestId: manifest.requestId, mode: 'resume'});
+      try {
       const executor = {model: pending.executorModel || record.worker.executorModel || null, reasoningEffort: pending.executorReasoningEffort || record.worker.executorReasoningEffort || webImageExecutorEffort, role: record.worker.role || webImageExecutorRole};
       await protectQuota(project, {executorModel: executor.model});
       checkpoint(signal);
@@ -349,7 +379,7 @@ export function createImageWorkflow({
         writeRunResult(pending.dir, {schemaVersion: 2, provider: webImageProvider, taskId: task.id, requestId: webManifest?.requestId || manifest.requestId, endedAt: new Date().toISOString(), outcome: 'artifact_not_located_after_resume', diagnostics: generationDiagnosticSummary(evidence), candidateCount: candidates.length, candidateNames: candidates.map(candidate => path.basename(candidate)), error: failure ? String(failure.message || failure).slice(0, 500) : null});
         const known = definiteImageFailure(pending, [made?.text, failure?.message, webManifest?.errorCode, webManifest?.error].filter(Boolean).join('\n'));
         if (known) {
-          if (new Set(['no-output', 'browser-unavailable', 'browser-origin-permission-denied', 'browser-upload-unavailable']).has(known.kind) && known.kind !== 'no-output') task.providerInvocations = 0;
+          if (new Set(['no-output', 'browser-unavailable', 'browser-origin-permission-denied', 'browser-upload-unavailable', 'browser-create-unavailable', 'browser-handle-lost', 'browser-mode-entry-unavailable', 'file-chooser-event-timeout', 'file-chooser-route-unavailable', 'file-set-failed', 'attachment-verification-timeout', 'reference-files-invalid']).has(known.kind) && known.kind !== 'no-output') task.providerInvocations = 0;
           project.pending = null;
           project.lastFailure = {...known, taskId: task.id};
           cleanupOwnStaging(project, pending.dir, 'pre_submission_failure', {submitted: webManifest?.submitted === true, submissionUncertain: webManifest?.submissionUncertain === true, reason: known.kind});
@@ -394,6 +424,9 @@ export function createImageWorkflow({
         const outcome = savedArtifactQaUnavailable(error, {artifact: file, webState: 'downloaded'});
         applySavedArtifactQaOutcome({project, task, record: imageRecord, artifactFile: file, outcome, saveProject, finishTask, jsonWrite, writeRunResult: result => writeRunResult(pending.dir, result), runResult: {schemaVersion: 2, provider: webImageProvider, taskId: task.id, requestId: webManifest.requestId, endedAt: new Date().toISOString(), outcome: outcome.outcome, artifact: path.relative(projectDir(project.id), file), integrity: persisted.integrity, errorCode: outcome.errorCode, error: outcome.detail}, extraTask: {webState: 'downloaded'}});
         return imageRecord;
+      }
+      } finally {
+        releaseImageFlight(flight, {outcome: 'resume-finished', requestId: manifest.requestId});
       }
     });
   }
