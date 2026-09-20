@@ -265,6 +265,8 @@ const FILE_SET_FAILED_ERROR=/(?:FILE_SET_FAILED|(?:setFiles|设置附件|写入�
 const ATTACHMENT_VERIFICATION_TIMEOUT_ERROR=/(?:ATTACHMENT_VERIFICATION_TIMEOUT|(?:附件|attachment)[^\n]*(?:verification|验证|核对)[^\n]*(?:timeout|超时|失败))/i;
 const DOWNLOAD_FAILED_ERROR=/(?:DOWNLOAD_FAILED|DOWNLOAD_CHROME_UNAVAILABLE|原始图片[^\n]*(?:下载|复制|校验)[^\n]*(?:失败|不可用)|download[^\n]*(?:failed|unavailable))/i;
 const FILE_UPLOAD_CHROME_UNAVAILABLE_ERROR=/(?:^|[^A-Z0-9_])FILE_UPLOAD_CHROME_UNAVAILABLE(?:$|[^A-Z0-9_])|(?:UPLOAD_ERROR[^\n]*(?:file chooser|文件选择器|附件入口|attachment control))/i;
+const WORKER_SCRIPT_RUNTIME_ERROR=/(?:WORKER_SCRIPT_RUNTIME_ERROR|(?:ReferenceError|SyntaxError|TypeError)[^\n]*(?:require is not defined|cua_repl|browser script|执行脚本)|require is not defined|js execution (?:failed|error)|浏览器执行脚本[^\n]*(?:运行时|异常|错误))/i;
+const EXECUTOR_RUNTIME_ERROR=/(?:EXECUTOR_RUNTIME_ERROR|(?:executor|执行器)[^\n]*(?:runtime error|运行时错误|异常退出))/i;
 // Prompt text and command arguments are not browser evidence. This matcher is
 // intentionally limited to the terminal result returned by the owned browser.
 const BROWSER_ORIGIN_PERMISSION_DENIED_ERROR=/(?:^|[^A-Z0-9_])BROWSER_ORIGIN_PERMISSION_DENIED(?:$|[^A-Z0-9_])|Browser use cannot access\s+https?:\/\/chatgpt\.com\b[^\n]*(?:denied permission|permission denied|拒绝)|https?:\/\/chatgpt\.com\b[^\n]*(?:browser security policy|origin permission|访问权限被拒绝)/i;
@@ -295,14 +297,26 @@ export function structuredBrowserToolResultText(dir){
 
 export function browserRunEvidenceText(dir,{manifest=null,failure=null}={}){
   const browserResult=structuredBrowserToolResultText(dir);
+  let runtimeEvents='';
+  try{
+    runtimeEvents=fs.readFileSync(path.join(dir,'events.jsonl'),'utf8').split('\n').filter(line=>WORKER_SCRIPT_RUNTIME_ERROR.test(line)||EXECUTOR_RUNTIME_ERROR.test(line)).join('\n');
+  }catch{}
   let stderr='';
   try{stderr=fs.readFileSync(path.join(dir,'events.jsonl'),'utf8').split('\n').flatMap(line=>{try{const event=JSON.parse(line);return typeof event?.stderr==='string'?[event.stderr]:[];}catch{return [];}}).join('\n');}catch{}
-  return [manifest?.errorCode,manifest?.error,manifest?.message,failure?.code,failure?.message,stderr,browserResult].filter(Boolean).join('\n');
+  return [manifest?.errorCode,manifest?.error,manifest?.message,failure?.code,failure?.message,stderr,runtimeEvents,browserResult].filter(Boolean).join('\n');
+}
+
+export function workerScriptRuntimeErrorEvidence(value){
+  return WORKER_SCRIPT_RUNTIME_ERROR.test(String(value||''));
+}
+
+export function executorRuntimeErrorEvidence(value){
+  return EXECUTOR_RUNTIME_ERROR.test(String(value||''));
 }
 
 export function browserPreSubmissionUnavailableText(value){
   const text=String(value||'');
-  return IAB_UNAVAILABLE_ERROR.test(text)||FILE_UPLOAD_CHROME_UNAVAILABLE_ERROR.test(text)||BROWSER_CREATE_UNAVAILABLE_ERROR.test(text)||BROWSER_HANDLE_LOST_ERROR.test(text)||BROWSER_MODE_ENTRY_UNAVAILABLE_ERROR.test(text)||FILE_CHOOSER_EVENT_TIMEOUT_ERROR.test(text)||FILE_CHOOSER_ROUTE_UNAVAILABLE_ERROR.test(text)||FILE_SET_FAILED_ERROR.test(text)||ATTACHMENT_VERIFICATION_TIMEOUT_ERROR.test(text)||DOWNLOAD_FAILED_ERROR.test(text)||BROWSER_ORIGIN_PERMISSION_DENIED_ERROR.test(text)||BROWSER_FOCUS_ERROR.test(text)||BROWSER_TAB_BACKGROUND_ERROR.test(text)||CHROME_UNAVAILABLE_ERROR.test(text);
+  return IAB_UNAVAILABLE_ERROR.test(text)||WORKER_SCRIPT_RUNTIME_ERROR.test(text)||EXECUTOR_RUNTIME_ERROR.test(text)||FILE_UPLOAD_CHROME_UNAVAILABLE_ERROR.test(text)||BROWSER_CREATE_UNAVAILABLE_ERROR.test(text)||BROWSER_HANDLE_LOST_ERROR.test(text)||BROWSER_MODE_ENTRY_UNAVAILABLE_ERROR.test(text)||FILE_CHOOSER_EVENT_TIMEOUT_ERROR.test(text)||FILE_CHOOSER_ROUTE_UNAVAILABLE_ERROR.test(text)||FILE_SET_FAILED_ERROR.test(text)||ATTACHMENT_VERIFICATION_TIMEOUT_ERROR.test(text)||DOWNLOAD_FAILED_ERROR.test(text)||BROWSER_ORIGIN_PERMISSION_DENIED_ERROR.test(text)||BROWSER_FOCUS_ERROR.test(text)||BROWSER_TAB_BACKGROUND_ERROR.test(text)||CHROME_UNAVAILABLE_ERROR.test(text);
 }
 
 export function browserOriginPermissionDeniedEvidence(value){
@@ -365,6 +379,8 @@ export function browserFailureCode({explicitCode=null,uploadUnavailable=false,or
   if(explicitCode)return explicitCode;
   const source=String(failure?.code||failure?.message||'');
   if(IAB_UNAVAILABLE_ERROR.test(source))return 'IAB_UNAVAILABLE';
+  if(WORKER_SCRIPT_RUNTIME_ERROR.test(detail))return 'WORKER_SCRIPT_RUNTIME_ERROR';
+  if(EXECUTOR_RUNTIME_ERROR.test(detail))return 'EXECUTOR_RUNTIME_ERROR';
   if(BROWSER_CREATE_UNAVAILABLE_ERROR.test(detail))return 'BROWSER_CREATE_UNAVAILABLE';
   if(BROWSER_HANDLE_LOST_ERROR.test(detail))return 'BROWSER_HANDLE_LOST';
   if(BROWSER_MODE_ENTRY_UNAVAILABLE_ERROR.test(detail))return 'BROWSER_MODE_ENTRY_UNAVAILABLE';
@@ -390,6 +406,8 @@ export function browserFailurePrefix(errorCode){
   if(errorCode==='FILE_CHOOSER_ROUTE_UNAVAILABLE')return '附件入口或“从电脑上传”菜单不可用；本次未上传附件或发送消息';
   if(errorCode==='FILE_SET_FAILED')return '浏览器文件选择器未能接收冻结附件；本次未上传附件或发送消息';
   if(errorCode==='ATTACHMENT_VERIFICATION_TIMEOUT')return '附件数量、名称、顺序或上传状态未能在有界时间内核实；本次未发送消息';
+  if(errorCode==='WORKER_SCRIPT_RUNTIME_ERROR')return '浏览器执行脚本发生运行时错误；本次未上传附件或发送消息';
+  if(errorCode==='EXECUTOR_RUNTIME_ERROR')return '网页执行器发生运行时错误；本次未上传附件或发送消息';
   if(errorCode==='DOWNLOAD_FAILED')return '网页原图已提交，但原始图片下载或校验失败；不会自动重发';
   if(errorCode==='FILE_UPLOAD_CHROME_UNAVAILABLE')return '专用 Chrome 标签页的附件入口未能打开浏览器文件选择器';
   if(errorCode==='BROWSER_ORIGIN_PERMISSION_DENIED')return 'Chrome 已连接，但 chatgpt.com 访问权限被拒绝；下次重试出现浏览器访问询问时请选择“允许”';

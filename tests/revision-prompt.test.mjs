@@ -54,9 +54,10 @@ test('browser executor separates local instructions from the remote prompt paylo
     editTarget:'/tmp/base.png',
     requestId:'11111111-1111-4111-8111-111111111111',
   });
-  const match=instruction.match(/<image_prompt>\n([\s\S]*?)\n<\/image_prompt>/);
+  const match=instruction.match(/<remote_prompt>\n([\s\S]*?)\n<\/remote_prompt>/);
   assert(match);
   assert.equal(match[1],revision);
+  assert.doesNotMatch(instruction,/fs\.readFileSync|require\(|worker-request\.json|prompt\.txt/);
   assert.match(instruction,/附件路径、manifest、requestId、项目状态/);
   assert.match(instruction,/本地执行参考（不要复制给 ChatGPT/);
   assert.doesNotMatch(match[1],/\/tmp\/|requestId|projectId|taskId|runId|用户已确认|上方主格/);

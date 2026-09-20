@@ -24,7 +24,7 @@ test('input validation and restricted references',()=>{
   bad.pages[0].panels[0].references=[];bad.pages[0].panels[0].caption='小林发来消息';assert.throws(()=>W.validatePlan(bad,brief),/小林/);
 });
 test('web image provider records the dedicated Chrome focus boundary',()=>{
-  const text=G.chatGptWebImagePrompt({outputFile:'/tmp/result.png',manifestFile:'/tmp/web-generation.json',prompt:'单格测试',referenceFiles:['/tmp/wendi-1.png','/tmp/wendi-2.png']});
+  const text=G.chatGptWebImagePrompt({outputFile:'/tmp/result.png',manifestFile:'/tmp/web-generation.json',prompt:'单格测试',referenceFiles:['/tmp/wendi-1.png','/tmp/wendi-2.png'],requestId:'11111111-1111-4111-8111-111111111111',runId:'workflow-core-fixture'});
   assert.equal(G.WEB_IMAGE_PROVIDER,'chatgpt-web-iab');
   assert.equal(G.WEB_IMAGE_TRANSPORT,'direct-chrome');
   assert.equal(G.webWorkerStatus().browser,'chrome');
@@ -34,7 +34,7 @@ test('web image provider records the dedicated Chrome focus boundary',()=>{
   assert.match(text,/web-generation\.json/);
   assert.match(text,/禁止调用 image_gen/);
   assert.match(text,/禁止接管用户已有标签页/);
-  assert.match(text,/createBrowserTab\("chrome",undefined,\{sessionName:"🎨 温蒂生图"\}\)/);
+  assert.match(text,/createBrowserTab\("chrome",undefined,\{sessionName:"🎨 温蒂生图-[a-f0-9]{8}"\}\)/);
   assert.match(text,/tab\.goto\("https:\/\/chatgpt\.com"\)/);
   assert.match(text,/try\s*\{/);
   assert.match(text,/finally\s*\{/);
@@ -50,11 +50,12 @@ test('web image provider records the dedicated Chrome focus boundary',()=>{
   assert.doesNotMatch(text,/不创建标签页、不上传、不发送/);
   assert.doesNotMatch(text,/cua\.getTab\(/);
   assert.match(text,/tab\.close\(\)/);
-  assert.match(text,/waitForEvent\("filechooser"\)/);
-  assert.match(text,/chooser\.setFiles\(worker\.referenceFiles\)/);
+  assert.match(text,/waitForEvent\("filechooser"/);
+  assert.match(text,/附件绝对路径/);
+  assert.doesNotMatch(text,/chooser\.setFiles\(worker\.referenceFiles\)|worker-request\.json|fs\.readFileSync|require\(/);
   assert.match(text,/禁止调用 cua\.getApp/);
   assert.match(text,/不得重复提交/);
-  assert.match(text,/authorization 是该操作发生后的持久证据/);
+  assert.match(text,/授权、身份和附件台账已由本地 provider 冻结并验证/);
   assert.match(text,/当前同一个回合完成/);
 });
 test('web executor availability reports the direct Chrome focus boundary',()=>{

@@ -40,6 +40,8 @@ const BROWSER_STAGE_FAILURE_KIND=Object.freeze({
   FILE_CHOOSER_ROUTE_UNAVAILABLE:'file-chooser-route-unavailable',
   FILE_SET_FAILED:'file-set-failed',
   ATTACHMENT_VERIFICATION_TIMEOUT:'attachment-verification-timeout',
+  WORKER_SCRIPT_RUNTIME_ERROR:'worker-script-runtime-error',
+  EXECUTOR_RUNTIME_ERROR:'executor-runtime-error',
   REFERENCE_FILES_INVALID:'reference-files-invalid',
 });
 const CONFIRMED_PRE_SUBMISSION_KINDS=new Set(['no-output','browser-unavailable','browser-origin-permission-denied','browser-upload-unavailable',...Object.values(BROWSER_STAGE_FAILURE_KIND)]);
@@ -239,7 +241,7 @@ const imageWorkflow=createImageWorkflow({
 });
 const {generate,resumeSameRequestImage}=imageWorkflow;
 function manifestBrowserUnavailable(manifest){
-  return /(?:IAB|WEB_WORKER_ARCHIVED|BROWSER(?:_[A-Z]+)*(?:_UNAVAILABLE|_FAILED)|BROWSER_ORIGIN_PERMISSION_DENIED|FILE_UPLOAD_CHROME_UNAVAILABLE|FILE_CHOOSER_EVENT_TIMEOUT|FILE_CHOOSER_ROUTE_UNAVAILABLE|FILE_SET_FAILED|ATTACHMENT_VERIFICATION_TIMEOUT|BROWSER_MODE_ENTRY_UNAVAILABLE|BROWSER_CREATE_UNAVAILABLE|BROWSER_HANDLE_LOST|REFERENCE_FILES_INVALID|CHATGPT_LOGIN_REQUIRED|Browser is not available|Chrome management capability is not advertised|焦点(?:恢复|管理)能力)/i.test(String(manifest?.errorCode||manifest?.error||''));
+  return /(?:IAB|WEB_WORKER_ARCHIVED|BROWSER(?:_[A-Z]+)*(?:_UNAVAILABLE|_FAILED)|BROWSER_ORIGIN_PERMISSION_DENIED|FILE_UPLOAD_CHROME_UNAVAILABLE|FILE_CHOOSER_EVENT_TIMEOUT|FILE_CHOOSER_ROUTE_UNAVAILABLE|FILE_SET_FAILED|ATTACHMENT_VERIFICATION_TIMEOUT|WORKER_SCRIPT_RUNTIME_ERROR|EXECUTOR_RUNTIME_ERROR|BROWSER_MODE_ENTRY_UNAVAILABLE|BROWSER_CREATE_UNAVAILABLE|BROWSER_HANDLE_LOST|REFERENCE_FILES_INVALID|CHATGPT_LOGIN_REQUIRED|Browser is not available|Chrome management capability is not advertised|焦点(?:恢复|管理)能力)/i.test(String(manifest?.errorCode||manifest?.error||''));
 }
 function manifestBrowserFailureKind(manifest){
   const text=String(manifest?.errorCode||manifest?.error||'');

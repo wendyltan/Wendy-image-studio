@@ -335,7 +335,7 @@ export function createImageWorkflow({
       let failure = null;
       const capsule = fs.readFileSync(path.join(versionDir(project), '制作提示词胶囊.txt'), 'utf8');
       const conversationUrl = manifest.conversationUrl || previousConversation(pending.prior);
-      const instruction = chatGptWebImagePrompt({outputFile: record.worker.outputFile || pending.file, manifestFile: path.join(pending.dir, 'web-generation.json'), prompt: pending.prompt, referenceFiles: record.worker.referenceFiles || pending.inputFiles || [], editTarget: pending.prior, conversationUrl, capsule, requestId: manifest.requestId});
+      const instruction = chatGptWebImagePrompt({outputFile: record.worker.outputFile || pending.file, manifestFile: path.join(pending.dir, 'web-generation.json'), prompt: pending.prompt, remotePrompt: pending.prompt, referenceFiles: record.worker.referenceFiles || pending.inputFiles || [], editTarget: pending.prior, conversationUrl, capsule, requestId: manifest.requestId});
       try { made = await resumeChatGptWebJob({codexBin: findCodex(), dir: pending.dir, signal, ...executor, instruction, expected: {projectId: project.id, projectVersion: project.version, taskId: pending.taskId, target: pending.key, requestId: manifest.requestId}}); if (made?.usage) addUsage(project, made.usage, executor); } catch (error) { failure = error; }
       const webManifest = readWebManifest(path.join(pending.dir, 'web-generation.json')) || failure?.webManifest || made?.manifest || null;
       if (webManifest?.requestId) {

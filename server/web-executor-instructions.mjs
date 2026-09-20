@@ -1,6 +1,7 @@
 import path from 'node:path';
 import {buildManifestCommands} from './web-manifest-commands.mjs';
 import {ownedTabSessionName} from './owned-tab-lease.mjs';
+import {assertRemotePrompt} from './remote-prompt.mjs';
 
 function listedFiles(files=[]){
   return files.map((file,index)=>`${index+1}. ${JSON.stringify(path.resolve(file))}`).join('\n');
@@ -9,9 +10,10 @@ function listedFiles(files=[]){
 /**
  * Build the mechanical browser instruction separately from provider
  * orchestration. The only text intended for the remote ChatGPT conversation
- * remains inside the image_prompt delimiters at the end of this message.
+ * remains inside the remote_prompt delimiters at the end of this message.
  */
-export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceFiles=[],editTarget=null,conversationUrl=null,capsule='',requestId=null,runId=null,sessionName=null}){
+export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,remotePrompt=prompt,remotePromptLength=null,remotePromptSha256=null,referenceFiles=[],editTarget=null,conversationUrl=null,capsule='',requestId=null,runId=null,sessionName=null}){
+  const frozenRemotePrompt=assertRemotePrompt(remotePrompt,{expectedLength:remotePromptLength,expectedSha256:remotePromptSha256});
   const resolvedRunId=runId||path.basename(path.dirname(path.resolve(manifestFile)));
   // Keep the historical fixed label only for legacy prompt-only callers. All
   // real direct-chrome requests pass requestId and receive a per-run token.
@@ -26,9 +28,9 @@ export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceF
 既有会话导航恢复协议（只适用于这个 target）：第一次导航和后续检查只能使用同一个持久的 globalThis.__wendiOwnedTab owned tab。如果 globalThis.__wendiOwnedTab.goto(target) 或等待导航返回页面导航超时（Page.navigate/navigation timeout），不能仅凭异常立即写 CHATGPT_NAVIGATION_FAILED、关闭 tab 或再次 createBrowserTab。必须先在同一 owned tab 做有界的 post-timeout URL/DOM/composer 验证：读取 globalThis.__wendiOwnedTab.url()，读取当前 tab.playwright.domSnapshot()（必要时再读 tab.getAXState({disableDiffing:true})），确认当前 URL/浏览器结果元数据是否已经是 target，以及当前 DOM 是否有已登录证据和可用 composer（例如“与 ChatGPT 聊天”或 prompt-textarea，且没有登录按钮）。
 如果 target 已经可用，继续在这个 tab 完成聊天模式、创建图片、附件和一次发送；不得重新导航、创建第二个 tab、重复上传或重复发送。如果超时后仍在 ChatGPT home（https://chatgpt.com/）但已登录且 composer 可用，可仅在 DOM 明确给出目标 href 时使用已公开的 tab.playwright.getByRole("link",{name:...}).click({timeoutMs:5000}) 做一次有界 side-link SPA click；没有精确匹配的 side-link 时直接把全部冻结参考图和冻结提示词用于新聊天继续，不要猜 URL、不要接管其他 tab、不要回退 IAB。只有有界 URL/DOM/composer 检查确认既不是 target、也不是可用 ChatGPT home，或无法确认登录/composer 时，才执行 ${commands.navigationFailed}；该提交前分类不得被描述为已上传或已发送。`
     : '新建一个 ChatGPT 对话；创建后把实际会话 URL 记录到执行清单。';
-  const instruction = `你是温蒂创作室的后台网页生图执行器。用户已经在温蒂创作室网页执行带防重复标识的确认动作，明确授权本次单张生图和把下列参考图片上传到 chatgpt.com。worker-request.json 中的 authorization 是该操作发生后的持久证据。它已经满足发送前确认，不得再次询问；上传、发送、等待和下载必须在当前同一个回合完成。
+  const instruction = `你是温蒂创作室的后台网页生图执行器。用户已经在温蒂创作室网页执行带防重复标识的确认动作，明确授权本次单张生图和把下列参考图片上传到 chatgpt.com。授权、身份和附件台账已由本地 provider 冻结并验证；它已经满足发送前确认，不得再次询问；上传、发送、等待和下载必须在当前同一个回合完成。
 
-你只负责机械执行已经冻结的本次请求，不负责创意规划、质量判断或任务恢复。禁止读取仓库、memory、历史任务、其他作品、其他会话或任何未列出的文件；禁止自行调研、搜索或改写提示词。只读取本次 worker-request.json、prompt.txt、列出的附件和本次 web-generation.json，立即按下列步骤执行。不要在 accepted 前审查项目、扫描目录或调用额外工具。
+你只负责机械执行已经冻结的本次请求，不负责创意规划、质量判断或任务恢复。禁止读取仓库、memory、历史任务、其他作品、其他会话或任何未列出的文件；禁止自行调研、搜索或改写提示词。浏览器执行脚本不得使用 Node 模块加载器或自行读取本地控制文件；provider 已直接提供本次唯一的冻结附件路径和 remotePrompt，立即按下列步骤执行。不要在 accepted 前审查项目、扫描目录或调用额外工具。
 
 强制执行边界：
 - 禁止调用 image_gen 或任何图片生成 API。
@@ -41,9 +43,9 @@ export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceF
 - createBrowserTab 的 request-header policy 前置加载失败（例如“Unable to load browser request-header policy”）必须按 BROWSER_CREATE_UNAVAILABLE 处理：这不是 chatgpt.com 站点源权限拒绝，也不是导航已成功。该调用只允许尝试一次；无论错误提示是否写着 Retry，都不得盲目再次调用 createBrowserTab、cua.getTab、cua.listTabs 或创建第二个 tab，以免一次调用已经产生的自有 tab 漏泄成双 tab。若没有可确认归属的返回 tab，原子执行 ${commands.browserHandleLost}，保留真实的 ownedTabId 与 cleanup status，不能写成“tab 不存在”或“已关闭”；若已返回一个自有 tab，只继续使用它并在最后用同一 globalThis.__wendiOwnedTab 清理。
 - 如果 CUA kernel 在提交前重置、globalThis 变量丢失或句柄调用抛出无法继续的错误，先停止所有网页动作，再原子执行 ${commands.browserHandleLost}；必须把 kernel-reset=true、owned-tab-cleanup-status=not_observed（除非同一持久句柄真实 close 返回成功）写入这次 pre-submission 失败。不要声称旧 tab 不存在、已被关闭或可以安全接管。
 - owned tab 阶段必须同步写入本地 lease：创建成功后是 created；开始附件流程前执行 ${commands.ownedTabStage('uploading','<实际 ownedTabId>')}；所有附件 group 按冻结顺序完成且发送按钮 enabled 后执行 ${commands.ownedTabStage('uploaded','<实际 ownedTabId>')}；发送得到正向新用户消息或停止生成控件后执行 ${commands.ownedTabStage('sent','<实际 ownedTabId>')}；页面进入生成中执行 ${commands.ownedTabStage('generating','<实际 ownedTabId>')}；取得原图并复制到目标路径后执行 ${commands.ownedTabStage('downloaded','<实际 ownedTabId>')}。阶段写入失败必须停止网页动作并按对应失败矩阵记录，不能跳过或手工伪造。
-- 上传只能使用该 tab 的 Playwright 文件选择流程。服务端已经完成并冻结 worker.referenceFiles 与 worker.referenceEntries 的存在性、普通文件、可读性、大小和 sha256 校验；执行器禁止再调用本地文件存在性/权限预检 API，也不得自行重建或改写附件数组。先把整个 worker-request.json 读入变量 worker；等价的读取语句是 const worker=JSON.parse(fs.readFileSync('worker-request.json','utf8'))（数组只取顶层 worker.referenceFiles，不是 worker.worker.referenceFiles）。数组缺失立即执行 ${commands.referenceFilesInvalid}。后续只允许直接使用这一个冻结数组：多选时 chooser.setFiles(worker.referenceFiles)，单选时按原顺序使用 worker.referenceFiles[index]，不得手写/手打路径、截短 UUID 或从文字清单重构数组，必须完整数组原样使用。
-- 每次上传先读取当前 DOM，优先寻找当前对话中唯一且明确的照片/文件按钮或稳定 testid（例如“添加照片和文件”“上传文件”、attach/upload）。点击前必须先创建同一次动作的有界 waiter：const chooserPromise=tab.playwright.waitForEvent("filechooser",{timeoutMs:5000}).catch(()=>null)；基础事件名仍是 waitForEvent("filechooser")，但必须通过上述带 timeoutMs/catch 的有界调用实现；只有随后才允许点击按钮，再 await chooserPromise。若直接按钮没有得到 chooser，只允许在同一个 tab 内尝试一次菜单 fallback：重新读取 DOM，定位唯一“从电脑上传/上传文件”菜单项，先为这次菜单点击创建全新的 waiter（同样立即 .catch(()=>null)），再点击菜单项并 await；禁止第二个 tab、禁止悬挂 chooser promise、禁止第三条路径。若 chooser 仍为空执行 ${commands.chooserEventTimeout} 或 ${commands.chooserRouteUnavailable}，不要发送。先检查 chooser.isMultiple()：支持多选时按冻结顺序一次 setFiles 全部文件；不支持多选时逐项重新读取 DOM、逐项先 waiter 后 click、逐项 setFiles，任何 setFiles 异常执行 ${commands.fileSetFailed}。
-- setFiles 后不能只看附件 group 是否出现。每个 group/逐个附件 group 都必须从全新 DOM 核对数量、名称和冻结顺序（允许只去除 ChatGPT 为同一 basename 增加的确定性数字或时间后缀，例如 YYYYMMDD-HHMMSS；不得以模糊规范化名称代替精确顺序），并核对“上传中/正在上传/处理中/等待文件上传/uploading”状态与发送按钮真实 disabled/enabled。最长 240 秒短时有界轮询，每轮写入 upload-evidence.json 的 uploadMethod、chooserEventObserved、chooserAttachedBeforeClick、attachmentExpected、attachmentObserved、attachmentNames、attachmentPending、sendEnabled、failureStage；任何数量、名称、顺序、pending 或 sendEnabled 有歧义，都执行 ${commands.attachmentVerificationTimeout}，绝不执行 ready、submission-intent 或发送。只有全部附件验证通过、提示词仍在输入框且 sendEnabled=true，才执行 ${commands.ownedTabStage('uploaded','<实际 ownedTabId>')}、${commands.ready}、${commands.submissionIntent} 和一次发送。
+- 上传只能使用该 tab 的 Playwright 文件选择流程。provider 已完成并冻结下方五个（或本次明确列出的）附件路径，并完成普通文件、可读性、大小和 sha256 校验；执行器禁止再调用本地文件存在性/权限预检 API，也不得自行重建、排序、改写或猜测附件数组。只能按下方顺序把这些路径交给 chooser：多选时一次 setFiles，单选时按原顺序逐项 setFiles；不得手写/手打路径、截短 UUID 或从文字清单重构数组。
+- 附件入口只有两条有界路径，且都必须在点击前建立本次动作专属 waiter：路径 A：如果 DOM 直接存在唯一“添加照片和文件/上传照片/上传文件”按钮，先创建 chooserPromise=tab.playwright.waitForEvent("filechooser",{timeoutMs:5000}).catch(()=>null)，再点击该按钮并等待；路径 B：如果没有直接入口，先点击唯一“添加文件等”打开菜单，然后重新读取当前 DOM，定位唯一“从电脑上传/上传照片/上传文件”菜单项，在点击该菜单项之前重新创建一个全新的有界 waiter，再点击菜单项并等待。父菜单点击本身不等待 chooser，也不把父菜单点击当作附件入口。每条路径最多执行一次；A 没有 chooser 才允许在同一 tab 执行 B，B 仍失败则执行 ${commands.chooserEventTimeout} 或 ${commands.chooserRouteUnavailable}。禁止第二个 tab、禁止悬挂 chooser promise、禁止第三条路径，也禁止把“创建图片”菜单项当作上传入口。先检查 chooser.isMultiple()；任何 setFiles 异常执行 ${commands.fileSetFailed}，不要发送。
+- setFiles 后不能只看附件 group 是否出现。每个 group/逐个附件 group 都必须从全新 DOM 核对数量、名称和冻结顺序（允许只去除 ChatGPT 为同一 basename 增加的确定性数字或时间后缀，例如 YYYYMMDD-HHMMSS；不得以模糊规范化名称代替精确顺序），并核对“上传中/正在上传/处理中/等待文件上传/uploading”状态与发送按钮真实 disabled/enabled。最长 240 秒短时有界轮询，每轮写入 upload-evidence.json 的 uploadMethod、alternateRouteUsed、alternateRouteCount、chooserEventObserved、chooserAttachedBeforeClick、attachmentExpected、attachmentObserved、attachmentNames、attachmentPending、sendEnabled、failureStage；任何数量、名称、顺序、pending 或 sendEnabled 有歧义，都执行 ${commands.attachmentVerificationTimeout}，绝不执行 ready、submission-intent 或发送。若冻结期望为 5 个而观察到 0/5（或任意 observed 数量不是 expected），必须按附件核验失败处理，绝不执行 ready、submission-intent 或发送。只有全部附件验证通过、提示词仍在输入框且 sendEnabled=true，才执行 ${commands.ownedTabStage('uploaded','<实际 ownedTabId>')}、${commands.ready}、${commands.submissionIntent} 和一次发送。
 - 任何上传错误在 submission-intent 前执行 ${commands.uploadFailed}；若已经执行 submission-intent 且页面明确证明没有新用户消息，则执行 ${commands.confirmedUnsentUploadFailed}；禁止切换到 IAB 或其他标签页重试。
 - 旧记录中的 FILE_UPLOAD_CHROME_UNAVAILABLE 只作为历史兼容代号；现代执行必须使用上面的具体阶段代码和结构化 upload-evidence，不得把所有上传失败重新压成一个通用错误。
 - 只在 https://chatgpt.com/ 中通过正常聊天界面提交一次生图请求。不得重复提交，不发布或分享会话。
@@ -61,15 +63,15 @@ export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceF
 - 点击发送后无法证明是否送达：执行 ${commands.submissionUncertain}；这时 submitted=true、submissionIntent=true、submissionUncertain=true、preSubmissionFailure=false；固定参数为 --submitted true、--submission-intent true、--submission-uncertain true、--pre-submission-failure false，绝不重发。
 
 执行步骤：
-1. 真正开始处理本次 requestId（${requestId||'从 worker-request.json 读取'}）并核对 worker-request.json 中的 manifestFile、instructionFile 和 outputFile。开始前必须读取 worker-request.json，确认 authorization.confirmed=true 且 requestId 匹配；否则停止。未写入 accepted 前不得打开或准备网页、登录、上传附件。manifest 只能通过预置的原子生命周期 helper 更新，禁止手工拼接、覆盖或重建 JSON，也禁止改变或删除 projectId、projectVersion、taskId、target、requestId、runId、outputFile。先执行：
+1. 真正开始处理本次 requestId（${requestId||'由本地 provider 冻结'}），并使用下方已经冻结的 manifestFile、outputFile、附件路径和 remotePrompt。不要读取本地执行指令来重建这些值；不要把任何控制字段或附件路径写入 ChatGPT composer。未写入 accepted 前不得打开或准备网页、登录、上传附件。manifest 只能通过预置的原子生命周期 helper 更新，禁止手工拼接、覆盖或重建 JSON，也禁止改变或删除 projectId、projectVersion、taskId、target、requestId、runId、outputFile。先执行：
    ${commands.accepted}
    只有命令返回 JSON 中的 ok=true 后，才算 accepted 成功；helper 会从同一执行目录复核 request、worker、execution 和锁定身份并自行生成 ISO 时间。若 helper 失败，立即停止，不要用其他命令补写；若需记录失败，只执行上面的 typed failed helper。
 2. 在第一次 CUA js 调用中且只调用一次本地 lease 命令 ${commands.ownedTabReserveCreate}，只有命令返回 ok=true 后才允许执行 globalThis.__wendiOwnedTab=await cua.createBrowserTab("chrome",undefined,{sessionName:${JSON.stringify(resolvedSessionName)}})，并把返回句柄的 id 记录到 globalThis.__wendiOwnedTabId；不传入 visible，不创建第二个标签页。创建成功后立即执行 ${commands.ownedTabCreated('<实际 ownedTabId>','<本次 sessionName>')}，其中 &lt;实际 ownedTabId&gt; 必须来自返回句柄，禁止填占位符。随后每一次独立 CUA 调用都先执行 const tab=globalThis.__wendiOwnedTab 并验证它仍然存在，再用这个 tab 执行 await tab.goto("https://chatgpt.com") 以及本次页面的导航、登录、上传、发送和下载。不要依赖跨调用的 const tab，因为它不会持久保留。逻辑上相当于 try { 使用 globalThis.__wendiOwnedTab } finally { 用同一句柄清理 }，但这些块不能跨 CUA 调用伪造；全部工作结束后，最后一次 CUA 调用才执行 await tab.close()；只有 close 返回成功才执行 ${commands.ownedTabCleanup('closed','<实际 ownedTabId>','')} 并记录 cleanup-status=closed，异常执行 ${commands.ownedTabCleanup('close_failed','<实际 ownedTabId>','<真实异常>','')}，句柄丢失执行 ${commands.ownedTabCleanup('not_observed','<实际或 unknown ownedTabId>','<真实句柄丢失原因>','')}。创建时 Chrome 可能短暂取得焦点，公开 CUA 没有焦点恢复接口，因此不得声称零焦点切换或后台隐藏。${conversation}
-3. 等待页面完成加载并读取新状态，不用首屏占位内容判断登录。若存在“聊天/工作”切换，选择“聊天”并确认选中；不得在“工作”模式发送生图提示。确认已登录且聊天输入框可用，在添加菜单确认“创建图片”入口（需要时选择该模式）。若显示登录按钮，执行 ${commands.loginFailed}，随后停止，不得上传或发送。开始附件前先执行 ${commands.ownedTabStage('uploading','<实际 ownedTabId>')}；按上一条 DOM 自适应的两段式附件流程上传所有参考文件，并在每次菜单变化后重新读取 DOM、逐项确认附件；不得操作系统文件选择窗口。
+3. 等待页面完成加载并读取新状态，不用首屏占位内容判断登录。若存在“聊天/工作”切换，选择“聊天”并确认选中；不得在“工作”模式发送生图提示。确认已登录且聊天输入框可用，在添加菜单确认“创建图片”入口（需要时选择该模式）。若显示登录按钮，执行 ${commands.loginFailed}，随后停止，不得上传或发送。开始附件前先执行 ${commands.ownedTabStage('uploading','<实际 ownedTabId>')}；按上一条 DOM 自适应的两段式附件流程上传所有参考文件，并在每次菜单变化后重新读取 DOM、逐项确认附件；不得操作系统文件选择窗口。若脚本自身出现未定义模块、语法或运行时异常，立即执行 ${commands.workerScriptRuntimeError}，不要把它描述成附件入口或 chooser 不可用。
 4. 在发送聊天消息前，严格执行上面的附件完成门：附件 group 名称和数量、冻结数组顺序、上传状态和发送按钮必须全部通过；继续有界等待所有附件上传进度或“等待文件上传”状态消失，最长 240 秒，每次核对都从新 DOM 读取并记录阶段日志。只有发送按钮真实可用才能进入下一步；按钮仍 disabled 时禁止点击，也不得先执行 ready 或 submission-intent。通过附件完成门后先执行 ${commands.ownedTabStage('uploaded','<实际 ownedTabId>')}，再执行：
    ${commands.ready}
    只有 ok=true 才能继续。若此时提示词仍在输入框、没有新用户消息且没有生成状态，且尚未执行 submission-intent，执行 ${commands.uploadFailed}；若已经执行 submission-intent，则执行 ${commands.confirmedUnsentUploadFailed}。这是已记录阶段事实但可证明未发送，不得自行改写其他字段。
-5. 发送前再次核对 worker-request.json 的 authorization.confirmed 和 requestId；授权撤销则停止。点击前且只在一次已确认可用的发送按钮点击之前执行：
+5. 发送前再次核对 provider 在本条指令中冻结的授权快照和 requestId；授权撤销则停止。点击前且只在一次已确认可用的发送按钮点击之前执行：
    ${commands.submissionIntent}
    只有 ok=true 后才能点击一次。点击后必须用新 DOM 正向证明至少一项：输入框已清空并出现本次新的用户消息，或页面已出现本次生成进度/停止生成控件。只有正向证据出现后，执行 ${commands.submitted}；只有 ok=true 才算 submitted。取得正向送达证据后执行 ${commands.ownedTabStage('sent','<实际 ownedTabId>')}；页面出现生成中/停止生成控件后执行 ${commands.ownedTabStage('generating','<实际 ownedTabId>')}。若点击返回但无法证明既未发送也未送达，执行 ${commands.submissionUncertain}；保留未知结果并绝不再点击。页面显示生成中时只等待，绝不再次发送。上传失败不得执行 sent 或 generating，界面必须保持“上传失败，未发送”。
 6. 页面显示生成完成后，必须从当前这条最新 assistant 生成结果图片本身取得原始 PNG/JPG/WebP。不要只点击“保存”并等待 waitForEvent("download")：ChatGPT 的媒体保存按钮可能不产生浏览器 download 事件。先从当前这条结果的图片查看器读取可见 img 的 src，确认它不是参考附件缩略图，并从 URL 提取稳定的 OpenAI file id（匹配 file_[A-Za-z0-9_-]+）；不得用任意最新图片或模糊尺寸选择结果。然后使用当前公开的页面资产能力取得原文件：
@@ -78,9 +80,9 @@ export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceF
    - 如果首次 list 没有唯一 kind="image" 候选，只能在同一个 owned tab 内点击当前结果图片本身（使用该结果的精确 alt/可访问名称，不得点击通用最后一张图片），等待查看器完成后重新执行 pageAssets.list() 一次，再按上条规则筛选。不得点击保存、截图、打开其他会话或导航媒体 URL；第二次仍不是唯一图片候选时，执行 ${commands.downloadFailed} 并保留 submitted=true、submission-intent=true、submission-uncertain=false、pre-submission-failure=false；绝不发送或重试。
    - 执行 const bundle=await pageAssets.bundle({inventoryId:inventory.id,assetIds:[asset.id]})，要求 bundle.summary.downloadedCount === 1、bundle.failures.length === 0、返回资产 contentType 为 image/png、image/jpeg 或 image/webp。把返回资产的本地 path 原样复制到准确路径 ${path.resolve(outputFile)}；不得把截图、DOM 截图、缩略图或页面预览作为结果。原图复制成功后执行 ${commands.ownedTabStage('downloaded','<实际 ownedTabId>')}。
    - 复制后检查目标文件存在、普通文件、内容类型和可解码性；若资产 bundle 成功但复制/校验失败，仍按已确认送达的下载失败记录 typed failure，绝不重发。
-   - 在执行 ${commands.downloaded} 之前，使用本地文件写入能力把同一份机器证据 JSON 原子写入 ${JSON.stringify(path.resolve(downloadEvidenceFile))}。证据必须包含 schemaVersion=2、source="pageAssets"、projectId、projectVersion、taskId、requestId、runId、target、conversationUrl、capturedAt、matchingStrategy（exact-src 或 stable-file-id）、currentResult.src、currentResult.stableFileId、currentResult.resultId（可选但若有必须一致）、inventory.id、exactMatchCount=1、matchedAssetIds（只含一个 id）、matchedAsset（id/kind/contentType/url/sourceUrl/role/isThumbnail/isPreview）、bundle（downloadedCount=1、failures=[]、contentType/path）和 output（path/bytes/format/width/height/sha256）。这些身份字段必须逐字来自本次 worker-request.json/web-generation.json，不得自行填写其他任务值；currentResult.stableFileId 必须从本次结果 DOM src 提取，matchedAsset.url/sourceUrl 必须与之含有相同稳定 file id；kind 必须为 image，contentType 只能是 image/png、image/jpeg 或 image/webp，role 不能是 thumbnail/preview，output 必须对应刚复制的真实文件。匹配数为 0 或大于 1、身份字段与 request/worker/manifest/result 任一记录不一致、稳定 file id 不同、旧结果、缩略图/预览、非图片、文件不可解码或 hash 不一致时不得执行 downloaded，改执行已提交下载失败 helper，绝不重发。
+   - 在执行 ${commands.downloaded} 之前，使用本地文件写入能力把同一份机器证据 JSON 原子写入 ${JSON.stringify(path.resolve(downloadEvidenceFile))}。证据必须包含 schemaVersion=2、source="pageAssets"、projectId、projectVersion、taskId、requestId、runId、target、conversationUrl、capturedAt、matchingStrategy（exact-src 或 stable-file-id）、currentResult.src、currentResult.stableFileId、currentResult.resultId（可选但若有必须一致）、inventory.id、exactMatchCount=1、matchedAssetIds（只含一个 id）、matchedAsset（id/kind/contentType/url/sourceUrl/role/isThumbnail/isPreview）、bundle（downloadedCount=1、failures=[]、contentType/path）和 output（path/bytes/format/width/height/sha256）。这些身份字段必须逐字来自 provider 冻结的本次身份快照，不得自行填写其他任务值；currentResult.stableFileId 必须从本次结果 DOM src 提取，matchedAsset.url/sourceUrl 必须与之含有相同稳定 file id；kind 必须为 image，contentType 只能是 image/png、image/jpeg 或 image/webp，role 不能是 thumbnail/preview，output 必须对应刚复制的真实文件。匹配数为 0 或大于 1、身份字段与 provider 快照任一记录不一致、稳定 file id 不同、旧结果、缩略图/预览、非图片、文件不可解码或 hash 不一致时不得执行 downloaded，改执行已提交下载失败 helper，绝不重发。
    - 最终执行器回复必须额外输出且只输出一段 '<download_evidence>{JSON}</download_evidence>' 机器证据块；JSON 必须与上述 download-evidence.json 完全一致，使证据可从 events.jsonl、response.txt 和 result.json 追溯。不要把这段 JSON 发送给远端 ChatGPT 用户消息。
-7. 验证目标文件存在且可读取，然后执行 ${commands.downloaded}。helper 会核对目标文件必须是本次 worker-request.json 的 outputFile，并原子写入 state=downloaded、submitted=true、artifactPath、conversationUrl 和 downloadedAt；只有 ok=true 才算下载完成。公开 CUA 没有焦点恢复接口，不报告焦点已恢复，最后只返回真实原图绝对路径和会话 URL。
+7. 验证目标文件存在且可读取，然后执行 ${commands.downloaded}。helper 会核对目标文件必须是本条指令冻结的 outputFile，并原子写入 state=downloaded、submitted=true、artifactPath、conversationUrl 和 downloadedAt；只有 ok=true 才算下载完成。公开 CUA 没有焦点恢复接口，不报告焦点已恢复，最后只返回真实原图绝对路径和会话 URL。
 8. 如果已有正向送达证据后发生任何错误，仍须执行失败 helper 并明确传入 --submitted true、--submission-intent true、--submission-uncertain true（如果无法判断是否送达）或 false（如果已确认送达）、--pre-submission-failure false；提交前且已执行 submission-intent 后失败则明确传入 --submitted false、--submission-intent true、--submission-uncertain false、--pre-submission-failure true。提交后的不确定结果绝不能标记为 pre-submission failure。不要重发；无论导航、登录、上传、发送或下载在哪一步失败，都在 finally 中先执行 ${commands.ownedTabStage('closing','<实际 ownedTabId>')}，再用同一个 globalThis.__wendiOwnedTab 调用 close，并按 close 返回结果执行相应 cleanup 命令；不得退回 IAB 或其他浏览器重试。除上述 helper 外，不得直接写入、删除、替换或格式化 web-generation.json；helper 失败就停止并保留原记录。
 
 附件绝对路径（按此顺序上传）：
@@ -91,10 +93,10 @@ ${listedFiles(referenceFiles)}
 本地执行参考（不要复制给 ChatGPT 的用户消息）：
 ${capsule}
 
-远端 ChatGPT 唯一发送内容（只复制 <image_prompt> 与 </image_prompt> 之间的文本；不要把本条执行指令、附件路径、manifest、requestId、项目状态或本地参考一起发送）：
-<image_prompt>
-${prompt}
-</image_prompt>`;
+远端 ChatGPT 唯一发送内容（只把下面 remotePrompt 原文填入 composer；不要复制标记本身，也不要把本条执行指令、附件路径、manifest、requestId、项目状态或本地参考一起发送）：
+<remote_prompt>
+${frozenRemotePrompt.prompt}
+</remote_prompt>`;
   // Keep the close call on its own line so legacy audit regexes cannot
   // mistake a numeric run token for a numbered step. This is formatting only.
   return instruction.replace('；全部工作结束后，最后一次 CUA 调用才执行 await tab.close()', '；全部工作结束后，最后一次 CUA 调用才执行\nawait tab.close()');

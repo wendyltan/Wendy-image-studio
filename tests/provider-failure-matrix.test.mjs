@@ -104,7 +104,7 @@ test('contradictory failure flags are rejected before they can corrupt the manif
   assert.equal(after.submitted,false);
 });
 
-test('executor instructions carry explicit stage flags and only the image_prompt is remote content',()=>{
+test('executor instructions carry explicit stage flags and only remote_prompt is remote content',()=>{
   const instruction=chatGptWebImagePrompt({
     outputFile:'/tmp/out.png',
     manifestFile:'/tmp/run/web-generation.json',
@@ -116,9 +116,9 @@ test('executor instructions carry explicit stage flags and only the image_prompt
   assert.match(instruction,/CHATGPT_LOGIN_REQUIRED[\s\S]*--submitted false[\s\S]*--submission-intent false[\s\S]*--submission-uncertain false[\s\S]*--pre-submission-failure true/);
   assert.match(instruction,/CHATGPT_NAVIGATION_FAILED[\s\S]*--submitted false[\s\S]*--submission-intent false[\s\S]*--submission-uncertain false[\s\S]*--pre-submission-failure true/);
   assert.match(instruction,/FILE_UPLOAD_CHROME_UNAVAILABLE[\s\S]*--submitted false[\s\S]*--submission-intent false[\s\S]*--submission-uncertain false[\s\S]*--pre-submission-failure true/);
-  assert.equal((instruction.match(/\n<image_prompt>\n/g)||[]).length,1);
-  assert.equal((instruction.match(/\n<\/image_prompt>/g)||[]).length,1);
-  assert.match(instruction,/只复制 <image_prompt> 与 <\/image_prompt> 之间的文本/);
+  assert.equal((instruction.match(/\n<remote_prompt>\n/g)||[]).length,1);
+  assert.equal((instruction.match(/\n<\/remote_prompt>/g)||[]).length,1);
+  assert.match(instruction,/只把下面 remotePrompt 原文填入 composer/);
   assert.match(instruction,/filechooser[\s\S]*catch\(\(\)=>null\)/);
   assert.match(instruction,/node "[^"]+server\/run-manifest\.mjs"/);
   assert.match(instruction,/globalThis\.__wendiOwnedTab/);
@@ -146,17 +146,19 @@ test('frozen reference validation rejects missing, unreadable, reordered, or tam
   assert.equal(tampered.ok,false);assert(tampered.errors.some(error=>/sha256|哈希|大小/.test(error)));
 });
 
-test('executor instructions bind the top-level worker reference array and gate send on every upload group',()=>{
+test('executor instructions bind provider-frozen references and gate send on every upload group',()=>{
   const instruction=chatGptWebImagePrompt({outputFile:'/tmp/out.png',manifestFile:'/tmp/run/web-generation.json',prompt:'fixture',referenceFiles:['/tmp/a.png','/tmp/b.png']});
-  assert.match(instruction,/const worker=JSON\.parse\(fs\.readFileSync\(['"]worker-request\.json['"],['"]utf8['"]\)\)/);
-  assert.match(instruction,/worker\.referenceFiles/);
-  assert.match(instruction,/不是 worker\.worker\.referenceFiles/);
-  assert.match(instruction,/不要手写|不要手打|完整数组原样/);
+  assert.doesNotMatch(instruction,/fs\.readFileSync|require\(|worker-request\.json|prompt\.txt/);
+  assert.doesNotMatch(instruction,/worker\.referenceFiles/);
+  assert.match(instruction,/附件绝对路径/);
+  assert.match(instruction,/不得手写|不得手打|不要手写|不要手打|完整数组原样/);
   assert.match(instruction,/每个 group|逐个附件 group|group.*数量/);
   assert.match(instruction,/重复后缀|YYYYMMDD-HHMMSS|规范化名称/);
   assert.match(instruction,/等待.*等待文件上传.*消失|等待文件上传.*消失/);
   assert.match(instruction,/发送按钮.*disabled|disabled.*发送按钮/);
   assert.match(instruction,/禁止.*submission-intent|submission-intent.*禁止/);
+  assert.match(instruction,/0\/5|observed 数量不是 expected/);
+  assert.match(instruction,/从电脑上传[\s\S]*重新创建一个全新的有界 waiter/);
 });
 
 test('executor retrieves the original generated media through page assets',()=>{

@@ -6,8 +6,9 @@ import {identityFields,sameIdentityValue,readJsonObject as readRunJson,readRunId
 import {patchManifest} from './run-manifest.mjs';
 import {chatGptWebImagePrompt} from './web-executor-instructions.mjs';
 import {ensureOwnedTabLease,ownedTabSessionName,readOwnedTabLease,syncOwnedTabLeaseToManifest} from './owned-tab-lease.mjs';
-import {browserFailurePrefix,browserPreSubmissionUnavailableText,browserRunEvidenceText,structuredBrowserToolResultText,browserOriginPermissionDeniedEvidence,fileUploadChromeUnavailableEvidence,browserCreateUnavailableEvidence,browserHandleLostEvidence,browserModeEntryUnavailableEvidence,fileChooserEventTimeoutEvidence,fileChooserRouteUnavailableEvidence,fileSetFailedEvidence,attachmentVerificationTimeoutEvidence,downloadFailedEvidence,iabUnavailableEvidence,browserTabBackgroundEvidence,chromeUnavailableEvidence,browserFocusEvidence,completeDownloadEvidence,enrichDownloadEvidenceIdentity,extractDownloadEvidence,inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence,writeDownloadEvidence} from './web-download-evidence.mjs';
+import {browserFailurePrefix,browserPreSubmissionUnavailableText,browserRunEvidenceText,structuredBrowserToolResultText,browserOriginPermissionDeniedEvidence,fileUploadChromeUnavailableEvidence,browserCreateUnavailableEvidence,browserHandleLostEvidence,browserModeEntryUnavailableEvidence,fileChooserEventTimeoutEvidence,fileChooserRouteUnavailableEvidence,fileSetFailedEvidence,attachmentVerificationTimeoutEvidence,workerScriptRuntimeErrorEvidence,executorRuntimeErrorEvidence,downloadFailedEvidence,iabUnavailableEvidence,browserTabBackgroundEvidence,chromeUnavailableEvidence,browserFocusEvidence,completeDownloadEvidence,enrichDownloadEvidenceIdentity,extractDownloadEvidence,inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence,writeDownloadEvidence} from './web-download-evidence.mjs';
 import {uploadEvidenceFailureCode,uploadEvidenceFromRun,validateUploadEvidence} from './web-upload-evidence.mjs';
+import {REMOTE_PROMPT_FILE,assertRemotePrompt,remotePromptMetadata,validateRemotePrompt} from './remote-prompt.mjs';
 // Keep the durable provider id for existing project records. The production
 // transport is direct Chrome; older IAB manifests remain readable for
 // recovery, but IAB is never a fallback for a new request.
@@ -60,6 +61,23 @@ function writeJson(file,value){
   const temp=`${file}.tmp-${crypto.randomUUID()}`;
   fs.writeFileSync(temp,JSON.stringify(value,null,2),{mode:0o600});
   fs.renameSync(temp,file);
+}
+
+function writeRemotePrompt(file, prompt) {
+  fs.mkdirSync(path.dirname(file), {recursive: true});
+  const temp = `${file}.tmp-${crypto.randomUUID()}`;
+  fs.writeFileSync(temp, String(prompt), {mode: 0o600});
+  fs.renameSync(temp, file);
+}
+
+function readRemotePrompt(dir, worker = null) {
+  const file = path.join(dir, REMOTE_PROMPT_FILE);
+  try {
+    const value = fs.readFileSync(file, 'utf8');
+    return {file, value, validation: validateRemotePrompt(value, {expectedLength: worker?.remotePromptLength, expectedSha256: worker?.remotePromptSha256})};
+  } catch {
+    return {file, value: null, validation: {ok: false, errors: ['remote-prompt.txt 缺失。']}};
+  }
 }
 
 function patchManifestState(manifestFile,stage,args={}){
@@ -155,7 +173,7 @@ function uploadUnavailableForRun({dir,manifestFile,outputFile,requestId,manifest
   if(!manifest||manifest.state!=='failed'||manifest.submitted!==false)return false;
   if(!browserRunIdentityMatches({dir,manifestFile,outputFile,requestId,manifest}))return false;
   const explicit=explicitManifestErrorCode(manifest);
-  if(explicit)return ['FILE_UPLOAD_CHROME_UNAVAILABLE','FILE_CHOOSER_EVENT_TIMEOUT','FILE_CHOOSER_ROUTE_UNAVAILABLE','FILE_SET_FAILED','ATTACHMENT_VERIFICATION_TIMEOUT','BROWSER_MODE_ENTRY_UNAVAILABLE','BROWSER_CREATE_UNAVAILABLE','BROWSER_HANDLE_LOST'].includes(explicit);
+  if(explicit)return ['FILE_UPLOAD_CHROME_UNAVAILABLE','FILE_CHOOSER_EVENT_TIMEOUT','FILE_CHOOSER_ROUTE_UNAVAILABLE','FILE_SET_FAILED','ATTACHMENT_VERIFICATION_TIMEOUT','WORKER_SCRIPT_RUNTIME_ERROR','EXECUTOR_RUNTIME_ERROR','BROWSER_MODE_ENTRY_UNAVAILABLE','BROWSER_CREATE_UNAVAILABLE','BROWSER_HANDLE_LOST'].includes(explicit);
   const worker=readJsonObject(path.join(dir,'worker-request.json'));
   const modern=Number(worker?.schemaVersion||0)>=2||Number(manifest?.schemaVersion||0)>=2;
   const evidence=uploadEvidenceFromRun(dir);
@@ -182,6 +200,8 @@ function structuredUploadFailureCode(dir){
 function knownBrowserFailureCode(detail,dir){
   const structured=structuredUploadFailureCode(dir);
   if(structured)return structured;
+  if(workerScriptRuntimeErrorEvidence(detail))return 'WORKER_SCRIPT_RUNTIME_ERROR';
+  if(executorRuntimeErrorEvidence(detail))return 'EXECUTOR_RUNTIME_ERROR';
   if(browserCreateUnavailableEvidence(detail))return 'BROWSER_CREATE_UNAVAILABLE';
   if(browserHandleLostEvidence(detail))return 'BROWSER_HANDLE_LOST';
   if(browserModeEntryUnavailableEvidence(detail))return 'BROWSER_MODE_ENTRY_UNAVAILABLE';
@@ -209,7 +229,7 @@ function recordBrowserPreSubmissionFailure(manifestFile,requestId,failure,dir){
   const originPermissionDenied=!explicit&&browserRunIdentityMatches(identity)&&browserOriginPermissionDeniedEvidence(structured);
   const uploadUnavailable=!explicit&&uploadUnavailableForRun({dir,manifestFile,outputFile:worker?.outputFile,requestId,manifest});
   const historicalIab=!explicit&&iabUnavailableEvidence(String(failure?.code||failure?.message||''));
-  const inferredCode=modern?(structuredUploadFailureCode(dir)):knownBrowserFailureCode(detail,dir);
+  const inferredCode=modern?(structuredUploadFailureCode(dir)||knownBrowserFailureCode(detail,dir)):knownBrowserFailureCode(detail,dir);
   const errorCode=explicit|| (inferredCode|| (uploadUnavailable?'FILE_UPLOAD_CHROME_UNAVAILABLE':originPermissionDenied?'BROWSER_ORIGIN_PERMISSION_DENIED':historicalIab?'IAB_UNAVAILABLE':browserTabBackgroundEvidence(detail)?'BROWSER_TAB_BACKGROUND_UNAVAILABLE':chromeUnavailableEvidence(detail)?'BROWSER_CHROME_UNAVAILABLE':browserFocusEvidence(detail)&&/RESTORE_FAILED_AFTER_CLOSE/i.test(detail)?'BROWSER_FOCUS_RESTORE_FAILED_AFTER_CLOSE':browserFocusEvidence(detail)&&/RESTORE_FAILED/i.test(detail)?'BROWSER_FOCUS_RESTORE_FAILED':'BROWSER_FOCUS_UNAVAILABLE'));
   const prefix=browserFailurePrefix(errorCode);
   try{
@@ -292,6 +312,7 @@ function archivePreAcceptanceAttempt(dir,manifest,execution){
   for(const name of ['execution.json','events.jsonl','response.txt','result.json','prompt.txt','web-generation.json','run-identity.json']){
     const source=path.join(dir,name);if(fs.existsSync(source))fs.copyFileSync(source,path.join(archive,name));
   }
+  const remotePrompt=path.join(dir,REMOTE_PROMPT_FILE);if(fs.existsSync(remotePrompt))fs.copyFileSync(remotePrompt,path.join(archive,REMOTE_PROMPT_FILE));
   writeJson(path.join(archive,'attempt.json'),{schemaVersion:1,requestId:manifest.requestId,state:manifest.state,accepted:manifest.accepted===true,submitted:manifest.submitted===true,referenceCount:Number(manifest.referenceCount)||0,executionState:execution.state,error:execution.error||null,archivedAt:new Date().toISOString()});
   return path.relative(dir,archive);
 }
@@ -303,6 +324,7 @@ function archiveConfirmedUnsentAttempt(dir,manifest,execution,audit){
   for(const name of ['execution.json','events.jsonl','response.txt','result.json','prompt.txt','web-generation.json','run-identity.json','web-audit.json']){
     const source=path.join(dir,name);if(fs.existsSync(source))fs.copyFileSync(source,path.join(archive,name));
   }
+  const remotePrompt=path.join(dir,REMOTE_PROMPT_FILE);if(fs.existsSync(remotePrompt))fs.copyFileSync(remotePrompt,path.join(archive,REMOTE_PROMPT_FILE));
   writeJson(path.join(archive,'attempt.json'),{schemaVersion:1,requestId:manifest.requestId,state:manifest.state,accepted:manifest.accepted===true,submitted:manifest.submitted===true,submissionIntent:manifest.submissionIntent===true,referenceCount:Number(manifest.referenceCount)||0,executionState:execution.state,errorCode:manifest.errorCode||null,error:manifest.error||execution.error||null,auditResult:audit.result,archivedAt:new Date().toISOString()});
   return path.relative(dir,archive);
 }
@@ -365,6 +387,8 @@ export async function dispatchChatGptWebJob({codexBin,dir,outputFile,prompt,refe
   fs.mkdirSync(dir,{recursive:true});
   const manifestFile=path.join(dir,'web-generation.json'),instructionFile=path.join(dir,'prompt.txt'),requestFile=path.join(dir,'worker-request.json'),requestMetadataFile=path.join(dir,'request.json');
   if(fs.existsSync(requestFile))throw new Error('这个图片请求已存在，请检查已有结果，不会再次执行。');
+  const remotePromptValidation=assertRemotePrompt(prompt);
+  const remotePrompt=remotePromptValidation.prompt,remotePromptInfo=remotePromptMetadata(remotePrompt);
   const requestId=crypto.randomUUID(),createdAt=new Date().toISOString(),absoluteOutput=path.resolve(outputFile);
   const runId=path.basename(path.resolve(dir)),sessionName=ownedTabSessionName(runId,requestId);
   const requestIdentity=identityFields(readJsonObject(path.join(dir,'request.json'))),lockedIdentity={...requestIdentity,requestId,runId,outputFile:absoluteOutput};
@@ -378,11 +402,19 @@ export async function dispatchChatGptWebJob({codexBin,dir,outputFile,prompt,refe
     throw error;
   }
   writeJson(manifestFile,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,transport:WEB_IMAGE_TRANSPORT,browser:WEB_IMAGE_BROWSER,focusPolicy:WEB_IMAGE_FOCUS_POLICY,role,executorModel:model||null,executorReasoningEffort:reasoningEffort,sessionName,ownedTabId:null,ownedTabState:'not_created',ownedTabCleanupStatus:'not_attempted',cleanupStatus:'not_attempted',cleanupVerifiedAt:null,cleanupError:null,kernelReset:false,...commonIdentity,state:'queued',accepted:false,submitted:false,referenceCount:0,createdAt});
-  writeJson(requestMetadataFile,{...previousRequest,schemaVersion:Number(previousRequest.schemaVersion||2),provider:previousRequest.provider||WEB_IMAGE_PROVIDER,identitySchemaVersion:2,identityLocked:true,...lockedIdentity,expectedOutput:previousRequest.expectedOutput||path.relative(path.resolve(dir,'..','..'),absoluteOutput)});
-  writeJson(requestFile,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,transport:WEB_IMAGE_TRANSPORT,browser:WEB_IMAGE_BROWSER,focusPolicy:WEB_IMAGE_FOCUS_POLICY,role,executorModel:model||null,executorReasoningEffort:reasoningEffort,sessionName,...commonIdentity,expectedOutput:path.relative(path.resolve(dir,'..','..'),absoluteOutput),authorization:{confirmed:true,scope:'one_chatgpt_web_image_submission',confirmedAt:createdAt},instructionFile,manifestFile,referenceFiles:referenceValidation.files.map(item=>item.path),referenceEntries:referenceValidation.files.map(({name,sizeBytes,sha256})=>({name,sizeBytes,sha256})),createdAt});
+  writeRemotePrompt(path.join(dir, REMOTE_PROMPT_FILE), remotePrompt);
+  writeJson(requestMetadataFile,{...previousRequest,schemaVersion:Number(previousRequest.schemaVersion||2),provider:previousRequest.provider||WEB_IMAGE_PROVIDER,identitySchemaVersion:2,identityLocked:true,...lockedIdentity,expectedOutput:previousRequest.expectedOutput||path.relative(path.resolve(dir,'..','..'),absoluteOutput),remotePromptLength:remotePromptInfo.remotePromptLength,remotePromptSha256:remotePromptInfo.remotePromptSha256});
+  writeJson(requestFile,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,transport:WEB_IMAGE_TRANSPORT,browser:WEB_IMAGE_BROWSER,focusPolicy:WEB_IMAGE_FOCUS_POLICY,role,executorModel:model||null,executorReasoningEffort:reasoningEffort,sessionName,...commonIdentity,expectedOutput:path.relative(path.resolve(dir,'..','..'),absoluteOutput),authorization:{confirmed:true,scope:'one_chatgpt_web_image_submission',confirmedAt:createdAt},instructionFile,remotePromptFile:path.join(dir, REMOTE_PROMPT_FILE),remotePromptLength:remotePromptInfo.remotePromptLength,remotePromptSha256:remotePromptInfo.remotePromptSha256,manifestFile,referenceFiles:referenceValidation.files.map(item=>item.path),referenceEntries:referenceValidation.files.map(({name,sizeBytes,sha256})=>({name,sizeBytes,sha256})),createdAt});
   writeJson(path.join(dir,'run-identity.json'),{schemaVersion:1,identitySchemaVersion:2,identityLocked:true,provider:WEB_IMAGE_PROVIDER,...lockedIdentity,expectedOutput:absoluteOutput,createdAt});
   ensureOwnedTabLease({dir,runId,requestId,sessionName});
-  const executorPrompt=chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceFiles,editTarget,conversationUrl,capsule,requestId,runId,sessionName});
+  const frozenRemote=readRemotePrompt(dir,{remotePromptLength:remotePromptInfo.remotePromptLength,remotePromptSha256:remotePromptInfo.remotePromptSha256});
+  if(!frozenRemote.validation.ok){
+    const error=new Error(`写入后的 remotePrompt 无法核验：${frozenRemote.validation.errors.join('；')}`);
+    error.code='REMOTE_PROMPT_INVALID';
+    error.remotePromptValidation=frozenRemote.validation;
+    throw error;
+  }
+  const executorPrompt=chatGptWebImagePrompt({outputFile,manifestFile,prompt:remotePrompt,remotePrompt:frozenRemote.value,remotePromptLength:remotePromptInfo.remotePromptLength,remotePromptSha256:remotePromptInfo.remotePromptSha256,referenceFiles,editTarget,conversationUrl,capsule,requestId,runId,sessionName});
   let result,failure;
   try{result=await runCodex({codexBin,dir,image:true,browserMode:'chrome',signal,timeoutMs,model,reasoningEffort,role,writableDirs:[path.dirname(path.resolve(outputFile))],prompt:executorPrompt});}catch(error){failure=error;}
   const lease=readOwnedTabLease(dir,{runId,requestId});
@@ -418,7 +450,21 @@ export async function resumeChatGptWebJob({codexBin,dir,signal,timeoutMs=900000,
     throw error;
   }
   const runId=path.basename(path.resolve(dir)),sessionName=String(worker.sessionName||manifest.sessionName||ownedTabSessionName(runId,requestId));
+  const remotePromptRecord=readRemotePrompt(dir,worker);
+  if(!remotePromptRecord.validation.ok){
+    const error=new Error(`待续接图片请求的 remotePrompt 无法核验：${remotePromptRecord.validation.errors.join('；')}`);
+    error.code='REMOTE_PROMPT_INVALID';
+    error.remotePromptValidation=remotePromptRecord.validation;
+    throw error;
+  }
   const instructionFile=String(worker.instructionFile||path.join(dir,'prompt.txt')),nextInstruction=typeof instruction==='string'&&instruction.trim()?instruction:fs.readFileSync(instructionFile,'utf8'),archive=preAcceptance?archivePreAcceptanceAttempt(dir,manifest,execution):archiveConfirmedUnsentAttempt(dir,manifest,execution,audit),resumedAt=new Date().toISOString();
+  const remoteBlock=nextInstruction.match(/<remote_prompt>\n([\s\S]*?)\n<\/remote_prompt>/i);
+  if(!remoteBlock||remoteBlock[1]!==remotePromptRecord.validation.prompt){
+    const error=new Error('续接执行指令中的 remotePrompt 与冻结提示不一致；不会发送控制指令或重新生图。');
+    error.code='REMOTE_PROMPT_INVALID';
+    error.remotePromptValidation=remotePromptRecord.validation;
+    throw error;
+  }
   if(audit&&!(typeof instruction==='string'&&instruction.trim()))throw new Error('已确认未发送的续接缺少更新后执行指令；原记录已保留。');
   fs.writeFileSync(instructionFile,nextInstruction,{mode:0o600});
   const resumeArgs={resumeCount:Number(manifest.resumeCount||0)+1,resumedAt,...(preAcceptance?{lastPreAcceptanceAttempt:archive}:{lastConfirmedUnsentAttempt:archive,confirmedUnsentAudit:'web-audit.json'})};

@@ -60,6 +60,8 @@ export function buildManifestCommands(manifestFile,{helperFile=DEFAULT_HELPER,re
     chooserRouteUnavailable:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'FILE_CHOOSER_ROUTE_UNAVAILABLE',error:'上传照片按钮和菜单 fallback 均不可用'}),
     fileSetFailed:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'FILE_SET_FAILED',error:'文件选择器未能接收冻结附件'}),
     attachmentVerificationTimeout:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'ATTACHMENT_VERIFICATION_TIMEOUT',error:'附件数量、名称、顺序或上传状态未能核实'}),
+    workerScriptRuntimeError:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'WORKER_SCRIPT_RUNTIME_ERROR',error:'浏览器执行脚本发生运行时错误'}),
+    executorRuntimeError:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'EXECUTOR_RUNTIME_ERROR',error:'网页执行器发生运行时错误'}),
     downloadFailed:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.submittedKnown,errorCode:'DOWNLOAD_FAILED',error:'网页原图下载或校验失败'}),
     originPermissionDenied:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'BROWSER_ORIGIN_PERMISSION_DENIED',error:'chatgpt.com 站点源访问权限被拒绝'}),
     chromeUnavailable:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'BROWSER_CHROME_UNAVAILABLE',error:'Chrome extension 不可用'}),

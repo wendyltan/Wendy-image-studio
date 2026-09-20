@@ -52,6 +52,8 @@ const ERROR_CODE_CATEGORY = Object.freeze({
   FILE_CHOOSER_EVENT_TIMEOUT: 'file_chooser',
   FILE_SET_FAILED: 'file_chooser',
   ATTACHMENT_VERIFICATION_TIMEOUT: 'upload_verification',
+  WORKER_SCRIPT_RUNTIME_ERROR: 'other',
+  EXECUTOR_RUNTIME_ERROR: 'other',
   SUBMISSION_FAILED: 'send',
   SEND_FAILED: 'send',
   SUBMISSION_UNCERTAIN: 'post_submit_unknown',
