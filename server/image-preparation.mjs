@@ -1,5 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import {
+  createRequestStaging,
+  materializeVersionAttachment,
+  readAttachmentCache,
+  updateRequestStagingMarker,
+  writeAttachmentCache,
+} from './storage-hygiene.mjs';
 
 /**
  * Preparation and quota boundary for a paid image request.
@@ -31,13 +38,10 @@ export function createImagePreparation({
   function preparedCacheFor(project, sourceFiles, prior) {
     let versionCache = [];
     try {
-      versionCache =
-        JSON.parse(
-          fs.readFileSync(
-            path.join(versionDir(project), '上传附件缓存.json'),
-            'utf8',
-          ),
-        ).files || [];
+      versionCache = readAttachmentCache({
+        projectRoot: projectDir(project.id),
+        versionRoot: versionDir(project),
+      }).entries;
     } catch {}
     const cache = [
       ...versionCache,
@@ -94,52 +98,82 @@ export function createImagePreparation({
         sourceSha256:
           cachePlan?.sourceSha256s?.[index] || checksum(source),
       }));
+    const staging = createRequestStaging({
+      projectRoot: projectDir(project.id),
+      runDir: dir,
+      projectId: project.id,
+      projectVersion: project.version,
+      taskId: project.currentTask?.id || null,
+      runId: path.basename(dir),
+      sourceFiles,
+    });
     if (missing.length) {
       const spec = path.join(dir, '上传素材.json');
       jsonWrite(spec, {
         files: missing.map((item) => item.source),
-        outputDir: path.join(dir, '上传素材'),
+        outputDir: staging.attachmentsDir,
         reusedCount: cachePlan?.cacheHits || 0,
       });
-      const fresh = JSON.parse(await pythonRun(['prepare-web', spec]));
-      for (const [index, item] of missing.entries()) {
-        const target = fresh[index];
-        if (!target?.file) throw new Error('上传素材准备未完成。');
-        prepared[item.index] = {...target, reused: false};
+      try {
+        const fresh = JSON.parse(await pythonRun(['prepare-web', spec]));
+        for (const [index, item] of missing.entries()) {
+          const target = fresh[index];
+          if (!target?.file) throw new Error('上传素材准备未完成。');
+          prepared[item.index] = {...target, reused: false};
+        }
+      } catch (error) {
+        updateRequestStagingMarker(staging, {state: 'prepare_failed', preparationError: String(error.message || error).slice(0, 500)});
+        throw error;
       }
     }
-    const cacheFile = path.join(versionDir(project), '上传附件缓存.json');
-    let existing = [];
-    try {
-      existing = JSON.parse(fs.readFileSync(cacheFile, 'utf8')).files || [];
-    } catch {}
-    const merged = new Map(
-      existing
-        .filter((item) => item?.sourceSha256 && item.file)
-        .map((item) => [item.sourceSha256, item]),
-    );
+    const existing = readAttachmentCache({
+      projectRoot: projectDir(project.id),
+      versionRoot: versionDir(project),
+    });
+    const merged = new Map(existing.entries.map((item) => [item.sourceSha256, item]));
     for (const [index, item] of prepared.entries()) {
       if (!item?.file) continue;
-      let relative;
-      try {
-        relative = path.relative(
-          projectDir(project.id),
-          inside(projectDir(project.id), item.file),
-        );
-      } catch {
-        continue;
-      }
       const sourceSha256 =
         cachePlan?.sourceSha256s?.[index] || checksum(sourceFiles[index]);
-      merged.set(sourceSha256, {
+      const shared = materializeVersionAttachment({
+        projectRoot: projectDir(project.id),
+        versionRoot: versionDir(project),
+        sourceFile: item.file,
         sourceSha256,
-        file: relative,
         optimized: item.optimized === true,
         sizeBytes: Number(item.sizeBytes) || fs.statSync(item.file).size,
+      });
+      prepared[index] = {
+        ...item,
+        file: shared.file,
+        sizeBytes: shared.sizeBytes,
+        sourceSha256,
+        reused: item.reused === true || shared.reused,
+      };
+      merged.set(sourceSha256, {
+        sourceSha256,
+        fileSha256: shared.fileSha256,
+        file: shared.relativePath,
+        optimized: item.optimized === true,
+        sizeBytes: shared.sizeBytes,
         updatedAt: new Date().toISOString(),
       });
     }
-    jsonWrite(cacheFile, {schemaVersion: 1, files: [...merged.values()].slice(-200)});
+    writeAttachmentCache({
+      projectRoot: projectDir(project.id),
+      versionRoot: versionDir(project),
+      entries: [...merged.values()].slice(-500),
+      migratedFrom: existing.schemaVersion,
+    });
+    updateRequestStagingMarker(staging, {
+      state: 'prepared',
+      preparedFiles: prepared.filter(Boolean).map((item) => path.relative(projectDir(project.id), item.file).split(path.sep).join('/')),
+      preparedAt: new Date().toISOString(),
+    });
+    // Optimized upload copies have already been promoted into the shared
+    // version cache. Remove only this request's own disposable preparation
+    // directory; request metadata and browser evidence stay in the run dir.
+    try { fs.rmSync(staging.attachmentsDir, {recursive: true, force: true}); } catch {}
     return prepared;
   }
 
