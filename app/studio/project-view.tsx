@@ -96,7 +96,7 @@ export function ProjectView({
     (item): item is { key: string; title: string; image: Picture } =>
       item !== null &&
       ((item.image.qa.pass === null &&
-        ['pending', 'unavailable', 'recovered_pending_review'].includes(
+        ['pending', 'unavailable', 'recovered_pending_review', 'manual_review'].includes(
           item.image.qa.status || '',
         )) ||
         (item.image.qa.pass === false &&

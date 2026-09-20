@@ -8,8 +8,8 @@ const root=fs.mkdtempSync(path.join(os.tmpdir(),'wendi-direct-worker-'));
 function setup(mode){
  const dir=fs.mkdtempSync(path.join(root,'run-')),bin=path.join(dir,'worker.mjs');
  fs.writeFileSync(bin,`#!/usr/bin/env node
-import fs from 'node:fs';import path from 'node:path';
-const args=process.argv.slice(2),dir=process.cwd();
+import fs from 'node:fs';import path from 'node:path';import crypto from 'node:crypto';
+const args=process.argv.slice(2),dir=process.cwd(),out=args[args.indexOf('-o')+1];
 fs.writeFileSync(path.join(dir,'argv.json'),JSON.stringify(args));
  fs.writeFileSync(path.join(dir,'env.json'),JSON.stringify({backend:process.env.BROWSER_USE_AVAILABLE_BACKENDS||null,surfaces:process.env.CUA_REPL_ENABLED_SURFACES||null}));
 let input='';process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>{
@@ -29,14 +29,15 @@ let input='';process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>{
  if(mode==='explicit-upload-with-permission-noise'){console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'permission denied browser security policy'}}));console.log(JSON.stringify({type:'item.completed',item:{type:'command_execution',command:'echo user declined permission',aggregated_output:'browser security policy denied'}}));write({...base,state:'failed',errorCode:'FILE_UPLOAD_CHROME_UNAVAILABLE',error:'FILE_UPLOAD_CHROME_UNAVAILABLE: attachment control did not open file chooser'});return;}
  if(mode==='failed'){write({...base,state:'failed',errorCode:'CHATGPT_LOGIN_REQUIRED',error:'请在专用 Chrome 页面登录 ChatGPT。'});return;}
  if(mode==='submitted'){write({...base,state:'submitted',submitted:true});process.exitCode=1;return;}
- fs.writeFileSync(req.outputFile,'mock image');
- write({...base,state:'downloaded',submitted:true,requestId:mode==='wrong'?'11111111-1111-4111-8111-111111111111':req.requestId,artifactPath:req.outputFile});
+ const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=','base64');fs.writeFileSync(req.outputFile,png);const conversationUrl='https://chatgpt.com/c/fixture-conversation',src='https://chatgpt.com/backend-api/estuary/content?id=file_fixture_result&sig=fixture',sha256=crypto.createHash('sha256').update(png).digest('hex'),downloadEvidence={schemaVersion:1,source:'pageAssets',conversationUrl,requestId:req.requestId,runId:req.runId,currentResult:{src,resultId:'file_fixture_result',marker:'fixture-result'},inventory:{id:'inventory-fixture',assetCount:1},exactMatchCount:1,matchedAssetIds:['asset-fixture'],matchedAsset:{id:'asset-fixture',kind:'image',contentType:'image/png',url:src,sourceUrl:src,role:'generated-result',isThumbnail:false,isPreview:false},bundle:{downloadedCount:1,failures:[],contentType:'image/png',path:'/tmp/fixture-bundle.png'},output:{path:req.outputFile,bytes:png.length,format:'PNG',width:1,height:1,sha256},capturedAt:new Date().toISOString()},evidenceText='<download_evidence>'+JSON.stringify(downloadEvidence)+'</download_evidence>';
+ write({...base,state:'downloaded',submitted:true,requestId:mode==='wrong'?'11111111-1111-4111-8111-111111111111':req.requestId,artifactPath:req.outputFile,conversationUrl});fs.writeFileSync(out,evidenceText);console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:evidenceText}}));
  if(mode==='crash-after-download')process.exitCode=1;
 });
 `);fs.chmodSync(bin,0o755);return {codexBin:bin,dir,outputFile:path.join(dir,'out.png'),prompt:'fixture',timeoutMs:5000};
 }
-test('direct execution starts once, retains identity, and records the Chrome focus boundary',async()=>{
- const args=setup('success'),result=await dispatchChatGptWebJob(args);assert.equal(result.manifest.state,'downloaded');
+test('direct execution persists validated page-assets evidence for the exact original',async()=>{
+ const args=setup('success'),result=await dispatchChatGptWebJob(args);assert.equal(result.manifest.state,'downloaded');assert.equal(result.downloadEvidence.exactMatchCount,1);assert.equal(result.downloadEvidence.bundle.downloadedCount,1);
+ const evidence=JSON.parse(fs.readFileSync(path.join(args.dir,'download-evidence.json'),'utf8'));assert.equal(evidence.conversationUrl,'https://chatgpt.com/c/fixture-conversation');assert.equal(evidence.matchedAsset.kind,'image');assert.equal(evidence.output.sha256,result.downloadEvidence.output.sha256);
  assert.equal(result.manifest.transport,'direct-chrome');assert.equal(result.manifest.browser,'chrome');assert.equal(result.manifest.focusPolicy,'may-focus-at-create-without-public-focus-api');assert.equal(result.manifest.role,'browser-executor');assert.equal(result.manifest.executorReasoningEffort,'low');
  const request=JSON.parse(fs.readFileSync(path.join(args.dir,'worker-request.json')));assert.equal(request.role,'browser-executor');assert.equal(request.executorReasoningEffort,'low');
  const argv=JSON.parse(fs.readFileSync(path.join(args.dir,'argv.json')));assert.equal(argv[0],'exec');assert(!argv.includes('queue'));assert(!argv.includes('--ignore-user-config'));assert(!argv.includes('browser_use_external'));assert(argv.includes('image_generation'));

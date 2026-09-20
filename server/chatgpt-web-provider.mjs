@@ -5,7 +5,7 @@ import {runCodex,findCodex} from './bridge.mjs';
 import {identityFields,sameIdentityValue,readJsonObject as readRunJson,readRunIdentity,compareRunIdentity} from './run-identity.mjs';
 import {patchManifest} from './run-manifest.mjs';
 import {chatGptWebImagePrompt} from './web-executor-instructions.mjs';
-import {browserFailurePrefix,browserPreSubmissionUnavailableText,browserRunEvidenceText,structuredBrowserToolResultText,browserOriginPermissionDeniedEvidence,fileUploadChromeUnavailableEvidence,iabUnavailableEvidence,browserTabBackgroundEvidence,chromeUnavailableEvidence,browserFocusEvidence} from './web-download-evidence.mjs';
+import {browserFailurePrefix,browserPreSubmissionUnavailableText,browserRunEvidenceText,structuredBrowserToolResultText,browserOriginPermissionDeniedEvidence,fileUploadChromeUnavailableEvidence,iabUnavailableEvidence,browserTabBackgroundEvidence,chromeUnavailableEvidence,browserFocusEvidence,completeDownloadEvidence,extractDownloadEvidence,inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence,writeDownloadEvidence} from './web-download-evidence.mjs';
 // Keep the durable provider id for existing project records. The production
 // transport is direct Chrome; older IAB manifests remain readable for
 // recovery, but IAB is never a fallback for a new request.
@@ -147,7 +147,19 @@ function browserPreSubmissionFailureObserved(dir,failure,manifest=null){
   return browserPreSubmissionUnavailableText(browserRunEvidenceText(dir,{failure,manifest}));
 }
 
-function finalizeWorkerResult({dir,manifestFile,outputFile,requestId,result,failure,model,reasoningEffort,role}){
+function downloadEvidenceFromRun({dir,result,manifestFile,outputFile,requestId}={}){
+  const manifest=readWebManifest(manifestFile),texts=[result?.text,readDownloadEvidence(dir)];
+  try{texts.push(fs.readFileSync(path.join(dir,'response.txt'),'utf8'));}catch{}
+  texts.push(structuredBrowserToolResultText(dir));
+  let raw=null;for(const value of texts){raw=extractDownloadEvidence(value);if(raw)break;}
+  let actual=null;try{if(fs.existsSync(outputFile))actual=inspectDownloadArtifact(outputFile);}catch(error){return {ok:false,errors:[`原始图片无法读取：${error.message}`],evidence:raw,actual:null};}
+  if(!raw)return {ok:false,errors:['执行器没有返回结构化 pageAssets 下载证据。'],evidence:null,actual};
+  const evidence=completeDownloadEvidence(raw,{actual}),validation=validateDownloadEvidence(evidence,{conversationUrl:manifest?.conversationUrl||null,requestId,runId:path.basename(dir),outputFile,actual});
+  try{writeDownloadEvidence(dir,evidence);}catch(error){validation.ok=false;validation.errors=[...validation.errors,`download-evidence.json 写入失败：${error.message}`];}
+  return {...validation,evidence,actual};
+}
+
+function finalizeWorkerResult({dir,manifestFile,outputFile,requestId,result,failure,model,reasoningEffort,role,downloadEvidence=null}){
   let manifest=readWebManifest(manifestFile);
   const normalizedOrigin=normalizeOriginPermissionDenied({manifestFile,requestId,dir,outputFile,manifest,failure});
   if(normalizedOrigin)manifest=normalizedOrigin;
@@ -159,7 +171,10 @@ function finalizeWorkerResult({dir,manifestFile,outputFile,requestId,result,fail
     }catch{}
   }
   const matches=manifest?.requestId===requestId&&browserRunIdentityMatches({dir,manifestFile,outputFile,requestId,manifest});
-  if(matches&&manifest.state==='downloaded'&&manifest.accepted===true&&manifest.submitted===true&&path.resolve(manifest.artifactPath||'')===path.resolve(outputFile)&&fs.existsSync(outputFile))return {...result,text:outputFile,manifest};
+  if(matches&&manifest.state==='downloaded'&&manifest.accepted===true&&manifest.submitted===true&&path.resolve(manifest.artifactPath||'')===path.resolve(outputFile)&&fs.existsSync(outputFile)){
+    if(!downloadEvidence?.ok){const error=new Error(`网页原图已送达但结构化下载证据未通过校验：${(downloadEvidence?.errors||['未知证据错误']).slice(0,3).join('；')}`);error.code='DOWNLOAD_EVIDENCE_INVALID';error.webManifest=manifest;error.downloadEvidence=downloadEvidence;throw error;}
+    return {...result,text:outputFile,manifest,downloadEvidence:downloadEvidence.evidence};
+  }
   if(matches&&manifest.state==='failed'){
     const error=new Error(manifest.error||'网页生成未完成。');error.code=manifest.errorCode||'WEB_IMAGE_FAILED';error.webManifest=manifest;throw error;
   }
@@ -244,7 +259,8 @@ export async function dispatchChatGptWebJob({codexBin,dir,outputFile,prompt,refe
   writeJson(path.join(dir,'run-identity.json'),{schemaVersion:1,identitySchemaVersion:2,identityLocked:true,provider:WEB_IMAGE_PROVIDER,...lockedIdentity,expectedOutput:absoluteOutput,createdAt});
   let result,failure;
   try{result=await runCodex({codexBin,dir,image:true,browserMode:'chrome',signal,timeoutMs,model,reasoningEffort,role,writableDirs:[path.dirname(path.resolve(outputFile))],prompt:chatGptWebImagePrompt({outputFile,manifestFile,prompt,referenceFiles,editTarget,conversationUrl,capsule,requestId})});}catch(error){failure=error;}
-  return finalizeWorkerResult({dir,manifestFile,outputFile,requestId,result,failure,model,reasoningEffort,role});
+  const downloadEvidence=downloadEvidenceFromRun({dir,result,manifestFile,outputFile,requestId});
+  return finalizeWorkerResult({dir,manifestFile,outputFile,requestId,result,failure,model,reasoningEffort,role,downloadEvidence});
 }
 
 /** Resume only a proven pre-acceptance quota stop or a separately audited,
@@ -273,7 +289,8 @@ export async function resumeChatGptWebJob({codexBin,dir,signal,timeoutMs=900000,
   patchManifestState(manifestFile,'resume',resumeArgs);
   let result,failure;
   try{result=await runCodex({codexBin,dir,image:true,browserMode:'chrome',signal,timeoutMs,model:model||worker.executorModel||null,reasoningEffort:reasoningEffort||worker.executorReasoningEffort||WEB_IMAGE_EXECUTOR_EFFORT,role:role||worker.role||WEB_IMAGE_EXECUTOR_ROLE,writableDirs:[path.dirname(outputFile)],prompt:nextInstruction});}catch(error){failure=error;}
-  const finalResult=finalizeWorkerResult({dir,manifestFile,outputFile,requestId,result,failure,model:model||worker.executorModel||null,reasoningEffort:reasoningEffort||worker.executorReasoningEffort||WEB_IMAGE_EXECUTOR_EFFORT,role:role||worker.role||WEB_IMAGE_EXECUTOR_ROLE});
+  const downloadEvidence=downloadEvidenceFromRun({dir,result,manifestFile,outputFile,requestId});
+  const finalResult=finalizeWorkerResult({dir,manifestFile,outputFile,requestId,result,failure,model:model||worker.executorModel||null,reasoningEffort:reasoningEffort||worker.executorReasoningEffort||WEB_IMAGE_EXECUTOR_EFFORT,role:role||worker.role||WEB_IMAGE_EXECUTOR_ROLE,downloadEvidence});
   try{
     patchManifestState(manifestFile,'metadata',resumeArgs);
     const restored=readWebManifest(manifestFile);

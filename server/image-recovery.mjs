@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import {readRunIdentity,compareRunIdentity,readRunEvidence} from './run-identity.mjs';
+import {readDownloadEvidence} from './web-download-evidence.mjs';
 
 function browserEvidence(durable){
   const text=durable.responseText,eventText=durable.eventsText;
@@ -173,12 +174,13 @@ export function createImageRecovery({webImageProvider,readGenerationEvidence,gen
         throw new Error('连接在保存结果前中断，系统仍无法确认是否已经生成。稍后可再次检查已有原图；检查本身不会重新生图。');
       }
       file=persisted.file;pending.file=file;
-      writeRunResult(pending.dir,{schemaVersion:2,provider:pending.provider||'legacy',taskId:pending.taskId||null,endedAt:new Date().toISOString(),outcome:'artifact_recovered',...recoveryIdentity,artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,diagnostics:generationDiagnosticSummary(evidence)});
-      const record={key:pending.key,file:path.relative(projectDir(p.id),file),provider:pending.provider||'legacy',prompt:pending.prompt,refs:pending.refs,integrity:persisted.integrity,qa:{pass:null,status:'recovered_pending_review',summary:'原图已找回，尚未自动校对。请查看图片后选择继续或修改。',issues:[],repairPrompt:''},at:new Date().toISOString()};
+      const downloadEvidence=pending.dir?readDownloadEvidence(pending.dir):null;
+      writeRunResult(pending.dir,{schemaVersion:2,provider:pending.provider||'legacy',taskId:pending.taskId||null,endedAt:new Date().toISOString(),outcome:'artifact_recovered',...recoveryIdentity,artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,downloadEvidence,diagnostics:generationDiagnosticSummary(evidence)});
+      const record={key:pending.key,file:path.relative(projectDir(p.id),file),provider:pending.provider||'legacy',prompt:pending.prompt,refs:pending.refs,integrity:persisted.integrity,downloadEvidence,qa:{pass:null,status:'manual_review',summary:'原图已找回，等待人工视觉校对。请查看图片后选择继续或修改。',issues:[],repairPrompt:'',source:'manual_review'},at:new Date().toISOString()};
       jsonWrite(file+'.json',record);const recoveredPanelKey=panelKeyFromImageKey?.(pending.key);if(recoveredPanelKey&&invalidatePanelDownstream)invalidatePanelDownstream(p,recoveredPanelKey);
-      recordArtifact(p,artifactIdForImageKey(pending.key),'image',record.file,[],{integrity:persisted.integrity});attachImageRecord(p,record);
+      recordArtifact(p,artifactIdForImageKey(pending.key),'image',record.file,[],{integrity:persisted.integrity,downloadEvidence});attachImageRecord(p,record);
       const sampleIndex=sampleIndexFromKey(pending.key);if(sampleIndex!==null)sampleRepairCount(p,sampleIndex);
-      p.pending=null;p.lastFailure=null;p.status='paused';const task=(p.tasks||[]).find(item=>item.id===pending.taskId);finishTask(p,task,'recovered_local',{artifact:file,qa:'not_run'});activity(p,'原图已找回并挂接到作品。未重新生图，也没有再次自动校对。');
+      p.pending=null;p.lastFailure=null;p.status='paused';const task=(p.tasks||[]).find(item=>item.id===pending.taskId),downloadedAt=webManifest?.downloadedAt||null,webTimings={...task?.webTimings,downloadedAt};finishTask(p,task,'recovered_local',{artifact:file,qa:'manual_review',qaStatus:'manual_review',webState:webManifest?.state||'downloaded',webTimings,errorCode:null,error:null});activity(p,'原图已找回并挂接到作品，等待人工视觉校对。未重新生图。');
     });
   }
 

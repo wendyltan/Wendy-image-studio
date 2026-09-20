@@ -8,6 +8,7 @@ import {WEB_IMAGE_PROVIDER,WEB_IMAGE_EXECUTOR_ROLE,WEB_IMAGE_EXECUTOR_EFFORT,cha
 import {IMAGE_OUTCOME,SAVED_ARTIFACT_QA_MESSAGE,SavedArtifactQaUnavailableError,savedArtifactQaUnavailable,applySavedArtifactQaOutcome} from './image-lifecycle.mjs';
 import {createTaskState,imageRetryState as deriveImageRetryState,retryableImageFailure as deriveRetryableImageFailure,unknownResultMessage as deriveUnknownResultMessage} from './task-state.mjs';
 import {createImageRecovery} from './image-recovery.mjs';
+import {readDownloadEvidence} from './web-download-evidence.mjs';
 import {buildRevisionPrompt,revisionPromptTelemetry} from './revision-prompt.mjs';
 export {buildRevisionPrompt,revisionPromptTelemetry};
 export const active = new Map();
@@ -551,7 +552,7 @@ function attachImageRecord(p,record){
 }
 function sampleNeedsExplicitDecision(sample){
   if(!sample||sampleAccepted(sample))return false;
-  if(['pending','unavailable','recovered_pending_review'].includes(sample.qa?.status))return true;
+  if(['pending','unavailable','recovered_pending_review','manual_review'].includes(sample.qa?.status))return true;
   return materialSampleIssues(sample.qa?.issues||[],sample.qa?.issueDetails||[]).length>0;
 }
 function blockedSampleIndexes(p){
@@ -713,12 +714,12 @@ async function generate(p,key,prompt,refnames,signal,prior=null,verify=true,qaKi
     throw failure||new Error('连接在保存结果前中断。当前节点已保存，请先检查已有原图，避免重复生成。');
   }
   file=persisted.file;pending.file=file;pending.integrity=persisted.integrity;
-  writeRunResult(dir,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:task.id,attempt:task.attempt,endedAt:new Date().toISOString(),outcome:'artifact_saved',artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,diagnostics:generationDiagnosticSummary(evidence)});
+  writeRunResult(dir,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:task.id,attempt:task.attempt,endedAt:new Date().toISOString(),outcome:'artifact_saved',artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,downloadEvidence:readDownloadEvidence(dir),diagnostics:generationDiagnosticSummary(evidence)});
   // Persist the recovered file before asking the model to inspect it. A QA
   // timeout is never evidence that the image did not exist, and must not make
   // the next click repeat a paid image request.
-  const record={key,file:path.relative(projectDir(p.id),file),provider:WEB_IMAGE_PROVIDER,conversationUrl:webManifest?.conversationUrl||conversationUrl||null,prompt,basePrompt,revisionDelta,revisionBase:revisionMeta.revisionBase||null,executor:{model:executor.model,reasoningEffort:executor.reasoningEffort,role:WEB_IMAGE_EXECUTOR_ROLE},refs:refnames,telemetry,integrity:persisted.integrity,qa:verify?{pass:null,status:'pending',summary:'原图已保存，等待画面校对。',issues:[],repairPrompt:''}:{pass:null,status:'deferred',summary:'已完成本地文件检查；尚未执行画面质检。',issues:[],repairPrompt:''},at:new Date().toISOString()};
-  jsonWrite(file+'.json',record);const panelKey=panelKeyFromImageKey(key);if(panelKey)invalidatePanelDownstream(p,panelKey);recordArtifact(p,artifactIdForImageKey(key),'image',record.file,[],{integrity:persisted.integrity});attachImageRecord(p,record);p.pending=null;p.lastFailure=null;finishTask(p,task,'artifact_saved',{artifact:file,qa:verify?'pending':'deferred'});saveProject(p);
+  const record={key,file:path.relative(projectDir(p.id),file),provider:WEB_IMAGE_PROVIDER,conversationUrl:webManifest?.conversationUrl||conversationUrl||null,prompt,basePrompt,revisionDelta,revisionBase:revisionMeta.revisionBase||null,executor:{model:executor.model,reasoningEffort:executor.reasoningEffort,role:WEB_IMAGE_EXECUTOR_ROLE},refs:refnames,telemetry,integrity:persisted.integrity,downloadEvidence:readDownloadEvidence(dir),qa:verify?{pass:null,status:'pending',summary:'原图已保存，等待画面校对。',issues:[],repairPrompt:''}:{pass:null,status:'deferred',summary:'已完成本地文件检查；尚未执行画面质检。',issues:[],repairPrompt:''},at:new Date().toISOString()};
+  jsonWrite(file+'.json',record);const panelKey=panelKeyFromImageKey(key);if(panelKey)invalidatePanelDownstream(p,panelKey);recordArtifact(p,artifactIdForImageKey(key),'image',record.file,[],{integrity:persisted.integrity,downloadEvidence:record.downloadEvidence});attachImageRecord(p,record);p.pending=null;p.lastFailure=null;finishTask(p,task,'artifact_saved',{artifact:file,qa:verify?'pending':'deferred'});saveProject(p);
   if(!verify)return record;
   try{
     checkpoint(signal);
@@ -943,7 +944,7 @@ export function generatePages(p){verifyApproval(p);if(!p.samplesApproved)throw n
       // generation request when the creator presses Continue.
       if(existing?.file){
         if(existing.qa?.pass===false&&!existing.userDecision){requirePanelDecision(p,key,existing);p.status='attention';p.message=`第 ${page.number} 页第 ${i+1} 格的画面检查未通过，请查看列出的问题后选择“采用当前图片”或“修改这一张”。系统不会自动重画。`;saveProject(p);return;}
-        p.status='attention';p.message=`第 ${page.number} 页第 ${i+1} 格的原图已保存，但${existing.qa?.status==='recovered_pending_review'?'尚未自动校对':'需要人工查看'}。请在网页中查看后决定修改或继续；继续制作不会自动重生这张图。`;saveProject(p);return;
+        p.status='attention';p.message=`第 ${page.number} 页第 ${i+1} 格的原图已保存，但${['recovered_pending_review','manual_review'].includes(existing.qa?.status)?'尚未完成人工视觉校对':'需要人工查看'}。请在网页中查看后决定修改或继续；继续制作不会自动重生这张图。`;saveProject(p);return;
       }
       checkpoint(signal);activity(p,`正在绘制第 ${page.number}/${p.plan.pages.length} 页 · 第 ${i+1}/${page.panels.length} 格…`,completed,totalPanels,'分镜');
       const g=geometry[i];const prompt=compilePanelPrompt(page.number,i+1,q,g,[]);
@@ -1020,9 +1021,9 @@ function resumeSameRequestImage(p){
       finishTask(p,task,'unknown_result',{errorCode:'unknown_result',webState:webManifest?.state||null});throw failure||new Error('续接后在保存结果前中断。当前请求记录已保留，不会自动再次发送。');
     }
     const file=persisted.file;pending.file=file;pending.integrity=persisted.integrity;
-    writeRunResult(pending.dir,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:task.id,requestId:webManifest.requestId,projectId:p.id,projectVersion:p.version,target:pending.key,endedAt:new Date().toISOString(),outcome:'artifact_saved_after_same_request_resume',artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,diagnostics:generationDiagnosticSummary(evidence)});
-    const imageRecord={key:pending.key,file:path.relative(projectDir(p.id),file),provider:WEB_IMAGE_PROVIDER,conversationUrl:webManifest.conversationUrl||null,prompt:pending.prompt,basePrompt:pending.basePrompt||pending.prompt,revisionDelta:pending.revisionDelta||null,revisionBase:pending.revisionBase||null,executor,refs:pending.refs,telemetry:pending.telemetry,integrity:persisted.integrity,qa:{pass:null,status:'pending',summary:'原图已保存，等待画面校对。',issues:[],repairPrompt:''},at:new Date().toISOString()};
-    jsonWrite(file+'.json',imageRecord);const panelKey=panelKeyFromImageKey(pending.key);if(panelKey)invalidatePanelDownstream(p,panelKey);recordArtifact(p,artifactIdForImageKey(pending.key),'image',imageRecord.file,[],{integrity:persisted.integrity});attachImageRecord(p,imageRecord);p.pending=null;p.lastFailure=null;finishTask(p,task,'artifact_saved',{artifact:file,qa:'pending',webState:'downloaded'});saveProject(p);
+    writeRunResult(pending.dir,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:task.id,requestId:webManifest.requestId,projectId:p.id,projectVersion:p.version,target:pending.key,endedAt:new Date().toISOString(),outcome:'artifact_saved_after_same_request_resume',artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,downloadEvidence:readDownloadEvidence(pending.dir),diagnostics:generationDiagnosticSummary(evidence)});
+    const imageRecord={key:pending.key,file:path.relative(projectDir(p.id),file),provider:WEB_IMAGE_PROVIDER,conversationUrl:webManifest.conversationUrl||null,prompt:pending.prompt,basePrompt:pending.basePrompt||pending.prompt,revisionDelta:pending.revisionDelta||null,revisionBase:pending.revisionBase||null,executor,refs:pending.refs,telemetry:pending.telemetry,integrity:persisted.integrity,downloadEvidence:readDownloadEvidence(pending.dir),qa:{pass:null,status:'pending',summary:'原图已保存，等待画面校对。',issues:[],repairPrompt:''},at:new Date().toISOString()};
+    jsonWrite(file+'.json',imageRecord);const panelKey=panelKeyFromImageKey(pending.key);if(panelKey)invalidatePanelDownstream(p,panelKey);recordArtifact(p,artifactIdForImageKey(pending.key),'image',imageRecord.file,[],{integrity:persisted.integrity,downloadEvidence:imageRecord.downloadEvidence});attachImageRecord(p,imageRecord);p.pending=null;p.lastFailure=null;finishTask(p,task,'artifact_saved',{artifact:file,qa:'pending',webState:'downloaded'});saveProject(p);
     try{
       checkpoint(signal);const check=await qa(p,file,pending.prompt,imageRefs(p,pending.refs||[]),signal,'原始分镜');imageRecord.qa=check;jsonWrite(file+'.json',imageRecord);finishTask(p,task,'completed',{artifact:file,qa:check.pass?'passed':'needs_review',webState:'downloaded'});p.status=check.pass?'paused':'attention';p.error=null;p.message=check.pass?`${pending.key} 已按原请求完成、保存并校对；本次只续接这一张。`:`${pending.key} 原图已保存，画面检查建议：${(check.issues||[]).join('；')||'请人工查看'}。本次不会自动重画。`;if(panelKey&&!check.pass)requirePanelDecision(p,panelKey,imageRecord);saveProject(p);return imageRecord;
     }catch(error){const outcome=savedArtifactQaUnavailable(error,{artifact:file,webState:'downloaded'});applySavedArtifactQaOutcome({project:p,task,record:imageRecord,artifactFile:file,outcome,saveProject,finishTask,jsonWrite,writeRunResult:result=>writeRunResult(pending.dir,result),runResult:{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,taskId:task.id,requestId:webManifest.requestId,endedAt:new Date().toISOString(),outcome:outcome.outcome,artifact:path.relative(projectDir(p.id),file),integrity:persisted.integrity,errorCode:outcome.errorCode,error:outcome.detail},extraTask:{webState:'downloaded'}});return imageRecord;}

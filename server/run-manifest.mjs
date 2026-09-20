@@ -4,6 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 import {RUN_LOCKED_FIELDS,readRunIdentity,compareRunIdentity} from './run-identity.mjs';
+import {inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence} from './web-download-evidence.mjs';
 
 const MANIFEST_STATES=new Set(['queued','accepted','ready','submitted','downloaded','failed']);
 const URL_RE=/^https:\/\/chatgpt\.com\/(?:c\/[^\s?#]+)?(?:[?#][^\s]*)?$/;
@@ -107,6 +108,11 @@ function stagePatch(stage,args,record){
     if(current.submitted!==true)throw usageError('downloaded 前必须已经 submitted。');
     const artifact=outputPath(record);
     if(!artifact||!fs.existsSync(artifact)||!fs.statSync(artifact).isFile()||fs.statSync(artifact).size===0)throw usageError('目标原图不存在或为空，不能写入 downloaded。');
+    if(current.transport==='direct-chrome'){
+      let actual=null;try{actual=inspectDownloadArtifact(artifact);}catch(error){throw usageError(`原始图片完整性检查失败：${error.message}`);}
+      const evidence=readDownloadEvidence(record.dir),validation=validateDownloadEvidence(evidence,{conversationUrl:String(args.conversationUrl||current.conversationUrl||''),requestId:current.requestId,runId:record.runId,outputFile:artifact,actual});
+      if(!validation.ok)throw usageError(`结构化 pageAssets 下载证据未通过校验：${validation.errors.slice(0,4).join('；')}`);
+    }
     patch.state='downloaded';patch.accepted=true;patch.submitted=true;patch.artifactPath=artifact;patch.downloadedAt=now();patch.errorCode=null;patch.error=null;patch.failedAt=null;
     if(args.conversationUrl)patch.conversationUrl=validateUrl(args.conversationUrl);
   }else if(stage==='failed'){

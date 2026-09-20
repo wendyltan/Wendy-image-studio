@@ -1,5 +1,172 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
+
+export const DOWNLOAD_EVIDENCE_FILE='download-evidence.json';
+const DOWNLOAD_EVIDENCE_SCHEMA_VERSION=1;
+const IMAGE_CONTENT_TYPES=new Set(['image/png','image/jpeg','image/webp']);
+const MEDIA_URL=/^https:\/\/chatgpt\.com\/backend-api\/estuary\/content(?:[?#/]|$)/i;
+const HASH=/^[a-f0-9]{64}$/i;
+const ISO=/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+
+function object(value){return value&&typeof value==='object'&&!Array.isArray(value)?value:null;}
+function text(value){return typeof value==='string'?value.trim():'';}
+function samePath(left,right){return path.resolve(String(left||''))===path.resolve(String(right||''));}
+function formatForContentType(value){
+  const type=text(value).toLowerCase();
+  if(type==='image/png')return 'PNG';
+  if(type==='image/jpeg')return 'JPEG';
+  if(type==='image/webp')return 'WEBP';
+  return null;
+}
+function contentTypeForFormat(value){
+  const format=text(value).toUpperCase();
+  return format==='PNG'?'image/png':format==='JPEG'||format==='JPG'?'image/jpeg':format==='WEBP'?'image/webp':null;
+}
+function parsePng(buffer){
+  if(buffer.length<24||buffer.subarray(0,8).toString('hex')!=='89504e470d0a1a0a')return null;
+  return {format:'PNG',contentType:'image/png',width:buffer.readUInt32BE(16),height:buffer.readUInt32BE(20)};
+}
+function parseJpeg(buffer){
+  if(buffer.length<4||buffer[0]!==0xff||buffer[1]!==0xd8)return null;
+  let offset=2;
+  while(offset+8<buffer.length){
+    while(offset<buffer.length&&buffer[offset]!==0xff)offset++;
+    while(offset<buffer.length&&buffer[offset]===0xff)offset++;
+    const marker=buffer[offset++];
+    if(!marker||marker===0xda||marker===0xd9)break;
+    if(offset+2>buffer.length)break;
+    const length=buffer.readUInt16BE(offset);
+    if(length<2||offset+length>buffer.length)break;
+    const sof=(marker>=0xc0&&marker<=0xc3)||(marker>=0xc5&&marker<=0xc7)||(marker>=0xc9&&marker<=0xcb)||(marker>=0xcd&&marker<=0xcf);
+    if(sof&&length>=7)return {format:'JPEG',contentType:'image/jpeg',height:buffer.readUInt16BE(offset+3),width:buffer.readUInt16BE(offset+5)};
+    offset+=length;
+  }
+  return null;
+}
+function parseWebp(buffer){
+  if(buffer.length<16||buffer.subarray(0,4).toString('ascii')!=='RIFF'||buffer.subarray(8,12).toString('ascii')!=='WEBP')return null;
+  let offset=12;
+  while(offset+8<=buffer.length){
+    const chunk=buffer.subarray(offset,offset+4).toString('ascii'),size=buffer.readUInt32LE(offset+4),data=offset+8;
+    if(data+size>buffer.length)break;
+    if(chunk==='VP8X'&&size>=10)return {format:'WEBP',contentType:'image/webp',width:1+buffer.readUIntLE(data+4,3),height:1+buffer.readUIntLE(data+7,3)};
+    if(chunk==='VP8 '&&size>=10){
+      for(let i=data;i+9<data+size;i++)if(buffer[i]===0x9d&&buffer[i+1]===0x01&&buffer[i+2]===0x2a)return {format:'WEBP',contentType:'image/webp',width:buffer.readUInt16LE(i+3)&0x3fff,height:buffer.readUInt16LE(i+5)&0x3fff};
+    }
+    if(chunk==='VP8L'&&size>=5&&buffer[data]===0x2f){
+      const b1=buffer[data+2],b2=buffer[data+3],b3=buffer[data+4],b4=buffer[data+5];
+      return {format:'WEBP',contentType:'image/webp',width:1+(((b2&0x3f)<<8)|b1),height:1+(((b4&0xf)<<10)|(b3<<2)|((b2&0xc0)>>6))};
+    }
+    offset+=8+size+(size%2);
+  }
+  return null;
+}
+function parseImage(buffer){return parsePng(buffer)||parseJpeg(buffer)||parseWebp(buffer);}
+
+/** Inspect the actual bytes copied from the page-assets bundle. */
+export function inspectDownloadArtifact(file){
+  const absolute=path.resolve(String(file||'')),buffer=fs.readFileSync(absolute),parsed=parseImage(buffer);
+  if(!parsed)throw new Error('目标文件不是可识别的 PNG、JPG 或 WebP 原图。');
+  return {path:absolute,bytes:buffer.length,...parsed,sha256:crypto.createHash('sha256').update(buffer).digest('hex')};
+}
+
+/** Extract only the executor's explicit machine-readable evidence block. */
+export function extractDownloadEvidence(value){
+  if(object(value)?.downloadEvidence)return object(value.downloadEvidence);
+  if(object(value)?.schemaVersion===DOWNLOAD_EVIDENCE_SCHEMA_VERSION&&text(value?.source)==='pageAssets')return value;
+  const source=text(value),match=source.match(/<download_evidence>\s*([\s\S]*?)\s*<\/download_evidence>/i);
+  if(!match)return null;
+  try{const parsed=JSON.parse(match[1]);return object(parsed)?.schemaVersion===DOWNLOAD_EVIDENCE_SCHEMA_VERSION?parsed:null;}catch{return null;}
+}
+
+/** Fill only locally verifiable artifact fields before the strict validation. */
+export function completeDownloadEvidence(evidence,{actual=null}={}){
+  const value=structuredClone(object(evidence)||{}),output=object(value.output)||(value.output={});
+  if(actual){for(const key of ['path','bytes','format','width','height','sha256'])if(output[key]===undefined||output[key]===null||output[key]==='')output[key]=actual[key];}
+  return value;
+}
+
+/**
+ * Validate the page-assets chain and the bytes copied to outputFile.  This is
+ * deliberately independent of executor prose: every accepted field is
+ * compared with the current run and the local artifact.
+ */
+export function validateDownloadEvidence(value,{conversationUrl=null,requestId=null,runId=null,outputFile=null,actual=null}={}){
+  const evidence=object(value),errors=[];
+  if(!evidence)errors.push('缺少结构化 pageAssets 下载证据。');
+  if(Number(evidence?.schemaVersion)!==DOWNLOAD_EVIDENCE_SCHEMA_VERSION)errors.push('download evidence schemaVersion 无效。');
+  const observedConversation=text(evidence?.conversationUrl);
+  if(!/^https:\/\/chatgpt\.com\/c\/[^\s?#]+(?:[?#][^\s]*)?$/.test(observedConversation))errors.push('conversationUrl 不是 ChatGPT 会话地址。');
+  if(conversationUrl&&observedConversation!==String(conversationUrl))errors.push('download evidence conversationUrl 与当前会话不一致。');
+  if(requestId&&text(evidence?.requestId)!==String(requestId))errors.push('download evidence requestId 与当前 request 不一致。');
+  if(runId&&text(evidence?.runId)!==String(runId))errors.push('download evidence runId 与当前执行不一致。');
+  if(text(evidence?.source)!=='pageAssets')errors.push('download evidence source 必须是 pageAssets。');
+  if(!ISO.test(text(evidence?.capturedAt))||!Number.isFinite(Date.parse(evidence?.capturedAt)))errors.push('download evidence capturedAt 无效。');
+  const result=object(evidence?.currentResult),src=text(result?.src);
+  if(!MEDIA_URL.test(src))errors.push('当前结果 src 不是会话内原始媒体 URL。');
+  const inventory=object(evidence?.inventory);
+  if(!text(inventory?.id))errors.push('缺少 pageAssets inventory id。');
+  const exact=Number(evidence?.exactMatchCount);
+  if(exact!==1)errors.push(`当前结果精确匹配资产数量必须为 1，实际为 ${String(evidence?.exactMatchCount)}。`);
+  const matchedIds=Array.isArray(evidence?.matchedAssetIds)?evidence.matchedAssetIds.filter(item=>text(item)) : null;
+  if(!matchedIds||matchedIds.length!==1)errors.push('matchedAssetIds 必须只包含一个精确匹配资产。');
+  const asset=object(evidence?.matchedAsset);
+  if(!asset)errors.push('缺少 matchedAsset。');
+  else{
+    if(text(asset.kind)!=='image')errors.push('matchedAsset.kind 必须是 image。');
+    const contentType=text(asset.contentType).toLowerCase();
+    if(!IMAGE_CONTENT_TYPES.has(contentType))errors.push('matchedAsset.contentType 不是允许的图片类型。');
+    const assetUrl=text(asset.url||asset.sourceUrl);
+    if(assetUrl!==src)errors.push('matchedAsset URL 与当前结果 src 不一致，可能是旧图或缩略图。');
+    const descriptor=[asset.role,assetUrl].map(text).join(' ');
+    if(asset.isThumbnail===true||asset.isPreview===true||/(?:thumbnail|preview|缩略|预览)/i.test(descriptor))errors.push('matchedAsset 被标记为 thumbnail/preview，拒绝作为原图。');
+    if(matchedIds&&matchedIds[0]!==text(asset.id))errors.push('matchedAsset.id 不在唯一精确匹配资产中。');
+  }
+  const bundle=object(evidence?.bundle);
+  if(!bundle)errors.push('缺少 pageAssets bundle 结果。');
+  else{
+    if(Number(bundle.downloadedCount)!==1)errors.push('bundle.downloadedCount 必须为 1。');
+    if(!Array.isArray(bundle.failures)||bundle.failures.length!==0)errors.push('bundle.failures 必须为空。');
+    if(!IMAGE_CONTENT_TYPES.has(text(bundle.contentType).toLowerCase()))errors.push('bundle contentType 不是允许的图片类型。');
+    if(!text(bundle.path))errors.push('bundle path 缺失。');
+    if(formatForContentType(bundle.contentType)!==formatForContentType(asset?.contentType))errors.push('bundle contentType 与资产类型不一致。');
+  }
+  const output=object(evidence?.output);
+  if(!output)errors.push('缺少最终原图 output 证据。');
+  else{
+    if(outputFile&&!samePath(output.path,outputFile))errors.push('output.path 与当前 worker outputFile 不一致。');
+    if(!Number.isInteger(Number(output.bytes))||Number(output.bytes)<=0)errors.push('output.bytes 无效。');
+    if(!contentTypeForFormat(output.format))errors.push('output.format 不是 PNG、JPEG 或 WEBP。');
+    if(!Number.isInteger(Number(output.width))||Number(output.width)<=0||!Number.isInteger(Number(output.height))||Number(output.height)<=0)errors.push('output dimensions 无效。');
+    if(!HASH.test(text(output.sha256)))errors.push('output.sha256 无效。');
+  }
+  if(actual&&output){
+    for(const key of ['bytes','width','height','sha256'])if(String(output[key])!==String(actual[key]))errors.push(`output.${key} 与实际文件不一致。`);
+    if(text(output.format).toUpperCase()!==text(actual.format).toUpperCase())errors.push('output.format 与实际文件不一致。');
+    if(!samePath(output.path,actual.path))errors.push('output.path 与实际文件不一致。');
+  }
+  return {ok:errors.length===0,errors:[...new Set(errors)],evidence:evidence||null};
+}
+
+export function readDownloadEvidence(dir){
+  try{const value=JSON.parse(fs.readFileSync(path.join(dir,DOWNLOAD_EVIDENCE_FILE),'utf8'));return object(value);}catch{return null;}
+}
+
+export function writeDownloadEvidence(dir,evidence){
+  if(!object(evidence))throw new TypeError('download evidence must be an object');
+  const file=path.join(dir,DOWNLOAD_EVIDENCE_FILE),temp=`${file}.tmp-${crypto.randomUUID()}`;
+  fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(temp,JSON.stringify(evidence,null,2)+'\n',{mode:0o600});fs.renameSync(temp,file);return file;
+}
+
+/** Append a durable audit event for evidence recovered after the executor turn. */
+export function appendDownloadEvidenceTrace(dir,evidence,{validation=null,appendResponse=true}={}){
+  if(!object(evidence))throw new TypeError('download evidence must be an object');
+  const marker=`<download_evidence>${JSON.stringify(evidence)}</download_evidence>`,event={type:'download.evidence',schemaVersion:1,capturedAt:evidence.capturedAt||null,requestId:evidence.requestId||null,runId:evidence.runId||null,downloadEvidence:evidence,validation:validation?{ok:validation.ok===true,errors:Array.isArray(validation.errors)?validation.errors:[]}:null};
+  const eventsFile=path.join(dir,'events.jsonl');fs.appendFileSync(eventsFile,JSON.stringify(event)+'\n',{mode:0o600});
+  if(appendResponse)fs.appendFileSync(path.join(dir,'response.txt'),`\n${marker}\n`,{encoding:'utf8',mode:0o600});
+  return event;
+}
 
 const IAB_UNAVAILABLE_ERROR=/(?:Browser is not available:\s*iab|IAB[_\s-]*(?:UNAVAILABLE|NOT[_\s-]*AVAILABLE)|IAB[_\s-]*SESSION[_\s-]*LOST[_\s-]*BEFORE[_\s-]*SUBMIT|Capability is not available:\s*(?:visibility|browser)|隐藏\s*IAB.*不可用)/i;
 const BROWSER_FOCUS_ERROR=/(?:BROWSER_FOCUS_(?:UNAVAILABLE|RESTORE_FAILED|RESTORE_FAILED_AFTER_CLOSE)|Chrome management capability is not advertised|焦点(?:恢复|管理)能力(?:不可用|未提供|未广告)|无法恢复创作室焦点)/i;
