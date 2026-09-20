@@ -51,6 +51,14 @@ function text(value) {
   return String(value ?? '').trim();
 }
 
+function assertOwnedTabMatch(lease, ownedTabId) {
+  const observed = text(ownedTabId);
+  const reserved = text(lease?.ownedTabId);
+  if (observed && reserved && observed !== reserved) {
+    throw Object.assign(new Error(`owned tab handle 与 lease 不一致：已预留 ${reserved}，收到 ${observed}。`), {code: 'OWNED_TAB_ID_MISMATCH'});
+  }
+}
+
 function leaseFileFor(dir) {
   return path.join(path.resolve(String(dir || '')), OWNED_TAB_LEASE_FILE);
 }
@@ -235,6 +243,7 @@ export function markOwnedTabStage({dir, runId, requestId, state, ownedTabId, ses
   if (!ALLOWED_STAGES.has(nextState)) throw Object.assign(new Error(`不支持的 owned tab 阶段：${nextState}`), {code: 'OWNED_TAB_STAGE_INVALID'});
   return withLease(dir, expected, (file, current) => {
     const lease = current || normalizeLease({runId: expected.runId, requestId: expected.requestId}, expected);
+    assertOwnedTabMatch(lease, ownedTabId);
     if (TERMINAL_STATES.has(lease.state)) {
       const error = new Error(`owned tab lease 已进入终态 ${lease.state}，不能回写 ${nextState}。`);
       error.code = 'OWNED_TAB_LEASE_TERMINAL';
@@ -278,6 +287,7 @@ export function markOwnedTabCleanup({dir, runId, requestId, status, ownedTabId, 
   }
   return withLease(dir, expected, (file, current) => {
     const lease = current || normalizeLease({runId: expected.runId, requestId: expected.requestId}, expected);
+    assertOwnedTabMatch(lease, ownedTabId);
     const closed = cleanupStatus === 'closed';
     const observed = cleanupStatus === 'not_observed' || cleanupStatus === 'orphaned';
     if (TERMINAL_STATES.has(lease.state)) {

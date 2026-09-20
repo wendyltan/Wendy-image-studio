@@ -62,6 +62,17 @@ test('created and verified close both require the reserved real handle', () => {
   assert.throws(() => markOwnedTabCleanup({...run, status: 'closed', ownedTabId: 'tab-close-throw', verification: 'exact-owned-tab-close-returned'}), error => error.code === 'OWNED_TAB_LEASE_TERMINAL');
 });
 
+test('stage and cleanup reject a handle that differs from the reserved tab', () => {
+  const run = fixture();
+  ensureOwnedTabLease(run);
+  reserveOwnedTabCreate(run);
+  markOwnedTabStage({...run, state: 'created', ownedTabId: 'tab-reserved'});
+  assert.throws(() => markOwnedTabStage({...run, state: 'uploading', ownedTabId: 'tab-other'}), error => error.code === 'OWNED_TAB_ID_MISMATCH');
+  assert.throws(() => markOwnedTabCleanup({...run, status: 'closed', ownedTabId: 'tab-other', verification: 'exact-owned-tab-close-returned'}), error => error.code === 'OWNED_TAB_ID_MISMATCH');
+  const closed = markOwnedTabCleanup({...run, status: 'closed', ownedTabId: 'tab-reserved', verification: 'exact-owned-tab-close-returned'});
+  assert.equal(closed.state, 'closed_verified');
+});
+
 test('verified close is distinct from close failure and handle loss', () => {
   const closed = fixture();
   ensureOwnedTabLease(closed);
