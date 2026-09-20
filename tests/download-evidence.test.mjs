@@ -62,6 +62,13 @@ test('stable file id matching accepts a changed signed URL but rejects non-image
   assert.equal(check.ok,true,check.errors?.join('; '));
 });
 
+test('stable file id matching never trusts a display name over a different source URL',()=>{
+  const run=fixture(),other='https://chatgpt.com/backend-api/estuary/content?id=file_other_fixture&sig=rotated';
+  const asset={kind:'image',url:other,sourceUrl:other,name:'file_current_fixture',contentType:'image/png'};
+  assert.deepEqual(stableFileIdsForAsset(asset),['file_other_fixture']);
+  assert.equal(pageAssetMatchesResult(asset,{src:run.evidence.currentResult.src}),false);
+});
+
 test('stable file id matching rejects a different result even when the URL shape is valid',()=>{
   const run=fixture(),evidence={...run.evidence,matchingStrategy:'stable-file-id',currentResult:{...run.evidence.currentResult,stableFileId:'file_other_fixture'},matchedAsset:{...run.evidence.matchedAsset,url:run.evidence.currentResult.src.replace('file_current_fixture','file_other_fixture'),sourceUrl:run.evidence.currentResult.src.replace('file_current_fixture','file_other_fixture')}};
   const check=validateDownloadEvidence(evidence,{conversationUrl,requestId,runId,outputFile:run.output,actual:run.actual});

@@ -26,7 +26,10 @@ export function stableFileId(value){
 }
 export function stableFileIdsForAsset(asset){
   const value=object(asset);
-  return [...new Set([value?.url,value?.sourceUrl,value?.name].map(stableFileId).filter(Boolean))];
+  // Only downloadable source URLs establish the file identity.  A display
+  // name is not an authority: stale or user-controlled names must not make a
+  // different URL look like the current generated result.
+  return [...new Set([value?.url,value?.sourceUrl].map(stableFileId).filter(Boolean))];
 }
 export function pageAssetMatchesResult(asset,{src=null,stableId=null}={}){
   const value=object(asset),url=text(value?.url||value?.sourceUrl),wanted=stableId||stableFileId(src);
