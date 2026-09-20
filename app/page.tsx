@@ -1,20 +1,12 @@
 'use client';
 import Link from 'next/link';
 import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react';
-import {
   AlertCircle,
   ArrowRight,
   ArrowUpRight,
   BookOpen,
   Check,
   ChevronRight,
-  CircleCheck,
   FileText,
   Images,
   Leaf,
@@ -23,704 +15,140 @@ import {
   Plus,
   Power,
   RotateCcw,
-  Save,
   Sparkles,
   Trash2,
   Upload,
   X,
 } from 'lucide-react';
-import type {
-  Asset,
-  AssetCandidate,
-  Bootstrap,
-  Doc,
-  Project,
-  Proposal,
-  StagedAssetCandidate,
-  Story,
-} from './studio/types';
 import { effortLabels, presets, statuses } from './studio/constants';
 import { ProjectView } from './studio/project-view';
-import {
-  observedAccountText,
-  resetText,
-  workflowClockActive,
-} from './studio/workflow-utils';
-async function request<T>(url: string, body?: unknown): Promise<T> {
-  const r = await fetch(
-    url,
-    body === undefined
-      ? { cache: 'no-store' }
-      : {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Wendi-Request': 'studio',
-          },
-          body: JSON.stringify(body),
-        },
-  );
-  const data = (await r.json()) as T & { error?: string };
-  if (!r.ok) throw new Error(data.error || '暂时无法连接创作室');
-  return data;
-}
+import { StudioDialogs } from './studio/studio-dialogs';
+import { observedAccountText, resetText } from './studio/workflow-utils';
+import { useStudioController } from './studio/use-studio-controller';
+
 export default function Studio() {
-  const [data, setData] = useState<Bootstrap | null>(null),
-    [section, setSection] = useState<'create' | 'library' | 'setting'>(
-      'create',
-    ),
-    [current, setCurrent] = useState<string | null>(null),
-    [project, setProject] = useState<Project | null>(null);
-  const [idea, setIdea] = useState(''),
-    [pages, setPages] = useState(4),
-    [special, setSpecial] = useState(''),
-    [cat, setCat] = useState('按剧情'),
-    [xiaolin, setXiaolin] = useState(false),
-    [model, setModel] = useState(''),
-    [effort, setEffort] = useState('medium'),
-    [preset, setPreset] = useState('balanced');
-  const [waiting, setWaiting] = useState(false),
-    [restarting, setRestarting] = useState(false),
-    [error, setError] = useState(''),
-    [toast, setToast] = useState(''),
-    [note, setNote] = useState(''),
-    [checks, setChecks] = useState<string[]>([]),
-    [view, setView] = useState('plan'),
-    [history, setHistory] = useState<number | null>(null),
-    [now, setNow] = useState(0);
-  const [zoom, setZoom] = useState<{ url: string; title: string } | null>(null),
-    [edit, setEdit] = useState<{ key: string; title: string } | null>(null),
-    [editNote, setEditNote] = useState(''),
-    [story, setStory] = useState<Story | null>(null),
-    [settingTab, setSettingTab] = useState<'documents' | 'assets'>('documents'),
-    [assetGroup, setAssetGroup] = useState('人物与服装');
-  const [doc, setDoc] = useState<Doc | null>(null),
-    [docText, setDocText] = useState(''),
-    [suggestNote, setSuggestNote] = useState(''),
-    [proposal, setProposal] = useState<Proposal | null>(null),
-    [applyWorld, setApplyWorld] = useState(false),
-    [applyWorkflow, setApplyWorkflow] = useState(false),
-    [uploadOpen, setUploadOpen] = useState(false),
-    [modelOpen, setModelOpen] = useState(false),
-    [titleOpen, setTitleOpen] = useState(false),
-    [titleDraft, setTitleDraft] = useState(''),
-    [deleteTarget, setDeleteTarget] = useState<{
-      kind: 'project' | 'archive';
-      id: string;
-      title: string;
-    } | null>(null),
-    [confirmTitle, setConfirmTitle] = useState('');
-  const [manualCandidate, setManualCandidate] = useState<AssetCandidate | null>(
-      null,
-    ),
-    [manualFile, setManualFile] = useState<File | null>(null),
-    [manualCategory, setManualCategory] = useState(''),
-    [manualName, setManualName] = useState(''),
-    [manualTags, setManualTags] = useState(''),
-    [manualDescription, setManualDescription] = useState(''),
-    [manualUsage, setManualUsage] = useState<'本篇' | '常用参考' | '正式基线'>(
-      '常用参考',
-    ),
-    [assetSearch, setAssetSearch] = useState(''),
-    [assetCategoryFilter, setAssetCategoryFilter] = useState(''),
-    [assetUsageFilter, setAssetUsageFilter] = useState(''),
-    [assetResults, setAssetResults] = useState<Asset[] | null>(null);
-  const lastMessage = useRef(''),
-    quotaStageSeen = useRef(0),
-    quotaRefreshInFlight = useRef(false),
-    quotaRefreshPending = useRef(false),
-    modelInitialized = useRef(false),
-    models = data?.account.models || [],
-    selectedModel = models.find((m) => m.id === model) || models[0],
-    limits = data?.account.rateLimits,
-    clockActive = workflowClockActive(project),
-    assets = useMemo(
-      () =>
-        (assetResults || data?.assets || []).filter(
-          (a) => a.group === assetGroup,
-        ),
-      [data, assetGroup, assetResults],
-    );
-  const refresh = useCallback(async () => {
-    try {
-      const d = await request<Bootstrap>('/api/bootstrap');
-      setData(d);
-      if (!modelInitialized.current) {
-        const m =
-          d.account.models.find((x) => x.isDefault) || d.account.models[0];
-        if (m) {
-          modelInitialized.current = true;
-          setModel(m.id);
-          setEffort(m.defaultReasoningEffort);
-        }
-      }
-      setError('');
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  }, []);
-  const refreshAccount = useCallback(async () => {
-    if (quotaRefreshInFlight.current) {
-      quotaRefreshPending.current = true;
-      return;
-    }
-    quotaRefreshInFlight.current = true;
-    try {
-      do {
-        quotaRefreshPending.current = false;
-        const account = await request<Bootstrap['account']>('/api/account', {});
-        setData((value) => (value ? { ...value, account } : value));
-      } while (quotaRefreshPending.current);
-    } finally {
-      quotaRefreshInFlight.current = false;
-    }
-  }, []);
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      void refresh();
-      const saved = localStorage.getItem('wendi-brief');
-      if (saved)
-        try {
-          const b = JSON.parse(saved);
-          setIdea(b.idea || '');
-          setSpecial(b.special || '');
-          setPages(b.pages || 4);
-          setCat(b.cat || '按剧情');
-          setXiaolin(b.xiaolin === true);
-          setPreset(b.preset || 'balanced');
-        } catch {}
-    }, 0);
-    return () => clearTimeout(timer);
-  }, [refresh]);
-  useEffect(() => {
-    const t = setTimeout(
-      () =>
-        localStorage.setItem(
-          'wendi-brief',
-          JSON.stringify({ idea, special, pages, cat, xiaolin, preset }),
-        ),
-      400,
-    );
-    return () => clearTimeout(t);
-  }, [idea, special, pages, cat, xiaolin, preset]);
-  useEffect(() => {
-    const tick = () => setNow(Date.now());
-    tick();
-    if (!clockActive) return;
-    const t = setInterval(tick, 1000);
-    return () => clearInterval(t);
-  }, [clockActive]);
-  useEffect(() => {
-    if (!current) return;
-    let gone = false,
-      timer: number | undefined,
-      delay = 2200,
-      inFlight = false;
-    async function poll() {
-      if (inFlight || gone) return;
-      inFlight = true;
-      try {
-        const p = await request<Project>('/api/projects/' + current);
-        if (!gone) {
-          setProject((previous) =>
-            !previous || (p.revision ?? 0) >= (previous.revision ?? 0)
-              ? p
-              : previous,
-          );
-          setData((d) =>
-            d
-              ? {
-                  ...d,
-                  projects: [p, ...d.projects.filter((x) => x.id !== p.id)],
-                }
-              : d,
-          );
-          if (
-            lastMessage.current &&
-            lastMessage.current !== p.message &&
-            !p.busy
-          ) {
-            setToast(p.message);
-            if (
-              'Notification' in window &&
-              Notification.permission === 'granted'
-            )
-              new Notification('温蒂创作室', { body: p.message });
-          }
-          lastMessage.current = p.message;
-          delay = 2200;
-        }
-      } catch (e) {
-        if (!gone) {
-          setError((e as Error).message);
-          delay = Math.min(15000, Math.max(2200, delay * 2));
-        }
-      } finally {
-        inFlight = false;
-        if (!gone) timer = window.setTimeout(poll, delay);
-      }
-    }
-    void poll();
-    return () => {
-      gone = true;
-      if (timer !== undefined) window.clearTimeout(timer);
-    };
-  }, [current]);
-  useEffect(() => {
-    if (!project) return;
-    const serial =
-      (project.progress?.stageSerial || 0) +
-      (project.metrics?.refreshSerial || 0);
-    if (serial <= quotaStageSeen.current) return;
-    quotaStageSeen.current = serial;
-    void refreshAccount().catch((e) => setError((e as Error).message));
-  }, [project, refreshAccount]);
-  useEffect(() => {
-    if (!toast) return;
-    const t = setTimeout(() => setToast(''), 4500);
-    return () => clearTimeout(t);
-  }, [toast]);
-  function select(p: Project) {
-    quotaStageSeen.current =
-      (p.progress?.stageSerial || 0) + (p.metrics?.refreshSerial || 0);
-    setCurrent(p.id);
-    setProject(p);
-    setSection('create');
-    setView(
-      p.pages.length ? 'pictures' : p.samples.length ? 'samples' : 'plan',
-    );
-    setHistory(null);
-    setChecks([]);
-    setError('');
-  }
-  async function create() {
-    setWaiting(true);
-    try {
-      select(
-        await request<Project>('/api/projects', {
-          idea,
-          pageCount: pages,
-          special,
-          allowXiaolin: xiaolin,
-          tangyuan: cat,
-          model,
-          reasoningEffort: effort,
-          workflowPreset: preset,
-        }),
-      );
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setWaiting(false);
-    }
-  }
-  async function restartStudio() {
-    if (restarting) return;
-    if (
-      !window.confirm(
-        '确定重启创作室后台吗？不会自动继续制作或重新生图；正在运行的任务必须先暂停。',
-      )
-    )
-      return;
-    setRestarting(true);
-    setError('');
-    try {
-      const accepted = await request<{
-        previousInstanceId: string;
-        retryAfterMs?: number;
-      }>('/api/restart', {});
-      setToast('正在安全重启创作室…');
-      await new Promise((resolve) =>
-        window.setTimeout(resolve, accepted.retryAfterMs || 700),
-      );
-      for (let attempt = 0; attempt < 40; attempt++) {
-        try {
-          const health = await request<{ ready: boolean; instanceId: string }>(
-            '/api/health',
-          );
-          if (
-            health.ready &&
-            health.instanceId !== accepted.previousInstanceId
-          ) {
-            window.location.reload();
-            return;
-          }
-        } catch {}
-        await new Promise((resolve) => window.setTimeout(resolve, 500));
-      }
-      throw new Error('后台重启等待超时，请再点一次桌面快捷方式。');
-    } catch (e) {
-      setError((e as Error).message);
-      setRestarting(false);
-    }
-  }
-  async function action(name: string, body: unknown = {}) {
-    if (!project) return;
-    setWaiting(true);
-    try {
-      const p = await request<Project>(
-        `/api/projects/${project.id}/${name}`,
-        body,
-      );
-      if (p.id) setProject(p);
-      if (name === 'approve-plan' || name === 'preview-decision')
-        setView('samples');
-      if (name === 'approve-samples') setView('pictures');
-      if (
-        [
-          'retry-missing',
-          'recover-image',
-          'review-image',
-          'resume',
-          'repair-page-layout',
-          'unify-page-layouts',
-        ].includes(name)
-      )
-        setView(p.samplesApproved ? 'pictures' : 'samples');
-      if (name === 'revise-image') {
-        setEdit(null);
-        setEditNote('');
-      }
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setWaiting(false);
-    }
-  }
-  async function switchProjectModel() {
-    if (!project) return;
-    setWaiting(true);
-    try {
-      const p = await request<Project>(`/api/projects/${project.id}/settings`, {
-        model,
-        reasoningEffort: effort,
-      });
-      setProject(p);
-      setModelOpen(false);
-      setToast('模型已切换，只影响后续步骤。');
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setWaiting(false);
-    }
-  }
-  async function renameProject() {
-    if (!project) return;
-    setWaiting(true);
-    try {
-      const p = await request<Project>(`/api/projects/${project.id}/title`, {
-        title: titleDraft,
-      });
-      setProject(p);
-      setData((d) =>
-        d
-          ? { ...d, projects: [p, ...d.projects.filter((x) => x.id !== p.id)] }
-          : d,
-      );
-      setTitleOpen(false);
-      setToast('作品名称已更新。');
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setWaiting(false);
-    }
-  }
-  async function analyze(
-    kind: 'page' | 'panel' | 'sample',
-    key: string | number,
-  ) {
-    if (!project) return;
-    setWaiting(true);
-    try {
-      setProposal(
-        (
-          await request<{ proposal: Proposal }>('/api/assets/analyze', {
-            projectId: project.id,
-            kind,
-            key,
-            model,
-            reasoningEffort: 'low',
-          })
-        ).proposal,
-      );
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setWaiting(false);
-    }
-  }
-  async function upload(file: File) {
-    if (file.size > 20_000_000) return setError('图片不能超过 20MB。');
-    setWaiting(true);
-    try {
-      const dataUrl = await new Promise<string>((ok, bad) => {
-        const r = new FileReader();
-        r.onload = () =>
-          typeof r.result === 'string'
-            ? ok(r.result)
-            : bad(new Error('无法读取图片'));
-        r.onerror = bad;
-        r.readAsDataURL(file);
-      });
-      setProposal(
-        (
-          await request<{ proposal: Proposal }>('/api/assets/upload', {
-            name: file.name,
-            type: file.type,
-            data: dataUrl,
-            model,
-            reasoningEffort: 'low',
-          })
-        ).proposal,
-      );
-      setUploadOpen(false);
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setWaiting(false);
-    }
-  }
-  async function readImageFile(file: File) {
-    return await new Promise<string>((ok, bad) => {
-      const reader = new FileReader();
-      reader.onload = () =>
-        typeof reader.result === 'string'
-          ? ok(reader.result)
-          : bad(new Error('无法读取图片'));
-      reader.onerror = bad;
-      reader.readAsDataURL(file);
-    });
-  }
-  async function stageManualAsset(file: File) {
-    if (file.size > 20_000_000) {
-      setError('图片不能超过 20MB。');
-      return;
-    }
-    setWaiting(true);
-    try {
-      const result = await request<{ candidate: StagedAssetCandidate }>(
-          '/api/assets/stage',
-          { name: file.name, type: file.type, data: await readImageFile(file) },
-        ),
-        candidate = {
-          ...result.candidate.inspection,
-          id: result.candidate.id,
-          name: result.candidate.name,
-        };
-      setManualFile(file);
-      setManualCandidate(candidate);
-      setManualName(file.name.replace(/\.(png|jpe?g|webp)$/i, ''));
-      setManualCategory(
-        (category) => category || data?.categories[0]?.id || '',
-      );
-      setManualTags('');
-      setManualDescription('');
-      if (candidate.duplicate)
-        setToast('这张图已在素材库中，已显示已有素材位置。');
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setWaiting(false);
-    }
-  }
-  async function inspectManualAsset() {
-    if (!manualCandidate) return;
-    setWaiting(true);
-    try {
-      const result = await request<{ candidate: AssetCandidate }>(
-        `/api/assets/candidates/${manualCandidate.id}`,
-      );
-      setManualCandidate(result.candidate);
-      setToast(
-        result.candidate.duplicate
-          ? '已找到相同素材，不会重复保存。'
-          : '本地检查完成，可以填写入库信息。',
-      );
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setWaiting(false);
-    }
-  }
-  function closeManualUpload() {
-    setUploadOpen(false);
-    setManualCandidate(null);
-    setManualFile(null);
-  }
-  async function saveManualAsset() {
-    if (!manualCandidate || manualCandidate.duplicate) return;
-    setWaiting(true);
-    try {
-      const result = await request<{
-        duplicate?: boolean;
-        asset?: Asset | null;
-        assets?: Asset[];
-      }>('/api/assets/manual-save', {
-        candidateId: manualCandidate.id,
-        category: manualCategory,
-        name: manualName,
-        tags: manualTags
-          .split(/[，,]/)
-          .map((tag) => tag.trim())
-          .filter(Boolean),
-        description: manualDescription,
-        usage: manualUsage,
-      });
-      if (result.assets)
-        setData((previous) =>
-          previous
-            ? { ...previous, assets: result.assets || previous.assets }
-            : previous,
-        );
-      if (result.duplicate) {
-        setManualCandidate((candidate) =>
-          candidate
-            ? {
-                ...candidate,
-                duplicate: result.asset
-                  ? { file: result.asset.file, asset: result.asset }
-                  : candidate.duplicate,
-              }
-            : candidate,
-        );
-        setToast('这张图已在素材库中，未重复保存。');
-        return;
-      }
-      setToast('素材已按你的分类加入素材库，未调用模型。');
-      closeManualUpload();
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setWaiting(false);
-    }
-  }
-  async function searchLibraryAssets() {
-    setWaiting(true);
-    try {
-      const params = new URLSearchParams();
-      if (assetSearch.trim()) params.set('query', assetSearch.trim());
-      if (assetCategoryFilter) params.set('category', assetCategoryFilter);
-      if (assetUsageFilter) params.set('usage', assetUsageFilter);
-      const result = await request<{ assets: Asset[]; total: number }>(
-        `/api/assets/search?${params.toString()}`,
-      );
-      setAssetResults(result.assets);
-      setToast(`本地找到 ${result.total} 项素材。`);
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setWaiting(false);
-    }
-  }
-  function clearAssetSearch() {
-    setAssetSearch('');
-    setAssetCategoryFilter('');
-    setAssetUsageFilter('');
-    setAssetResults(null);
-  }
-  async function applyProposal() {
-    if (!proposal) return;
-    setWaiting(true);
-    try {
-      const result = await request<{ duplicate?: boolean }>(
-        '/api/assets/apply',
-        { proposalId: proposal.id, applyWorld, applyWorkflow },
-      );
-      setProposal(null);
-      setToast(
-        result.duplicate
-          ? '这张图已在长期素材库中，未重复添加。'
-          : '素材已加入长期素材库。',
-      );
-      await refresh();
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setWaiting(false);
-    }
-  }
-  async function suggestDoc() {
-    if (!doc) return;
-    setWaiting(true);
-    try {
-      const r = await request<{ revisedText: string }>(
-        '/api/documents/suggest',
-        {
-          docPath: doc.path,
-          note: suggestNote,
-          model,
-          reasoningEffort: effort,
-        },
-      );
-      setDocText(r.revisedText);
-      setToast('修改建议已填入编辑区，请检查后保存。');
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setWaiting(false);
-    }
-  }
-  async function saveDoc() {
-    if (
-      !doc ||
-      !confirm('保存后会更新长期设定，并自动保留旧版本。确定保存吗？')
-    )
-      return;
-    setWaiting(true);
-    try {
-      await request('/api/documents/save', {
-        docPath: doc.path,
-        content: docText,
-        expectedHash: doc.hash,
-        confirm: true,
-      });
-      setDoc(null);
-      setToast('长期设定已保存，旧版本已备份。');
-      await refresh();
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setWaiting(false);
-    }
-  }
-  async function remove() {
-    if (!deleteTarget) return;
-    setWaiting(true);
-    try {
-      await request(
-        deleteTarget.kind === 'project'
-          ? `/api/projects/${deleteTarget.id}/delete`
-          : `/api/archive/${deleteTarget.id}/delete`,
-        { confirmTitle },
-      );
-      if (deleteTarget.id === current) {
-        setCurrent(null);
-        setProject(null);
-      }
-      setDeleteTarget(null);
-      setStory(null);
-      setToast('作品已移入本地废纸篓。');
-      await refresh();
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setWaiting(false);
-    }
-  }
-  const plan =
-      history !== null
-        ? project?.history.find((h) => h.version === history)?.plan
-        : project?.plan,
-    primary = limits?.primary || null,
-    secondary = limits?.secondary || null,
-    used = primary ? Math.round(primary.usedPercent) : null,
-    remaining = primary
-      ? Math.max(0, Math.round(primary.remainingPercent))
-      : null,
-    weeklyUsed = secondary ? Math.round(secondary.usedPercent) : null,
-    weeklyRemaining = secondary
-      ? Math.max(0, Math.round(secondary.remainingPercent))
-      : null;
+  const {
+    data,
+    section,
+    setSection,
+    current,
+    project,
+    idea,
+    setIdea,
+    pages,
+    setPages,
+    special,
+    setSpecial,
+    cat,
+    setCat,
+    xiaolin,
+    setXiaolin,
+    model,
+    setModel,
+    effort,
+    setEffort,
+    preset,
+    setPreset,
+    waiting,
+    restarting,
+    error,
+    setError,
+    toast,
+    note,
+    setNote,
+    checks,
+    setChecks,
+    view,
+    setView,
+    history,
+    setHistory,
+    now,
+    zoom,
+    setZoom,
+    edit,
+    setEdit,
+    editNote,
+    setEditNote,
+    story,
+    setStory,
+    settingTab,
+    setSettingTab,
+    modelOpen,
+    setModelOpen,
+    titleOpen,
+    setTitleOpen,
+    titleDraft,
+    setTitleDraft,
+    deleteTarget,
+    setDeleteTarget,
+    confirmTitle,
+    setConfirmTitle,
+    models,
+    selectedModel,
+    plan,
+    primary,
+    used,
+    remaining,
+    weeklyUsed,
+    weeklyRemaining,
+    refreshAccount,
+    select,
+    newStory,
+    create,
+    restartStudio,
+    action,
+    switchProjectModel,
+    renameProject,
+    remove,
+    proposal,
+    setProposal,
+    applyWorld,
+    setApplyWorld,
+    applyWorkflow,
+    setApplyWorkflow,
+    uploadOpen,
+    setUploadOpen,
+    manualCandidate,
+    manualFile,
+    manualCategory,
+    setManualCategory,
+    manualName,
+    setManualName,
+    manualTags,
+    setManualTags,
+    manualDescription,
+    setManualDescription,
+    manualUsage,
+    setManualUsage,
+    assetSearch,
+    setAssetSearch,
+    assetCategoryFilter,
+    setAssetCategoryFilter,
+    assetUsageFilter,
+    setAssetUsageFilter,
+    assetResults,
+    assetGroup,
+    setAssetGroup,
+    assets,
+    analyze,
+    upload,
+    stageManualAsset,
+    inspectManualAsset,
+    closeManualUpload,
+    saveManualAsset,
+    searchLibraryAssets,
+    clearAssetSearch,
+    applyProposal,
+    doc,
+    setDoc,
+    docText,
+    setDocText,
+    suggestNote,
+    setSuggestNote,
+    openDoc,
+    suggestDoc,
+    saveDoc,
+  } = useStudioController();
   return (
     <div className="studio-shell">
       <aside className="sidebar">
@@ -732,14 +160,7 @@ export default function Studio() {
             温蒂的日常<small>WENDI’S LITTLE STUDIO</small>
           </span>
         </Link>
-        <button
-          className="new-story"
-          onClick={() => {
-            setCurrent(null);
-            setProject(null);
-            setSection('create');
-          }}
-        >
+        <button className="new-story" onClick={newStory}>
           <Plus size={18} />
           写一个新故事
         </button>
@@ -788,7 +209,9 @@ export default function Studio() {
             </button>
           ))}
         </div>
-        <div className="sidebar-foot"><small>作品保存在这台电脑</small></div>
+        <div className="sidebar-foot">
+          <small>作品保存在这台电脑</small>
+        </div>
       </aside>
       <main>
         <header className="topbar">
@@ -809,9 +232,7 @@ export default function Studio() {
               )}
               <b>
                 1周{' '}
-                {weeklyRemaining === null
-                  ? '暂不可用'
-                  : `${weeklyRemaining}%`}
+                {weeklyRemaining === null ? '暂不可用' : `${weeklyRemaining}%`}
               </b>
               {data?.account.updatedAt && (
                 <small>
@@ -1278,14 +699,7 @@ export default function Studio() {
                           {data.documents
                             .filter((d) => d.group === group)
                             .map((d) => (
-                              <button
-                                key={d.path}
-                                onClick={() => {
-                                  setDoc(d);
-                                  setDocText(d.text);
-                                  setSuggestNote('');
-                                }}
-                              >
+                              <button key={d.path} onClick={() => openDoc(d)}>
                                 <FileText />
                                 <span>
                                   <b>{d.label}</b>
@@ -1424,446 +838,73 @@ export default function Studio() {
           </footer>
         </div>
       </main>
-      {toast && (
-        <div className="toast">
-          <CircleCheck />
-          {toast}
-        </div>
-      )}
-      {zoom && (
-        <dialog open className="modal" aria-label={zoom.title}>
-          <header>
-            <span>{zoom.title} · 原始尺寸</span>
-            <button aria-label="关闭图片预览" onClick={() => setZoom(null)}>
-              <X />
-            </button>
-          </header>
-          <div className="zoom-scroll">
-            <img src={zoom.url} alt={zoom.title} />
-          </div>
-        </dialog>
-      )}
-      {edit && (
-        <Dialog close={() => setEdit(null)}>
-          <h2>{edit.title}，想改哪里？</h2>
-          <p>只修改你指出的部分，旧图不会覆盖。</p>
-          <textarea
-            value={editNote}
-            onChange={(e) => setEditNote(e.target.value)}
-          />
-          <button
-            className="primary"
-            onClick={() =>
-              action('revise-image', { key: edit.key, note: editNote })
-            }
-          >
-            <Pencil />
-            按这个要求修改
-          </button>
-        </Dialog>
-      )}
-      {story && (
-        <dialog open className="modal story-modal" aria-label={story.title}>
-          <header>
-            <span>
-              {story.title} · 共 {story.pages.length} 页
-            </span>
-            <div>
-              <button
-                className="danger-link"
-                onClick={() =>
-                  setDeleteTarget({
-                    kind: 'archive',
-                    id: story.id,
-                    title: story.title,
-                  })
-                }
-              >
-                <Trash2 />
-                删除作品
-              </button>
-              <button aria-label="关闭作品预览" onClick={() => setStory(null)}>
-                <X />
-              </button>
-            </div>
-          </header>
-          <div className="story-pages">
-            {story.pages.map((p, i) => (
-              <button
-                key={p.url}
-                onClick={() =>
-                  setZoom({
-                    url: p.url,
-                    title: `${story.title} · 第 ${i + 1} 页`,
-                  })
-                }
-              >
-                <img
-                  src={p.url}
-                  alt={`第${i + 1}页`}
-                  loading="lazy"
-                  decoding="async"
-                />
-                <span>第 {i + 1} 页</span>
-              </button>
-            ))}
-          </div>
-        </dialog>
-      )}
-      {doc && (
-        <Dialog wide close={() => setDoc(null)}>
-          <h2>{doc.label}</h2>
-          <p>
-            可以直接编辑，也可以让创作助手先给出完整修订建议；保存时自动备份旧版。
-          </p>
-          <div className="suggest-row">
-            <textarea
-              value={suggestNote}
-              onChange={(e) => setSuggestNote(e.target.value)}
-              placeholder="想完善什么？"
-            />
-            <button className="secondary" onClick={suggestDoc}>
-              <Sparkles />
-              智能完善
-            </button>
-          </div>
-          <textarea
-            className="doc-editor"
-            value={docText}
-            onChange={(e) => setDocText(e.target.value)}
-          />
-          <button className="primary" onClick={saveDoc}>
-            <Save />
-            检查后保存长期设定
-          </button>
-        </Dialog>
-      )}
-      {uploadOpen && (
-        <Dialog close={closeManualUpload}>
-          <h2>手动添加素材</h2>
-          <p>
-            上传、查重、分类和保存都在本地完成，不调用模型。需要智能建议时再主动选择。
-          </p>
-          {!manualCandidate ? (
-            <label className="upload-box">
-              <Upload />
-              <span>
-                {waiting ? '正在检查…' : '选择 PNG、JPG 或 WebP（20MB 内）'}
-              </span>
-              <input
-                type="file"
-                accept="image/png,image/jpeg,image/webp"
-                onChange={(e) =>
-                  e.target.files?.[0] && stageManualAsset(e.target.files[0])
-                }
-              />
-            </label>
-          ) : (
-            <div className="manual-asset-form">
-              <p>
-                <b>{manualCandidate.name}</b> · {manualCandidate.width}×
-                {manualCandidate.height} ·{' '}
-                {(manualCandidate.sizeBytes / 1024 / 1024).toFixed(1)} MB
-              </p>
-              {manualCandidate.duplicate ? (
-                <div className="recovery-card">
-                  <p>这张图已存在于素材库，不会重复保存。</p>
-                  <button className="secondary" onClick={closeManualUpload}>
-                    完成
-                  </button>
-                </div>
-              ) : (
-                <>
-                  <div className="form-row">
-                    <label>
-                      分类
-                      <select
-                        value={manualCategory}
-                        onChange={(e) => setManualCategory(e.target.value)}
-                      >
-                        {data?.categories.map((c) => (
-                          <option key={c.id} value={c.id}>
-                            {c.label}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label>
-                      用途
-                      <select
-                        value={manualUsage}
-                        onChange={(e) =>
-                          setManualUsage(e.target.value as typeof manualUsage)
-                        }
-                      >
-                        <option>本篇</option>
-                        <option>常用参考</option>
-                        <option>正式基线</option>
-                      </select>
-                    </label>
-                  </div>
-                  <label>
-                    素材名称
-                    <input
-                      value={manualName}
-                      maxLength={80}
-                      onChange={(e) => setManualName(e.target.value)}
-                    />
-                  </label>
-                  <label>
-                    标签（用逗号分隔）
-                    <input
-                      value={manualTags}
-                      onChange={(e) => setManualTags(e.target.value)}
-                      placeholder="例如：高丸子头、通勤、咖啡"
-                    />
-                  </label>
-                  <label>
-                    说明
-                    <textarea
-                      value={manualDescription}
-                      maxLength={500}
-                      onChange={(e) => setManualDescription(e.target.value)}
-                      placeholder="这张素材适合在什么情况下复用？"
-                    />
-                  </label>
-                  <div className="actions">
-                    <button
-                      className="primary"
-                      disabled={
-                        waiting || !manualCategory || !manualName.trim()
-                      }
-                      onClick={saveManualAsset}
-                    >
-                      <Save />
-                      保存到素材库（本地，不调用模型）
-                    </button>
-                    <button
-                      className="secondary"
-                      disabled={waiting}
-                      onClick={inspectManualAsset}
-                    >
-                      重新本地检查
-                    </button>
-                    {manualFile && (
-                      <button
-                        className="text-button"
-                        disabled={waiting}
-                        onClick={() => upload(manualFile)}
-                      >
-                        {' '}
-                        <Sparkles />
-                        智能分析建议
-                      </button>
-                    )}
-                  </div>
-                </>
-              )}
-            </div>
-          )}
-        </Dialog>
-      )}
-      {proposal && (
-        <Dialog close={() => setProposal(null)}>
-          <h2>
-            {proposal.decision === 'keep'
-              ? '建议加入长期素材库'
-              : '建议只留在本篇作品中'}
-          </h2>
-          <div className={'proposal-score ' + proposal.decision}>
-            {proposal.confidence}% 可信度
-          </div>
-          <p>{proposal.reason}</p>
-          {proposal.decision === 'keep' && (
-            <>
-              <dl className="proposal-detail">
-                <dt>归类</dt>
-                <dd>
-                  {
-                    data?.categories.find((c) => c.id === proposal.category)
-                      ?.label
-                  }
-                </dd>
-                <dt>文件名</dt>
-                <dd>{proposal.filename}</dd>
-                <dt>索引说明</dt>
-                <dd>{proposal.indexEntry}</dd>
-              </dl>
-              {proposal.worldSettingAddition && (
-                <label className="checkbox">
-                  <input
-                    type="checkbox"
-                    checked={applyWorld}
-                    onChange={(e) => setApplyWorld(e.target.checked)}
-                  />
-                  <span>
-                    同时补充世界观<small>{proposal.worldSettingAddition}</small>
-                  </span>
-                </label>
-              )}
-              {proposal.workflowAddition && (
-                <label className="checkbox">
-                  <input
-                    type="checkbox"
-                    checked={applyWorkflow}
-                    onChange={(e) => setApplyWorkflow(e.target.checked)}
-                  />
-                  <span>
-                    同时补充工作指引<small>{proposal.workflowAddition}</small>
-                  </span>
-                </label>
-              )}
-              <button className="primary" onClick={applyProposal}>
-                <Check />
-                确认加入素材库
-              </button>
-            </>
-          )}
-        </Dialog>
-      )}
-      {modelOpen && project && (
-        <Dialog close={() => setModelOpen(false)}>
-          <h2>更换后续步骤使用的模型</h2>
-          <p>
-            已有方案、样张和成稿保持不变。切换记录会保存到本篇项目；正在执行某一步时不能更换。
-          </p>
-          <div className="model-panel switch">
-            <div>
-              <label htmlFor="project-model">模型</label>
-              <select
-                id="project-model"
-                value={model}
-                onChange={(e) => {
-                  setModel(e.target.value);
-                  const m = models.find((x) => x.id === e.target.value);
-                  if (m) setEffort(m.defaultReasoningEffort);
-                }}
-              >
-                {models.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.label}
-                  </option>
-                ))}
-              </select>
-              <small>{selectedModel?.description}</small>
-            </div>
-            <div>
-              <label htmlFor="project-effort">思考力度</label>
-              <select
-                id="project-effort"
-                value={effort}
-                onChange={(e) => setEffort(e.target.value)}
-              >
-                {(selectedModel?.reasoningEfforts || []).map((x) => (
-                  <option key={x} value={x}>
-                    {effortLabels[x] || x}
-                  </option>
-                ))}
-              </select>
-            </div>
-          </div>
-          <button
-            className="primary"
-            disabled={waiting || project.busy}
-            onClick={switchProjectModel}
-          >
-            <Check />
-            确认，从下一步开始使用
-          </button>
-        </Dialog>
-      )}
-      {titleOpen && project && (
-        <Dialog close={() => setTitleOpen(false)}>
-          <h2>修改作品名称</h2>
-          <p>名称会同步到首页、作品列表和本地项目记录。</p>
-          <input
-            value={titleDraft}
-            maxLength={60}
-            onChange={(e) => setTitleDraft(e.target.value)}
-          />
-          <button
-            className="primary"
-            disabled={waiting || !titleDraft.trim()}
-            onClick={renameProject}
-          >
-            <Check />
-            保存名称
-          </button>
-        </Dialog>
-      )}
-      {deleteTarget && (
-        <Dialog close={() => setDeleteTarget(null)}>
-          <h2>确认删除《{deleteTarget.title}》</h2>
-          <p>作品会移入本地废纸篓。请输入完整作品名进行二次确认。</p>
-          <input
-            value={confirmTitle}
-            onChange={(e) => setConfirmTitle(e.target.value)}
-            placeholder={deleteTarget.title}
-          />
-          <button
-            className="danger-button"
-            disabled={confirmTitle !== deleteTarget.title}
-            onClick={remove}
-          >
-            <Trash2 />
-            确认移入废纸篓
-          </button>
-        </Dialog>
-      )}
-    </div>
-  );
-}
-function Dialog({
-  children,
-  close,
-  wide = false,
-}: {
-  children: React.ReactNode;
-  close: () => void;
-  wide?: boolean;
-}) {
-  const dialog = useRef<HTMLDialogElement>(null),
-    closeRef = useRef(close);
-  useEffect(() => {
-    closeRef.current = close;
-  }, [close]);
-  useEffect(() => {
-    const node = dialog.current,
-      previous =
-        document.activeElement instanceof HTMLElement
-          ? document.activeElement
-          : null;
-    if (node && !node.open) node.showModal();
-    const first = node?.querySelector<HTMLElement>(
-      'input, textarea, select, button:not(.close):not(.modal-dismiss)',
-    );
-    first?.focus();
-    return () => {
-      if (node?.open) node.close();
-      previous?.focus();
-    };
-  }, []);
-  return (
-    <dialog
-      ref={dialog}
-      className="modal-scrim"
-      aria-label="操作对话框"
-      onCancel={(event) => {
-        event.preventDefault();
-        closeRef.current();
-      }}
-    >
-      <button
-        className="modal-dismiss"
-        aria-label="关闭对话框"
-        onClick={close}
+      <StudioDialogs
+        data={data}
+        toast={toast}
+        zoom={zoom}
+        setZoom={setZoom}
+        edit={edit}
+        setEdit={setEdit}
+        editNote={editNote}
+        setEditNote={setEditNote}
+        action={action}
+        story={story}
+        setStory={setStory}
+        setDeleteTarget={setDeleteTarget}
+        doc={doc}
+        setDoc={setDoc}
+        docText={docText}
+        setDocText={setDocText}
+        suggestNote={suggestNote}
+        setSuggestNote={setSuggestNote}
+        suggestDoc={suggestDoc}
+        saveDoc={saveDoc}
+        uploadOpen={uploadOpen}
+        closeManualUpload={closeManualUpload}
+        waiting={waiting}
+        stageManualAsset={stageManualAsset}
+        manualCandidate={manualCandidate}
+        manualFile={manualFile}
+        manualCategory={manualCategory}
+        setManualCategory={setManualCategory}
+        manualUsage={manualUsage}
+        setManualUsage={setManualUsage}
+        manualName={manualName}
+        setManualName={setManualName}
+        manualTags={manualTags}
+        setManualTags={setManualTags}
+        manualDescription={manualDescription}
+        setManualDescription={setManualDescription}
+        saveManualAsset={saveManualAsset}
+        inspectManualAsset={inspectManualAsset}
+        upload={upload}
+        proposal={proposal}
+        setProposal={setProposal}
+        applyWorld={applyWorld}
+        setApplyWorld={setApplyWorld}
+        applyWorkflow={applyWorkflow}
+        setApplyWorkflow={setApplyWorkflow}
+        applyProposal={applyProposal}
+        modelOpen={modelOpen}
+        setModelOpen={setModelOpen}
+        project={project}
+        model={model}
+        setModel={setModel}
+        models={models}
+        selectedModel={selectedModel}
+        effort={effort}
+        setEffort={setEffort}
+        switchProjectModel={switchProjectModel}
+        titleOpen={titleOpen}
+        setTitleOpen={setTitleOpen}
+        titleDraft={titleDraft}
+        setTitleDraft={setTitleDraft}
+        renameProject={renameProject}
+        deleteTarget={deleteTarget}
+        confirmTitle={confirmTitle}
+        setConfirmTitle={setConfirmTitle}
+        remove={remove}
       />
-      <div className={'edit-modal ' + (wide ? 'wide' : '')}>
-        <button className="close" aria-label="关闭对话框" onClick={close}>
-          <X />
-        </button>
-        {children}
-      </div>
-    </dialog>
+    </div>
   );
 }

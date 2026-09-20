@@ -8,10 +8,25 @@ const page = fs.readFileSync(path.join(appRoot, 'app/page.tsx'), 'utf8');
 const studioSources = [
   page,
   fs.readFileSync(path.join(appRoot, 'app/studio/project-view.tsx'), 'utf8'),
+  fs.readFileSync(path.join(appRoot, 'app/studio/project-plan.tsx'), 'utf8'),
+  fs.readFileSync(path.join(appRoot, 'app/studio/project-samples.tsx'), 'utf8'),
+  fs.readFileSync(path.join(appRoot, 'app/studio/project-pictures.tsx'), 'utf8'),
   fs.readFileSync(path.join(appRoot, 'app/studio/workflow-status.tsx'), 'utf8'),
   fs.readFileSync(path.join(appRoot, 'app/studio/recovery-cards.tsx'), 'utf8'),
   fs.readFileSync(path.join(appRoot, 'app/studio/visuals.tsx'), 'utf8'),
   fs.readFileSync(path.join(appRoot, 'app/studio/workflow-utils.ts'), 'utf8'),
+  fs.readFileSync(path.join(appRoot, 'app/studio/studio-dialogs.tsx'), 'utf8'),
+  fs.readFileSync(path.join(appRoot, 'app/studio/asset-dialogs.tsx'), 'utf8'),
+  fs.readFileSync(path.join(appRoot, 'app/studio/document-dialog.tsx'), 'utf8'),
+  fs.readFileSync(path.join(appRoot, 'app/studio/dialog.tsx'), 'utf8'),
+  fs.readFileSync(
+    path.join(appRoot, 'app/studio/use-studio-controller.ts'),
+    'utf8',
+  ),
+  fs.readFileSync(
+    path.join(appRoot, 'app/studio/use-project-controller.ts'),
+    'utf8',
+  ),
 ].join('\n');
 const css = fs.readFileSync(path.join(appRoot, 'app/globals.css'), 'utf8');
 
@@ -158,7 +173,10 @@ test('recovery and panel decisions render through one primary card priority', ()
   assert.match(studioSources, /primaryCard === 'panel'/);
   assert.match(studioSources, /previousAttemptNoOutput=\{noOutput\}/);
   assert.match(studioSources, /本次修改未取得新图，上一版原图仍保留/);
-  assert.match(studioSources, /panelDecisionPrimary=\{primaryCard === 'panel'\}/);
+  assert.match(
+    studioSources,
+    /panelDecisionPrimary=\{primaryCard === 'panel'\}/,
+  );
   assert.match(studioSources, /采用上一版/);
   assert.match(studioSources, /继续修改这一张/);
   assert.match(
@@ -183,8 +201,14 @@ test('model usage details are collapsed while the aggregate remains visible', ()
 test('idle wall-clock updates are conditional and storyboard images are lazy decoded', () => {
   assert.match(studioSources, /function workflowClockActive\(/);
   assert.match(studioSources, /project\.busy/);
-  assert.match(studioSources, /taskRunning = project\?\.currentTask\?\.status === 'running'/);
-  assert.match(studioSources, /project\.progress\?\.activeStage\?\.state === 'running'/);
+  assert.match(
+    studioSources,
+    /taskRunning = project\?\.currentTask\?\.status === 'running'/,
+  );
+  assert.match(
+    studioSources,
+    /project\.progress\?\.activeStage\?\.state === 'running'/,
+  );
   assert.match(studioSources, /if \(!clockActive\) return;/);
   assert.match(
     studioSources,
@@ -192,11 +216,11 @@ test('idle wall-clock updates are conditional and storyboard images are lazy dec
   );
   assert.match(
     studioSources,
-    /alt=\{`第\$\{p\.number\}页`\}[\s\S]{0,180}loading="lazy"[\s\S]{0,80}decoding="async"/,
+    /alt=\{`第\$\{(?:p|page)\.number\}页`\}[\s\S]{0,180}loading="lazy"[\s\S]{0,80}decoding="async"/,
   );
   assert.match(
     studioSources,
-    /alt=\{`分镜\$\{k\}`\}[\s\S]{0,180}loading="lazy"[\s\S]{0,80}decoding="async"/,
+    /alt=\{`分镜\$\{(?:k|key)\}`\}[\s\S]{0,180}loading="lazy"[\s\S]{0,80}decoding="async"/,
   );
   assert.match(studioSources, /className="reference-grid"/);
   assert.match(
