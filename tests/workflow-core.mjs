@@ -58,7 +58,7 @@ test('web image provider records the dedicated Chrome focus boundary',()=>{
   assert.match(text,/当前同一个回合完成/);
 });
 test('web executor availability reports the direct Chrome focus boundary',()=>{
-  const worker=G.webWorkerStatus();assert.equal(worker.transport,'direct-chrome');assert.equal(worker.browser,'chrome');assert.equal(worker.state,'available');assert.equal(worker.focusRestoration,'unsupported');assert.equal(worker.focusSafe,false);assert.equal(worker.ready,true);assert.equal(worker.message,'执行器可用，站点访问权限将在任务中验证。');
+  const worker=G.webWorkerStatus();assert.equal(worker.transport,'direct-chrome');assert.equal(worker.browser,'chrome');assert.equal(worker.state,'available');assert.equal(worker.focusRestoration,'unsupported');assert.equal(worker.focusSafe,false);assert.equal(worker.ready,true);assert.equal(worker.executableReady,true);assert.equal(worker.chromeCapabilityVerified,false);assert.equal(worker.message,'Codex executable ready；Chrome capability 未验证。');
 });
 test('UI keeps real image errors and removes the non-blocking Chrome focus notice',()=>{
   const text=['app/page.tsx','app/studio/project-view.tsx','app/studio/recovery-cards.tsx','app/studio/workflow-status.tsx'].map(file=>fs.readFileSync(path.join(W.APP,file),'utf8')).join('\\n');

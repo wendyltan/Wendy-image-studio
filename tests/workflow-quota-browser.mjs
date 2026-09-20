@@ -121,7 +121,7 @@ test('an unavailable hidden IAB stops before any provider submission',async()=>{
   assert.equal(failed.pending,null);assert.equal(failed.lastFailure.kind,'browser-unavailable');assert.equal(failed.lastFailure.attempts,0);
   assert.equal(failed.currentTask.providerInvocations,0);assert.equal(failed.currentTask.status,'failed_no_output');assert.match(failed.message,/未提交图片请求/);
   delete process.env.WENDI_TEST_NO_IMAGE_ONCE;delete process.env.WENDI_TEST_NO_IMAGE_TEXT;
-  E.retryMissingImage(failed,'样张-1');failed=await done(failed.id);assert.equal(failed.currentTask.attempt,1);assert.equal(failed.progress.current,1);assert.equal(failed.progress.total,2);
+  E.retryMissingImage(failed,'样张-1');failed=await done(failed.id);assert.equal(failed.currentTask.attempt,2);assert.equal(failed.progress.current,1);assert.equal(failed.progress.total,2);
 });
 test('an unavailable Chrome focus capability stops before any provider submission',async()=>{
   const marker=path.join(temp,'chrome-focus-unavailable');process.env.WENDI_TEST_NO_IMAGE_ONCE=marker;process.env.WENDI_TEST_NO_IMAGE_TEXT='BROWSER_FOCUS_UNAVAILABLE: Chrome management capability is not advertised';
@@ -158,7 +158,7 @@ test('restart migrates only an identity-matched legacy browser permission failur
 test('manual retry keeps the direct Chrome path when focus restoration is unavailable',async()=>{
   let project=E.createProject({...brief,idea:'手动重试允许已知焦点边界'});project.plan=structuredClone(plan);project.version=1;project.approved={version:1,hash:W.digest(project.plan)};project.samplesApproved=true;project.status='attention';project.currentTask={id:'focus-retry-task',kind:'image',target:'第1页-第1格',status:'failed_no_output',errorCode:'browser-unavailable',providerInvocations:0};project.lastFailure={kind:'browser-unavailable',definiteNoOutput:true,key:'第1页-第1格',attempts:0,taskId:'focus-retry-task',at:new Date().toISOString()};E.saveProject(project);
   E.retryMissingImage(project,'第1页-第1格');project=await done(project.id);
-  assert.ok(!project.pending);assert.equal(project.currentTask.providerInvocations,1);assert.ok(project.panels['1-1']);assert.match(G.webWorkerStatus().message,/站点访问权限将在任务中验证/);
+  assert.ok(!project.pending);assert.equal(project.currentTask.providerInvocations,1);assert.ok(project.panels['1-1']);assert.equal(G.webWorkerStatus().message,'Codex executable ready；Chrome capability 未验证。');
 });
 test('a durable pre-submission web failure is safely retryable after restart',()=>{
   let failed=E.createProject({...brief,idea:'网页提交前失败恢复测试'});const dir=path.join(E.projectDir(failed.id),'.制作记录','pre-submit');
