@@ -137,6 +137,7 @@ test('executor instructions bind the top-level worker reference array and gate s
   assert.match(instruction,/不是 worker\.worker\.referenceFiles/);
   assert.match(instruction,/不要手写|不要手打|完整数组原样/);
   assert.match(instruction,/每个 group|逐个附件 group|group.*数量/);
+  assert.match(instruction,/重复后缀|YYYYMMDD-HHMMSS|规范化名称/);
   assert.match(instruction,/等待.*等待文件上传.*消失|等待文件上传.*消失/);
   assert.match(instruction,/发送按钮.*disabled|disabled.*发送按钮/);
   assert.match(instruction,/禁止.*submission-intent|submission-intent.*禁止/);
