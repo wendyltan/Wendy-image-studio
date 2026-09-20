@@ -55,11 +55,41 @@ function checksum(file){
   return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 }
 
+function copyTree(source,target,{immutable=false}={}){
+  const stat=fs.lstatSync(source);
+  if(stat.isSymbolicLink())throw new Error(`拒绝复制符号链接：${source}`);
+  if(stat.isDirectory()){
+    fs.mkdirSync(target,{recursive:true});
+    for(const name of fs.readdirSync(source))copyTree(path.join(source,name),path.join(target,name),{immutable});
+    if(immutable)try{fs.chmodSync(target,0o555);}catch{}
+    return;
+  }
+  if(!stat.isFile())throw new Error(`执行证据包含不可复制的文件类型：${source}`);
+  fs.mkdirSync(path.dirname(target),{recursive:true});
+  fs.copyFileSync(source,target);
+  if(immutable)try{fs.chmodSync(target,0o444);}catch{}
+}
+
+function rewriteImportedPaths(value,{sourceProjectRoot,sourceRunDir,sourceOutput,targetProjectRoot,targetRunDir,targetOutput}={}){
+  if(Array.isArray(value))return value.map(item=>rewriteImportedPaths(item,{sourceProjectRoot,sourceRunDir,sourceOutput,targetProjectRoot,targetRunDir,targetOutput}));
+  if(value&&typeof value==='object'){
+    const result={};
+    for(const [key,item] of Object.entries(value))result[key]=rewriteImportedPaths(item,{sourceProjectRoot,sourceRunDir,sourceOutput,targetProjectRoot,targetRunDir,targetOutput});
+    return result;
+  }
+  if(typeof value!=='string')return value;
+  const absolute=path.isAbsolute(value)?path.resolve(value):null;
+  if(absolute===path.resolve(sourceOutput))return targetOutput;
+  if(absolute&&absolute.startsWith(path.resolve(sourceRunDir)+path.sep))return path.join(targetRunDir,path.relative(sourceRunDir,absolute));
+  if(absolute&&absolute.startsWith(path.resolve(sourceProjectRoot)+path.sep))return path.join(targetProjectRoot,path.relative(sourceProjectRoot,absolute));
+  return value;
+}
+
 /**
  * Image files are verified through the existing local inspector. The caller
  * supplies pythonRun so this module remains independent of the engine.
  */
-export function createImageRecovery({webImageProvider,readGenerationEvidence,generationDiagnosticSummary,readWebManifest,pythonRun,jsonWrite,projectDir,inside,saveProject,job,verifyApproval,finishTask,activity,invalidatePanelDownstream,recordArtifact,attachImageRecord,artifactIdForImageKey,panelKeyFromImageKey,sampleIndexFromKey,sampleRepairCount,definiteImageFailure,failureMessage}={}){
+export function createImageRecovery({webImageProvider,readGenerationEvidence,generationDiagnosticSummary,readWebManifest,pythonRun,jsonWrite,projectDir,inside,saveProject,job,verifyApproval,finishTask,activity,invalidatePanelDownstream,recordArtifact,attachImageRecord,artifactIdForImageKey,panelKeyFromImageKey,sampleIndexFromKey,sampleRepairCount,definiteImageFailure,failureMessage,hasActive=()=>false}={}){
   const required={readGenerationEvidence,generationDiagnosticSummary,readWebManifest,pythonRun,jsonWrite,projectDir,inside};
   for(const [key,value] of Object.entries(required))if(typeof value!=='function')throw new TypeError(`image recovery requires ${key}`);
 
@@ -200,6 +230,98 @@ export function createImageRecovery({webImageProvider,readGenerationEvidence,gen
     });
   }
 
+  /**
+   * Adopt a completed run from an isolated production root without creating a
+   * new request. The source run is archived byte-for-byte under
+   * source-evidence; the small root projection is path-normalized to the
+   * current project so the ordinary identity/evidence validators can inspect
+   * it. This is intentionally explicit and rejects any existing target/task.
+   */
+  async function adoptRecoveredRun(p,{sourceDir,sourceFile,targetFile,target,expectedSha256=null}={}){
+    verifyApproval(p);
+    if(hasActive(p.id))throw new Error('当前作品仍有运行中的任务，不能采用外部原图。');
+    if(p.pending)throw new Error('当前作品存在待确认任务，不能采用外部原图。');
+    const key=String(target||'').trim(),panelKey=panelKeyFromImageKey?.(key);
+    if(!panelKey)throw new Error('外部原图只支持采用为正式分镜。');
+    const [pageNumber,panelNumber]=panelKey.split('-').map(Number),definition=p.plan?.pages?.[pageNumber-1]?.panels?.[panelNumber-1];
+    if(!definition)throw new Error(`当前方案中不存在 ${key}，拒绝采用外部原图。`);
+    if(p.panels?.[panelKey])throw new Error(`当前作品已经存在 ${key}，不会覆盖已有分镜。`);
+    if((p.tasks||[]).some(item=>item?.target===key||item?.target===panelKey))throw new Error(`当前作品已经存在 ${key} 的制作任务，不会覆盖历史任务。`);
+    if(!sourceDir||!sourceFile||!targetFile)throw new Error('外部原图采用缺少 sourceDir、sourceFile 或 targetFile。');
+
+    const sourceRunDir=path.resolve(String(sourceDir)),sourceImage=path.resolve(String(sourceFile)),projectRoot=path.resolve(projectDir(p.id)),destination=path.isAbsolute(String(targetFile))?path.resolve(String(targetFile)):inside(projectRoot,String(targetFile));
+    if(!destination.startsWith(projectRoot+path.sep))throw new Error('外部原图目标路径必须位于当前作品目录。');
+    if(fs.existsSync(destination))throw new Error('外部原图目标文件已经存在，不会覆盖已有文件。');
+    const requiredSourceFiles=['request.json','worker-request.json','web-generation.json','run-identity.json','execution.json','result.json','download-evidence.json','events.jsonl','prompt.txt'];
+    for(const name of requiredSourceFiles)if(!fs.existsSync(path.join(sourceRunDir,name)))throw new Error(`外部执行记录缺少 ${name}。`);
+
+    const source=readRunIdentity(sourceRunDir,{strict:true}),sourceRequest=source.request,sourceWorker=source.worker,sourceManifest=source.manifest,sourceExecution=source.execution,sourceResult=readJsonObject(path.join(sourceRunDir,'result.json'),{strict:true}),sourceEvidence=readDownloadEvidence(sourceRunDir),sourceProjectRoot=source.projectRoot,sourceOutput=source.expectedOutput;
+    if(!sourceRequest||!sourceWorker||!sourceManifest||!sourceExecution||!sourceEvidence)throw new Error('外部执行记录不完整，拒绝采用。');
+    if(sourceImage!==sourceOutput)throw new Error('外部原图路径与 request.expectedOutput 不一致。');
+    if(sourceRequest.provider!==webImageProvider||sourceWorker.provider!==webImageProvider||sourceManifest.provider!==webImageProvider)throw new Error('外部执行记录 provider 不匹配。');
+    const sourceExpected={projectId:p.id,projectVersion:p.version,taskId:sourceRequest.taskId,target:key,requestId:sourceManifest.requestId,runId:source.runId,outputFile:sourceImage};
+    const sourceIdentity=compareRunIdentity({record:source,expected:sourceExpected,requireModern:true});
+    if(!sourceIdentity.ok)throw new Error(`外部执行记录身份不一致：${sourceIdentity.issues.join('；')}`);
+    if(sourceManifest.state!=='downloaded'||sourceManifest.accepted!==true||sourceManifest.submitted!==true)throw new Error('外部执行记录不是已提交且已下载的正向结果。');
+    if(sourceManifest.requestId!==sourceRequest.requestId||sourceManifest.requestId!==sourceWorker.requestId)throw new Error('外部执行记录 requestId 不一致。');
+    if(sourceResult.projectId!==p.id||Number(sourceResult.projectVersion)!==Number(p.version)||sourceResult.taskId!==sourceRequest.taskId||sourceResult.target!==key||sourceResult.requestId!==sourceManifest.requestId||sourceResult.runId!==source.runId)throw new Error('外部 result.json 与当前采用身份不一致。');
+    const sourceIntegrity=await verifyImage(sourceImage);
+    if(expectedSha256&&sourceIntegrity.sha256!==String(expectedSha256))throw new Error('外部原图 SHA-256 与指定值不一致。');
+    const evidenceValidation=validateDownloadEvidence(sourceEvidence,{expectedIdentity:{...sourceExpected,conversationUrl:sourceManifest.conversationUrl},request:sourceRequest,worker:sourceWorker,result:sourceResult,manifest:sourceManifest,outputFile:sourceImage,actual:{...sourceIntegrity,path:sourceImage,bytes:sourceIntegrity.sizeBytes,format:String(sourceIntegrity.format||'').toUpperCase(),contentType:sourceIntegrity.contentType||`image/${String(sourceIntegrity.format||'').toLowerCase()}`},conversationUrl:sourceManifest.conversationUrl});
+    if(!evidenceValidation.ok)throw new Error(`外部下载证据不一致：${evidenceValidation.errors.slice(0,5).join('；')}`);
+
+    const targetRunDir=path.join(projectRoot,'.制作记录',source.runId);
+    if(fs.existsSync(targetRunDir))throw new Error(`当前作品已有同名制作记录 ${source.runId}，不会覆盖。`);
+    const importedAt=new Date().toISOString(),mapping={sourceProjectRoot,sourceRunDir,sourceOutput,targetProjectRoot:projectRoot,targetRunDir,targetOutput:destination};
+    let persisted=null;
+    try{
+      fs.mkdirSync(targetRunDir,{recursive:true});
+      copyTree(sourceRunDir,targetRunDir);
+      copyTree(sourceRunDir,path.join(targetRunDir,'source-evidence'),{immutable:true});
+      fs.mkdirSync(path.dirname(destination),{recursive:true});
+      persisted=await persistImage(sourceImage,destination);
+      if(!persisted||persisted.file!==destination)throw new Error('外部原图复制后的目标扩展名或路径不一致。');
+
+      const readSourceJson=name=>readJsonObject(path.join(sourceRunDir,name),{strict:true});
+      const normalizedRequest=rewriteImportedPaths(readSourceJson('request.json'),mapping);
+      const normalizedWorker=rewriteImportedPaths(readSourceJson('worker-request.json'),mapping);
+      const normalizedManifest=rewriteImportedPaths(readSourceJson('web-generation.json'),mapping);
+      const normalizedLock=rewriteImportedPaths(readSourceJson('run-identity.json'),mapping);
+      const normalizedExecution=rewriteImportedPaths(readSourceJson('execution.json'),mapping);
+      const normalizedResult=rewriteImportedPaths(sourceResult,mapping);
+      const normalizedEvidence=rewriteImportedPaths(sourceEvidence,mapping);
+      const normalizedDownloadEvidence=enrichDownloadEvidenceIdentity(normalizedEvidence,{projectId:p.id,projectVersion:p.version,taskId:sourceRequest.taskId,target:key,requestId:sourceManifest.requestId,runId:source.runId,outputFile:destination});
+      normalizedDownloadEvidence.output={...normalizedDownloadEvidence.output,path:destination,bytes:persisted.integrity.sizeBytes,format:String(persisted.integrity.format||'').toUpperCase(),width:persisted.integrity.width,height:persisted.integrity.height,sha256:persisted.integrity.sha256};
+      normalizedRequest.projectId=p.id;normalizedRequest.projectVersion=p.version;normalizedRequest.taskId=sourceRequest.taskId;normalizedRequest.target=key;normalizedRequest.requestId=sourceManifest.requestId;normalizedRequest.runId=source.runId;normalizedRequest.expectedOutput=path.relative(projectRoot,destination);
+      normalizedWorker.projectId=p.id;normalizedWorker.projectVersion=p.version;normalizedWorker.taskId=sourceRequest.taskId;normalizedWorker.target=key;normalizedWorker.requestId=sourceManifest.requestId;normalizedWorker.runId=source.runId;normalizedWorker.outputFile=destination;normalizedWorker.manifestFile=path.join(targetRunDir,'web-generation.json');
+      normalizedManifest.projectId=p.id;normalizedManifest.projectVersion=p.version;normalizedManifest.taskId=sourceRequest.taskId;normalizedManifest.target=key;normalizedManifest.requestId=sourceManifest.requestId;normalizedManifest.runId=source.runId;normalizedManifest.outputFile=destination;normalizedManifest.artifactPath=destination;normalizedManifest.state='downloaded';normalizedManifest.accepted=true;normalizedManifest.submitted=true;normalizedManifest.error=null;normalizedManifest.errorCode=null;
+      normalizedLock.projectId=p.id;normalizedLock.projectVersion=p.version;normalizedLock.taskId=sourceRequest.taskId;normalizedLock.target=key;normalizedLock.requestId=sourceManifest.requestId;normalizedLock.runId=source.runId;normalizedLock.outputFile=destination;normalizedLock.expectedOutput=destination;
+      Object.assign(normalizedResult,{schemaVersion:2,provider:webImageProvider,projectId:p.id,projectVersion:p.version,taskId:sourceRequest.taskId,target:key,requestId:sourceManifest.requestId,runId:source.runId,acceptanceState:'downloaded',accepted:true,submitted:true,artifact:path.relative(projectRoot,destination),integrity:persisted.integrity,downloadEvidence:normalizedDownloadEvidence,sourceOutcome:sourceResult.outcome||null,outcome:'artifact_adopted_from_external_run',importedAt,recoveryCompletedAt:importedAt,endedAt:importedAt});
+      for(const [name,value] of [['request.json',normalizedRequest],['worker-request.json',normalizedWorker],['web-generation.json',normalizedManifest],['run-identity.json',normalizedLock],['execution.json',normalizedExecution],['result.json',normalizedResult],['download-evidence.json',normalizedDownloadEvidence]])jsonWrite(path.join(targetRunDir,name),value);
+      jsonWrite(path.join(targetRunDir,'import.json'),{schemaVersion:1,sourceTempPath:sourceRunDir,sourceOutputFile:sourceImage,sourceEvidencePath:path.join(targetRunDir,'source-evidence'),importedAt,targetProjectId:p.id,targetProjectVersion:p.version,targetTaskId:sourceRequest.taskId,target:key,targetRunDir,outputFile:destination,integrity:persisted.integrity});
+      fs.appendFileSync(path.join(targetRunDir,'events.jsonl'),`${JSON.stringify({type:'recovery.imported',schemaVersion:1,metadataOnly:false,importedAt,sourceTempPath:sourceRunDir,sourceOutputFile:sourceImage,targetRunDir,outputFile:destination,projectId:p.id,projectVersion:p.version,taskId:sourceRequest.taskId,target:key,sha256:persisted.integrity.sha256})}\n`,{encoding:'utf8',mode:0o600});
+
+      const imported=readRunIdentity(targetRunDir,{strict:true}),importedExpected={projectId:p.id,projectVersion:p.version,taskId:sourceRequest.taskId,target:key,requestId:sourceManifest.requestId,runId:source.runId,outputFile:destination},importedIdentity=compareRunIdentity({record:imported,expected:importedExpected,requireModern:true});
+      if(!importedIdentity.ok)throw new Error(`采用后的执行记录身份不一致：${importedIdentity.issues.join('；')}`);
+      const importedActual=inspectDownloadArtifact(destination),importedResult=readJsonObject(path.join(targetRunDir,'result.json'),{strict:true}),importedEvidence=readDownloadEvidence(targetRunDir),importedValidation=validateDownloadEvidence(importedEvidence,{expectedIdentity:{...importedExpected,conversationUrl:normalizedManifest.conversationUrl},request:imported.request,worker:imported.worker,result:importedResult,manifest:imported.manifest,outputFile:destination,actual:importedActual,conversationUrl:normalizedManifest.conversationUrl});
+      if(!importedValidation.ok)throw new Error(`采用后的下载证据不一致：${importedValidation.errors.slice(0,5).join('；')}`);
+
+      const relativeFile=path.relative(projectRoot,destination),prompt=fs.readFileSync(path.join(sourceRunDir,'prompt.txt'),'utf8').trim(),refs=Array.isArray(definition.references)?[...definition.references]:Array.isArray(sourceRequest.referenceNames)?[...sourceRequest.referenceNames]:[],record={key,file:relativeFile,provider:webImageProvider,conversationUrl:normalizedManifest.conversationUrl||null,prompt,basePrompt:prompt,revisionDelta:null,revisionBase:null,executor:{model:sourceWorker.executorModel||null,reasoningEffort:sourceWorker.executorReasoningEffort||null,role:sourceWorker.role||'browser-executor'},refs,telemetry:{promptSha256:sourceRequest.promptSha256||null,promptCharacters:Number(sourceRequest.promptCharacters)||prompt.length,referenceAttachmentCount:Number(sourceRequest.referenceNames?.length)||refs.length,recordedAt:importedAt,source:'external-run-adoption'},integrity:persisted.integrity,downloadEvidence:importedEvidence,qa:{pass:null,status:'manual_review',summary:'原图已从已完成的隔离执行记录安全采用，等待人工视觉校对。',issues:[],repairPrompt:'',source:'external_run_adoption'},import:{sourceTempPath:sourceRunDir,sourceOutputFile:sourceImage,importedAt},at:importedAt};
+      jsonWrite(`${destination}.json`,record);
+      if(invalidatePanelDownstream)invalidatePanelDownstream(p,panelKey);
+      recordArtifact(p,artifactIdForImageKey(key),'image',relativeFile,[],{integrity:persisted.integrity,downloadEvidence:importedEvidence,importedAt,sourceTempPath:sourceRunDir});
+      attachImageRecord(p,record);
+      const task={id:sourceRequest.taskId,kind:'image',target:key,status:'running',attempt:Number(sourceRequest.attempt)||1,startedAt:sourceManifest.createdAt||importedAt,lastProgressAt:importedAt,projectId:p.id,projectVersion:p.version,provider:webImageProvider,providerInvocations:1,requestId:sourceManifest.requestId,accepted:true,submitted:true,referenceCount:Number(sourceManifest.referenceCount)||refs.length,webState:'downloaded',webTimings:{createdAt:sourceManifest.createdAt||null,acceptedAt:sourceManifest.acceptedAt||null,readyAt:sourceManifest.readyAt||null,submittedAt:sourceManifest.submittedAt||null,downloadedAt:sourceManifest.downloadedAt||null,recoveryCompletedAt:importedAt,executorModel:sourceWorker.executorModel||null,executorReasoningEffort:sourceWorker.executorReasoningEffort||null,role:sourceWorker.role||'browser-executor'},artifact:destination,recoverySource:{sourceTempPath:sourceRunDir,sourceOutputFile:sourceImage,importedAt,sha256:persisted.integrity.sha256}};
+      p.tasks=Array.isArray(p.tasks)?p.tasks:[];p.tasks.push(task);p.tasks=p.tasks.slice(-80);p.currentTask=task;p.pending=null;p.lastFailure=null;p.error=null;p.status='paused';p.message=`${key} 已安全采用已完成的隔离原图，等待人工视觉校对；未重新生图。`;p.recoveryImports=Array.isArray(p.recoveryImports)?p.recoveryImports:[];p.recoveryImports.push({sourceTempPath:sourceRunDir,sourceOutputFile:sourceImage,importedAt,targetRunDir,outputFile:destination,projectId:p.id,projectVersion:p.version,taskId:sourceRequest.taskId,target:key,sha256:persisted.integrity.sha256});p.recoveryImports=p.recoveryImports.slice(-40);
+      finishTask(p,task,'recovered_local',{completedAt:importedAt,generationCompletedAt:sourceResult.generationCompletedAt||sourceExecution.endedAt||sourceManifest.submittedAt||null,priorCompletedAt:sourceResult.priorCompletedAt||sourceResult.endedAt||sourceManifest.submittedAt||null,recoveryCompletedAt:importedAt,artifact:destination,qa:'manual_review',qaStatus:'manual_review',webState:'downloaded',webTimings:task.webTimings,errorCode:null,error:null,recoverySource:task.recoverySource});
+      return {project:p,runDir:targetRunDir,file:destination,record,task,manifest:imported.manifest,result:importedResult,downloadEvidence:importedEvidence,integrity:persisted.integrity,importedAt};
+    }catch(error){
+      try{if(fs.existsSync(targetRunDir))fs.rmSync(targetRunDir,{recursive:true,force:true});}catch{}
+      try{if(fs.existsSync(destination))fs.unlinkSync(destination);}catch{}
+      throw error;
+    }
+  }
+
   function syncRecoveredMetadata(p,{dir,target,taskId,requestId,file}={}){
     const runDir=path.resolve(String(dir||'')),projectRoot=path.resolve(projectDir(p.id));
     if(!runDir.startsWith(path.join(projectRoot,'.制作记录')+path.sep))throw new Error('恢复元数据目录不属于当前作品制作记录。');
@@ -224,7 +346,7 @@ export function createImageRecovery({webImageProvider,readGenerationEvidence,gen
     p.pending=null;p.lastFailure=null;p.status='paused';p.error=null;const webTimings={...task.webTimings,downloadedAt:timeline.downloadedAt,generationCompletedAt:timeline.generationCompletedAt,recoveryCompletedAt:timeline.recoveryCompletedAt};finishTask(p,task,'recovered_local',{completedAt:timeline.recoveryCompletedAt,generationCompletedAt:timeline.generationCompletedAt,priorCompletedAt:timeline.priorCompletedAt,recoveryCompletedAt:timeline.recoveryCompletedAt,artifact:expectedOutput,qa:'manual_review',qaStatus:'manual_review',webState:'downloaded',webTimings,errorCode:null,error:null});saveProject(p);return p;
   }
 
-  return Object.freeze({checksum,verifyImage,matchingWebRunRecord,matchingPendingManifest:matchingManifest,inspectOrphanImageEvidence,persistImage,writeRunResult,runEvidence,attributableCandidates,assertCurrentPending,recoverImage,syncRecoveredMetadata});
+  return Object.freeze({checksum,verifyImage,matchingWebRunRecord,matchingPendingManifest:matchingManifest,inspectOrphanImageEvidence,persistImage,writeRunResult,runEvidence,attributableCandidates,assertCurrentPending,recoverImage,adoptRecoveredRun,syncRecoveredMetadata});
 }
 
 export {generatedCandidates,extensionForImage,checksum};

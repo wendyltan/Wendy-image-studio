@@ -195,8 +195,9 @@ const imageRecovery=createImageRecovery({
   sampleRepairCount,
   definiteImageFailure,
   failureMessage,
+  hasActive:id=>active.has(id),
 });
-const {runEvidence,matchingWebRunRecord,matchingPendingManifest,checksum,verifyImage,inspectOrphanImageEvidence,persistImage,writeRunResult,attributableCandidates,recoverImage:recoverImageAction,syncRecoveredMetadata:syncRecoveredMetadataAction}=imageRecovery;
+const {runEvidence,matchingWebRunRecord,matchingPendingManifest,checksum,verifyImage,inspectOrphanImageEvidence,persistImage,writeRunResult,attributableCandidates,recoverImage:recoverImageAction,adoptRecoveredRun:adoptRecoveredRunAction,syncRecoveredMetadata:syncRecoveredMetadataAction}=imageRecovery;
 export {inspectOrphanImageEvidence};
 const preAcceptanceQuotaEvidence=(pending,manifest,failure=null,made=null)=>classifyPreAcceptanceQuotaEvidence({pending,manifest,failure,made,provider:WEB_IMAGE_PROVIDER,matchingWebRunRecord,runEvidence});
 const confirmedUnsentEvidence=(pending,manifest)=>classifyConfirmedUnsentEvidence({pending,manifest,provider:WEB_IMAGE_PROVIDER,matchingWebRunRecord,confirmedUnsentWebAudit});
@@ -827,6 +828,7 @@ export function retryMissingImage(p,target,{allowUnknownResult=false}={}){
   });
 }
 export function recoverImage(p){return recoverImageAction(p);}
+export function adoptRecoveredRun(p,options={}){return adoptRecoveredRunAction(p,options);}
 export function syncRecoveredImageMetadata(p,options={}){return syncRecoveredMetadataAction(p,options);}
 export function reviewImage(p,key){
   verifyApproval(p);if(p.pending)throw new Error('请先完成这次原图找回，再重新校对。');
