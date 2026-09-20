@@ -529,8 +529,8 @@ export function applyProjectStorageCleanup(projectRoot, {apply = false, report =
   return {...reportProjectStorage(root), applied: true, moved, downloadsTouched: false};
 }
 
-function imageFiles(root) {
-  return walkFiles(root).filter(file => IMAGE_EXT.has(path.extname(file).toLowerCase()));
+function imageFiles(root, options = {}) {
+  return walkFiles(root, options).filter(file => IMAGE_EXT.has(path.extname(file).toLowerCase()));
 }
 
 /** Read-only redundancy report for Downloads.  This function never mutates it. */
@@ -544,7 +544,12 @@ export function reportDownloadsRedundancy({downloadsDir, projectRoot} = {}) {
     if (/(?:^|\/)(?:素材|成品|候选成稿|原图|页面|成稿)(?:\/|$)/.test(relative) || relative.includes('.制作记录')) archived.set(hash, relative);
     if (relative.startsWith('v') && relative.includes('/参考/')) sources.set(hash, relative);
   }
-  const items = imageFiles(downloads).map(file => {
+  // Downloads can contain application-owned hidden data directories (for
+  // example game map tiles) that are not browser downloads. Keep this report
+  // focused on user-visible downloads while remaining strictly read-only.
+  const items = imageFiles(downloads, {
+    skip: (file, entry) => entry.isDirectory() && entry.name.startsWith('.'),
+  }).map(file => {
     let hash = null; try { hash = hashFile(file); } catch {}
     const relative = path.relative(downloads, file).split(path.sep).join('/');
     const archivedPath = hash && archived.get(hash), sourcePath = hash && sources.get(hash);

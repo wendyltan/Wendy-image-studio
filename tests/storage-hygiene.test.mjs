@@ -178,3 +178,13 @@ test('Downloads report may read a user-level symlink but still performs no write
   assert.equal(report.items.length, 1);
   assert.equal(fs.existsSync(path.join(version, '参考', 'ref.png')), true);
 });
+
+test('Downloads report ignores hidden application data directories', () => {
+  const {root} = fixture();
+  const downloads = fs.mkdtempSync(path.join(os.tmpdir(), 'wendi-downloads-hidden-'));
+  fs.writeFileSync(path.join(downloads, 'visible.png'), PNG);
+  fs.mkdirSync(path.join(downloads, '.minecraft', 'journeymap'), {recursive: true});
+  fs.writeFileSync(path.join(downloads, '.minecraft', 'journeymap', 'tile.png'), PNG);
+  const report = reportDownloadsRedundancy({downloadsDir: downloads, projectRoot: root});
+  assert.deepEqual(report.items.map(item => item.relativePath), ['visible.png']);
+});
