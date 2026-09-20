@@ -3,6 +3,7 @@ import path from 'node:path';
 import {readDownloadEvidence} from './web-download-evidence.mjs';
 import {IMAGE_OUTCOME,SavedArtifactQaUnavailableError,savedArtifactQaUnavailable,applySavedArtifactQaOutcome} from './image-lifecycle.mjs';
 import {createImagePreparation} from './image-preparation.mjs';
+import {cleanupRequestStaging} from './storage-hygiene.mjs';
 
 const USAGE_LIMIT_ERROR=/(?:you'?ve hit your usage limit|usage limit(?: has been)? reached|rate limit reached|额度(?:已用尽|不足|限制)|使用额度(?:已用尽|不足)|hit your limit)/i;
 
@@ -89,6 +90,18 @@ export function createImageWorkflow({
   });
   const {preparedCacheFor,prepareWebAttachments,executorLimitFor,protectQuota,writeRunRequest,previousConversation}=preparation;
 
+  function cleanupOwnStaging(project, dir, outcome, extra = {}) {
+    if (!project || !dir) return {status: 'not_attempted', removed: false};
+    try {
+      return cleanupRequestStaging({root: projectDir(project.id), stagingRoot: path.join(dir, '.staging')}, {outcome, ...extra});
+    } catch (error) {
+      // Cleanup must never turn a recoverable image result into a different
+      // workflow outcome. The run directory remains the durable evidence and
+      // the storage report will surface an owner-marked orphan for review.
+      return {status: 'error', removed: false, error: String(error.message || error)};
+    }
+  }
+
   async function generate(project, key, prompt, refnames, signal, prior = null, verify = true, qaKind = '原始分镜', attempt = 1, revisionMeta = {}) {
     checkpoint(signal);
     if (!process.env.WENDI_TEST_PLAN_FILE) {
@@ -115,7 +128,13 @@ export function createImageWorkflow({
     const prepStartedAt = new Date().toISOString();
     const cachePlan = preparedCacheFor(project, sourceFiles, prior);
     activity(project, `正在整理并压缩${cachePlan.missing.length}个上传素材${cachePlan.cacheHits ? `，复用${cachePlan.cacheHits}个已准备附件` : ''}…`);
-    const prepared = await prepareWebAttachments(project, dir, sourceFiles, cachePlan);
+    let prepared;
+    try {
+      prepared = await prepareWebAttachments(project, dir, sourceFiles, cachePlan);
+    } catch (error) {
+      cleanupOwnStaging(project, dir, 'pre_submission_failure', {submitted: false, submissionUncertain: false, reason: 'attachment_preparation_failed'});
+      throw error;
+    }
     const preparation = {startedAt: prepStartedAt, completedAt: new Date().toISOString(), durationMs: Math.max(0, Date.now() - Date.parse(prepStartedAt)), sourceCount: sourceFiles.length, preparedCount: prepared.length, reusedCount: cachePlan.cacheHits, preparedCountThisRun: cachePlan.missing.length};
     const inputFiles = prepared.map(item => item.file);
     checkpoint(signal);
@@ -172,6 +191,7 @@ export function createImageWorkflow({
     }
     activity(project, '正在核对网页执行结果并保存原图…');
     if (!process.env.WENDI_TEST_PLAN_FILE && !matchingPendingManifest(pending)) {
+      cleanupOwnStaging(project, dir, 'unknown', {submitted: webManifest?.submitted === true, submissionUncertain: webManifest?.submissionUncertain === true, reason: 'request_identity_mismatch'});
       finishTask(project, task, 'unknown_result', {errorCode: 'REQUEST_IDENTITY_MISMATCH'});
       saveProject(project);
       throw new Error('执行记录与本次图片请求不匹配，原文件已保留，不能自动采用或重试。');
@@ -197,6 +217,7 @@ export function createImageWorkflow({
       project.error = message;
       project.message = message;
       writeRunResult(dir, {schemaVersion: 2, provider: webImageProvider, taskId: task.id, requestId: webManifest.requestId, projectId: project.id, projectVersion: project.version, target: key, endedAt: new Date().toISOString(), outcome: 'quota_paused_before_acceptance', manifestState: webManifest.state, accepted: webManifest.accepted === true, submitted: webManifest.submitted === true, referenceCount: Number(webManifest.referenceCount) || 0, error: usageError});
+      cleanupOwnStaging(project, dir, 'pre_submission_failure', {submitted: false, submissionUncertain: false, reason: 'quota_before_acceptance'});
       saveProject(project);
       const error = new Error(message);
       error.code = 'USAGE_LIMIT_BEFORE_START';
@@ -214,18 +235,21 @@ export function createImageWorkflow({
         if (new Set(['no-output', 'browser-unavailable', 'browser-origin-permission-denied', 'browser-upload-unavailable']).has(known.kind) && known.kind !== 'no-output') task.providerInvocations = 0;
         project.pending = null;
         project.lastFailure = {...known, taskId: task.id};
+        cleanupOwnStaging(project, dir, 'pre_submission_failure', {submitted: webManifest?.submitted === true, submissionUncertain: webManifest?.submissionUncertain === true, reason: known.kind});
         finishTask(project, task, 'failed_no_output', {errorCode: known.kind});
         saveProject(project);
         const error = new Error(failureMessage(known));
         error.code = 'IMAGE_NO_OUTPUT';
         throw error;
       }
+      cleanupOwnStaging(project, dir, 'unknown', {submitted: webManifest?.submitted === true, submissionUncertain: webManifest?.submissionUncertain === true, reason: 'artifact_not_located'});
       finishTask(project, task, 'unknown_result', {errorCode: 'unknown_result'});
       throw failure || new Error('连接在保存结果前中断。当前节点已保存，请先检查已有原图，避免重复生成。');
     }
     file = persisted.file;
     pending.file = file;
     pending.integrity = persisted.integrity;
+    cleanupOwnStaging(project, dir, 'success', {submitted: webManifest?.submitted === true, submissionUncertain: false, reason: 'artifact_saved'});
     writeRunResult(dir, {schemaVersion: 2, provider: webImageProvider, projectId: project.id, projectVersion: project.version, taskId: task.id, target: key, requestId: webManifest?.requestId || null, attempt: task.attempt, endedAt: new Date().toISOString(), outcome: 'artifact_saved', artifact: path.relative(projectDir(project.id), file), integrity: persisted.integrity, downloadEvidence: readDownloadEvidence(dir), diagnostics: generationDiagnosticSummary(evidence)});
     const record = {key, file: path.relative(projectDir(project.id), file), provider: webImageProvider, conversationUrl: webManifest?.conversationUrl || conversationUrl || null, prompt, basePrompt, revisionDelta, revisionBase: revisionMeta.revisionBase || null, executor: {model: executor.model, reasoningEffort: executor.reasoningEffort, role: webImageExecutorRole}, refs: refnames, telemetry, integrity: persisted.integrity, downloadEvidence: readDownloadEvidence(dir), qa: verify ? {pass: null, status: 'pending', summary: '原图已保存，等待画面校对。', issues: [], repairPrompt: ''} : {pass: null, status: 'deferred', summary: '已完成本地文件检查；尚未执行画面质检。', issues: [], repairPrompt: ''}, at: new Date().toISOString()};
     jsonWrite(`${file}.json`, record);
@@ -300,7 +324,7 @@ export function createImageWorkflow({
       task.webState = webManifest?.state || null;
       task.webTimings = webManifest ? {createdAt: webManifest.createdAt || null, acceptedAt: webManifest.acceptedAt || null, readyAt: webManifest.readyAt || null, submittedAt: webManifest.submittedAt || null, downloadedAt: webManifest.downloadedAt || null, executorModel: webManifest.executorModel || executor.model || null, executorReasoningEffort: webManifest.executorReasoningEffort || executor.reasoningEffort, role: webManifest.role || executor.role, ...ownedTabLifecycle(webManifest)} : null;
       saveProject(project);
-      if (!matchingPendingManifest(pending)) { finishTask(project, task, 'unknown_result', {errorCode: 'REQUEST_IDENTITY_MISMATCH'}); throw new Error('续接记录与当前图片请求不匹配，原文件已保留，不能自动采用或重试。'); }
+      if (!matchingPendingManifest(pending)) { cleanupOwnStaging(project, pending.dir, 'unknown', {submitted: webManifest?.submitted === true, submissionUncertain: webManifest?.submissionUncertain === true, reason: 'resume_identity_mismatch'}); finishTask(project, task, 'unknown_result', {errorCode: 'REQUEST_IDENTITY_MISMATCH'}); throw new Error('续接记录与当前图片请求不匹配，原文件已保留，不能自动采用或重试。'); }
       if (preAcceptanceQuotaEvidence(pending, webManifest, failure, made)) {
         const usageError = String(failure?.message || webManifest?.error || quota.error || '已达到生图执行器额度限制。').slice(0, 1000);
         const message = quotaPauseMessage(pending.key, webManifest.requestId, pending.taskId, pending.projectVersion, usageError);
@@ -311,6 +335,7 @@ export function createImageWorkflow({
         project.status = 'paused';
         project.error = message;
         project.message = message;
+        cleanupOwnStaging(project, pending.dir, 'pre_submission_failure', {submitted: false, submissionUncertain: false, reason: 'quota_before_acceptance_resume'});
         saveProject(project);
         const error = new Error(message);
         error.code = 'USAGE_LIMIT_BEFORE_START';
@@ -327,18 +352,21 @@ export function createImageWorkflow({
           if (new Set(['no-output', 'browser-unavailable', 'browser-origin-permission-denied', 'browser-upload-unavailable']).has(known.kind) && known.kind !== 'no-output') task.providerInvocations = 0;
           project.pending = null;
           project.lastFailure = {...known, taskId: task.id};
+          cleanupOwnStaging(project, pending.dir, 'pre_submission_failure', {submitted: webManifest?.submitted === true, submissionUncertain: webManifest?.submissionUncertain === true, reason: known.kind});
           finishTask(project, task, 'failed_no_output', {errorCode: known.kind, webState: webManifest?.state || null});
           saveProject(project);
           const error = new Error(failureMessage(known));
           error.code = 'IMAGE_NO_OUTPUT';
           throw error;
         }
+        cleanupOwnStaging(project, pending.dir, 'unknown', {submitted: webManifest?.submitted === true, submissionUncertain: webManifest?.submissionUncertain === true, reason: 'artifact_not_located_after_resume'});
         finishTask(project, task, 'unknown_result', {errorCode: 'unknown_result', webState: webManifest?.state || null});
         throw failure || new Error('续接后在保存结果前中断。当前请求记录已保留，不会自动再次发送。');
       }
       const file = persisted.file;
       pending.file = file;
       pending.integrity = persisted.integrity;
+      cleanupOwnStaging(project, pending.dir, 'success', {submitted: webManifest?.submitted === true, submissionUncertain: false, reason: 'artifact_saved_after_resume'});
       writeRunResult(pending.dir, {schemaVersion: 2, provider: webImageProvider, taskId: task.id, requestId: webManifest.requestId, projectId: project.id, projectVersion: project.version, target: pending.key, endedAt: new Date().toISOString(), outcome: 'artifact_saved_after_same_request_resume', artifact: path.relative(projectDir(project.id), file), integrity: persisted.integrity, downloadEvidence: readDownloadEvidence(pending.dir), diagnostics: generationDiagnosticSummary(evidence)});
       const imageRecord = {key: pending.key, file: path.relative(projectDir(project.id), file), provider: webImageProvider, conversationUrl: webManifest.conversationUrl || null, prompt: pending.prompt, basePrompt: pending.basePrompt || pending.prompt, revisionDelta: pending.revisionDelta || null, revisionBase: pending.revisionBase || null, executor, refs: pending.refs, telemetry: pending.telemetry, integrity: persisted.integrity, downloadEvidence: readDownloadEvidence(pending.dir), qa: {pass: null, status: 'pending', summary: '原图已保存，等待画面校对。', issues: [], repairPrompt: ''}, at: new Date().toISOString()};
       jsonWrite(`${file}.json`, imageRecord);

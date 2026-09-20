@@ -7,6 +7,7 @@ import {connectionStatus,appServerSnapshot,normalizeRateLimits} from './bridge.m
 import {WEB_IMAGE_PROVIDER,readWebManifest,webWorkerStatus} from './chatgpt-web-provider.mjs';
 import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,decidePanel,rejectPanel,resume,reviseImage,repairPageLayout,unifyPageLayouts,recoverImage,reviewImage,retryMissingImage,imageRetryState,accept,recover,projectDir,syncRunningProject,refreshQuotaPauses} from './engine.mjs';
 import {CATEGORIES,listDocuments,listAssets,discoverArchiveStories,archiveStory,stageUpload,readCandidate,inspectStagedCandidate,saveManualAsset,searchAssets,analyzeAsset,saveAssetProposal,applyAssetProposal,saveDocument,suggestDocument,deleteProjectFolder,deleteArchiveStory} from './library.mjs';
+import {applyProjectStorageCleanup,reportDownloadsRedundancy,reportProjectStorage} from './storage-hygiene.mjs';
 const PORT=Number(process.env.PORT||4318);const HOST='127.0.0.1';
 const INSTANCE_ID=`${process.pid}-${Date.now()}`;let restartRequested=false;
 const front=path.join(APP,'dist/client');
@@ -211,6 +212,18 @@ const server=http.createServer(async(req,res)=>{
     if(url.pathname==='/api/assets/apply'&&req.method==='POST'){const b=await body(req);const result=applyAssetProposal({proposalId:b.proposalId,applyWorld:b.applyWorld===true,applyWorkflow:b.applyWorkflow===true});return send(res,{...result,asset:result.asset?publicAsset(result.asset):null,assets:publicAssets()});}
     if(url.pathname==='/api/documents/suggest'&&req.method==='POST'){const b=await body(req),selected=chooseModel(await account(),b.model,b.reasoningEffort);return send(res,await suggestDocument({docPath:b.docPath,note:b.note,dir:path.join(APP,'.文档提案',`${Date.now()}`),...selected}));}
     if(url.pathname==='/api/documents/save'&&req.method==='POST'){const result=saveDocument(await body(req));return send(res,{...result,documents:listDocuments()});}
+    if(url.pathname==='/api/storage/report'&&req.method==='GET'){
+      const projectId=String(url.searchParams.get('projectId')||''),p=readProject(projectId);
+      return send(res,{storage:reportProjectStorage(projectDir(p.id))});
+    }
+    if(url.pathname==='/api/storage/cleanup'&&req.method==='POST'){
+      const b=await body(req),p=readProject(b.projectId),storage=applyProjectStorageCleanup(projectDir(p.id),{apply:b.apply===true,report:b.report||null});
+      return send(res,{storage});
+    }
+    if(url.pathname==='/api/storage/downloads-report'&&req.method==='GET'){
+      const projectId=String(url.searchParams.get('projectId')||''),p=readProject(projectId),downloadsDir=process.env.WENDI_DOWNLOADS_DIR||path.join(process.env.HOME||'/Users/wuwendi','Downloads');
+      return send(res,{downloads:reportDownloadsRedundancy({downloadsDir,projectRoot:projectDir(p.id)})});
+    }
     const archiveDelete=/^\/api\/archive\/([A-Za-z0-9_-]+)\/delete$/.exec(url.pathname);if(archiveDelete&&req.method==='POST'){const b=await body(req);deleteArchiveStory(archiveDelete[1],b.confirmTitle);return send(res,{ok:true,archiveStories:discoverArchiveStories()});}
     const match=/^\/api\/projects\/([a-f0-9-]{36})(?:\/([a-z-]+))?$/.exec(url.pathname);
     if(match){
