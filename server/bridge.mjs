@@ -139,7 +139,7 @@ function compactResponseFile(file){
   return compact;
 }
 
-function browserToolCallInfo(event,{dir,cleanupCallUsed=false}={}){
+function browserToolCallInfo(event,{dir,cleanupCallUsed=false,runIdOverride=null}={}){
   const item=event?.item&&typeof event.item==='object'?event.item:event&&typeof event==='object'?event:{};
   if(item.type!=='mcp_tool_call')return null;
   const namespace=[item.server,item.serverName,event?.server,event?.serverName,item.tool,item.name,event?.tool].filter(Boolean).join(' ');
@@ -161,7 +161,7 @@ function browserToolCallInfo(event,{dir,cleanupCallUsed=false}={}){
   const fixedCleanup=source.includes(BROWSER_CLEANUP_MARKER)&&closeLike&&/(?:--state[^\n]{0,120}closing|ownedTabStage[^\n]*closing|cleanup-status|\bfinally\b)/i.test(source);
   let lease=null;
   try{lease=dir?readOwnedTabLease(dir):null;}catch{}
-  const runId=path.basename(path.resolve(String(dir||'')));
+  const runId=String(runIdOverride||path.basename(path.resolve(String(dir||''))));
   const leaseRunMatches=Boolean(lease?.runId)&&lease.runId===runId;
   const sourceRunId=source.match(/--run-id\s+(?:"([^"]+)"|'([^']+)'|([^\s;,)]+))/i)?.slice(1).find(Boolean)||source.match(/--run-id["']\s*,\s*["']([^"']+)/i)?.[1]||null;
   const sourceRunMatches=Boolean(sourceRunId&&sourceRunId===runId);
@@ -190,7 +190,7 @@ function manifestHasSubmissionIntent(dir){
 
 function writeBrowserToolBudget(dir,value={}){
   if(!dir||!value)return null;
-  const record={schemaVersion:2,errorCode:'BROWSER_TOOL_BUDGET_EXCEEDED',limit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,businessLimit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,cleanupLimit:BROWSER_TOOL_CLEANUP_CALL_BUDGET,stageBudgets:BROWSER_TOOL_STAGE_BUDGETS,observed:Number(value.observed)||0,observedBusiness:Number(value.observedBusiness)||0,observedCleanup:Number(value.observedCleanup)||0,stageCounts:value.stageCounts&&typeof value.stageCounts==='object'?{...value.stageCounts}:{},budgetKind:value.budgetKind||'business',stageName:value.stageName||null,stageLimit:Number(value.stageLimit)||null,stageCount:Number(value.stageCount)||null,submissionIntentObserved:value.submissionIntentObserved===true,stage:value.submissionIntentObserved===true?'post_submission_intent':'pre_submission_intent',terminationRequestedAt:new Date().toISOString()};
+  const record={schemaVersion:2,errorCode:'BROWSER_TOOL_BUDGET_EXCEEDED',limit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,businessLimit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,cleanupLimit:BROWSER_TOOL_CLEANUP_CALL_BUDGET,stageBudgets:BROWSER_TOOL_STAGE_BUDGETS,observed:Number(value.observed)||0,observedBusiness:Number(value.observedBusiness)||0,observedCleanup:Number(value.observedCleanup)||0,stageCounts:value.stageCounts&&typeof value.stageCounts==='object'?{...value.stageCounts}:{},budgetKind:value.budgetKind||'business',stageName:value.stageName||null,stageLimit:Number(value.stageLimit)||null,stageCount:Number(value.stageCount)||null,submissionIntentObserved:value.submissionIntentObserved===true,stage:value.submissionIntentObserved===true?'post_submission_intent':'pre_submission_intent',terminationDeferred:value.terminationDeferred===true,terminationRequestedAt:new Date().toISOString()};
   try{
     const file=path.join(dir,BROWSER_TOOL_BUDGET_FILE),temp=`${file}.tmp-${crypto.randomUUID()}`;
     fs.writeFileSync(temp,JSON.stringify(record,null,2)+'\n',{mode:0o600});fs.renameSync(temp,file);return record;
@@ -211,7 +211,14 @@ export function browserToolStage(value){
   // or an actual send-button click is a submit call.
   const intentMarker=/(?:submission[-_ ]?intent|submission_intent_recorded)/i.test(source);
   const enterSubmit=/(?:pressKey|press)\([^)]*(?:Enter|Return)\)/i.test(source);
-  const sendButtonClick=/(?:\b(?:send|submit|sendButton|submitButton|composerSubmit)\b\s*\.\s*(?:click|press)\s*\(|(?:getByRole|locator)\([^)]*(?:发送提示词|composer-submit-button)[^)]*\)\s*\.\s*(?:click|press)\s*\()/i.test(source);
+  // Do not treat an arbitrary locator click as sending.  Upload fallback
+  // necessarily clicks the plus button and the menu item before it receives a
+  // filechooser.  Only a named send control (or an explicitly named submit
+  // handle) is a submission action.
+  const namedSendHandle=/(?:\b(?:send|submit|sendButton|submitButton|composerSubmit)\b\s*\.\s*(?:click|press)\s*\()/i.test(source);
+  const roleSendClick=/getByRole\(\s*['"]button['"][^)]*(?:发送提示词|composer-submit-button)[^)]*\)\s*\.\s*(?:click|press)\s*\(/i.test(source);
+  const locatorSendClick=/locator\(\s*['"]#(?:composer-submit-button|send-button)['"]\s*\)\s*\.\s*(?:click|press)\s*\(/i.test(source);
+  const sendButtonClick=namedSendHandle||roleSendClick||locatorSendClick;
   if(intentMarker||enterSubmit||sendButtonClick)return 'submit';
   if(/pageAssets|\.bundle\(|\.list\(\)|download-evidence|下载原图|生成结果|停止生成|等待生成/i.test(source))return 'wait_download';
   if(/\bupload\b|setFiles|filechooser|从电脑上传|上传文件|上传照片|attachment(?:s|Signals|Expected|Observed|Pending)|上传中|等待文件上传|remotePrompt|填入冻结|\.fill\(|\.paste\(|prompt-textarea|textbox/i.test(source))return 'upload';
@@ -444,11 +451,11 @@ export function rateLimitSnapshot(timeoutMs=12000,{force=false}={}){
   });
   return rateLimitCache.inFlight.finally(()=>{rateLimitCache.inFlight=null;});
 }
-export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},image=false,browserMode=null,writableDirs=[],model=null,reasoningEffort='low',timeoutMs=900000,codexBin=null,role='creative'}) {
+export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},image=false,browserMode=null,writableDirs=[],model=null,reasoningEffort='low',timeoutMs=900000,codexBin=null,role='creative',leaseDir=null,runIdOverride=null}) {
   const bin=codexBin||findCodex();if(!bin)throw new Error('请先打开 Codex 并登录。');
   fs.mkdirSync(dir,{recursive:true});
   const resultPath=path.join(dir,'response.txt');
-  const runId=path.basename(dir),startedAt=new Date().toISOString();
+  const runId=String(runIdOverride||path.basename(path.resolve(dir))),leaseRoot=path.resolve(leaseDir||dir),startedAt=new Date().toISOString();
   const executionFile=path.join(dir,'execution.json');
   const execution={schemaVersion:1,role,model:model||null,reasoningEffort,browserMode:browserMode||null,image:Boolean(image),runId,startedAt};
   const saveExecution=patch=>{try{fs.writeFileSync(executionFile,JSON.stringify({...execution,...patch},null,2),{mode:0o600});}catch{}};
@@ -497,12 +504,15 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
       // unconfirmed/orphaned lease instead of claiming that the tab vanished.
       // Runs without a lease (creative/fixture executions) are untouched.
       try{
-        const lease=readOwnedTabLease(dir,{runId});
+        const lease=readOwnedTabLease(leaseRoot,{runId});
         if(lease){
           const browserFailure=String(err?.message||error||'');
           const kernelReset=/kernel\s*reset|globalThis[^\n]*(?:lost|undefined)|owned.?tab[^\n]*(?:lost|handle)/i.test(browserFailure);
-          const finalized=finalizeOwnedTabLease({dir,runId,requestId:lease.requestId,reason:err?'executor-exit':'executor-finished',kernelReset});
-          if(finalized)syncOwnedTabLeaseToManifest({dir,manifestFile:path.join(dir,'web-generation.json'),lease:finalized});
+          const finalized=finalizeOwnedTabLease({dir:leaseRoot,runId,requestId:lease.requestId,reason:err?'executor-exit':'executor-finished',kernelReset});
+          if(finalized){
+            const manifestFile=path.join(leaseRoot,'web-generation.json');
+            syncOwnedTabLeaseToManifest({dir:leaseRoot,manifestFile,lease:finalized});
+          }
         }
       }catch{}
       const runEvidence=evidence(responseText,exitCode);
@@ -513,7 +523,7 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
       }
       resolve(result);
     };
-    const registerBrowserToolCall=(callKey,kind,event,stageHint=null)=>{
+    const registerBrowserToolCall=(callKey,kind,event,stageHint=null,{deferTermination=false}={})=>{
       if(browserToolCallIds.has(callKey))return;
       browserToolCallIds.add(callKey);browserToolCalls+=1;
       if(kind==='cleanup')browserCleanupCalls+=1;else {
@@ -521,17 +531,24 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
         const stage=stageHint||browserToolBusinessStage(event?.item?.arguments?.code||event?.item?.arguments?.command||'');
         browserBusinessStageCounts[stage]=(browserBusinessStageCounts[stage]||0)+1;
       }
-      submissionIntentObserved=submissionIntentObserved||eventContainsSubmissionIntent(event)||manifestHasSubmissionIntent(dir);
+      submissionIntentObserved=submissionIntentObserved||eventContainsSubmissionIntent(event)||manifestHasSubmissionIntent(leaseRoot);
       const stage=stageHint||browserToolBusinessStage(event?.item?.arguments?.code||event?.item?.arguments?.command||'');
       const stageCount=browserBusinessStageCounts[stage]||0;
       const stageLimit=BROWSER_TOOL_STAGE_BUDGETS[stage]||BROWSER_TOOL_BUSINESS_CALL_BUDGET;
       if(kind!=='cleanup'&&(browserBusinessCalls>BROWSER_TOOL_BUSINESS_CALL_BUDGET||stageCount>stageLimit)&&!budgetFailure){
-        const record=writeBrowserToolBudget(dir,{observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,budgetKind:'business',stageName:stage,stageLimit,stageCount,stageCounts:browserBusinessStageCounts,submissionIntentObserved});
+        const terminationDeferred=Boolean(deferTermination&&stage==='submit'&&submissionIntentObserved);
+        const record=writeBrowserToolBudget(dir,{observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,budgetKind:'business',stageName:stage,stageLimit,stageCount,stageCounts:browserBusinessStageCounts,submissionIntentObserved,terminationDeferred});
         const reason=stageCount>stageLimit?`${stage} 阶段已达到 ${stageLimit} 次上限（第 ${stageCount} 次）`:`浏览器业务 CUA 调用已达到 ${BROWSER_TOOL_BUSINESS_CALL_BUDGET} 次总上限`;
-        budgetFailure={code:'BROWSER_TOOL_BUDGET_EXCEEDED',observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,limit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,stageName:stage,stageLimit,stageCount,stageCounts:{...browserBusinessStageCounts},submissionIntentObserved,message:`BROWSER_TOOL_BUDGET_EXCEEDED: ${reason}；本次业务调用已被父进程终止。`};
+        budgetFailure={code:'BROWSER_TOOL_BUDGET_EXCEEDED',observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,limit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,stageName:stage,stageLimit,stageCount,stageCounts:{...browserBusinessStageCounts},submissionIntentObserved,terminationDeferred,message:terminationDeferred?`BROWSER_TOOL_BUDGET_EXCEEDED: ${reason}；发送调用已经开始，保留未知结果保护，不异步终止。`:`BROWSER_TOOL_BUDGET_EXCEEDED: ${reason}；本次业务调用已被父进程终止。`};
         const budgetEvent={type:'browser_tool_budget_exceeded',errorCode:budgetFailure.code,observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,limit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,cleanupLimit:BROWSER_TOOL_CLEANUP_CALL_BUDGET,submissionIntentObserved,stage:record?.stage||(budgetFailure.submissionIntentObserved?'post_submission_intent':'pre_submission_intent')};
         budgetEvent.stageName=stage;budgetEvent.stageLimit=stageLimit;budgetEvent.stageCount=stageCount;budgetEvent.stageCounts={...browserBusinessStageCounts};
-        capturedEvents.push(budgetEvent);log.write(boundedEventLine(budgetEvent)+'\n');stop();
+        budgetEvent.terminationDeferred=terminationDeferred;
+        capturedEvents.push(budgetEvent);log.write(boundedEventLine(budgetEvent)+'\n');
+        // A submit item.started means the side effect may already be in
+        // flight. Killing it asynchronously can turn a real send into an
+        // unverifiable result. Preserve the conservative unknown-result path
+        // and let the already-started call reach its own completion instead.
+        if(!terminationDeferred)stop();
       }
     };
     child.stdout.on('data',c=>{
@@ -545,8 +562,8 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
           // call.  Observe it from command/helper events as well as from the
           // next CUA call, so a budget failure immediately after the helper
           // still gets the correct post-intent safety classification.
-          submissionIntentObserved=submissionIntentObserved||eventContainsSubmissionIntent(e)||manifestHasSubmissionIntent(dir);
-          const browserCall=browserToolCallInfo(e,{dir,cleanupCallUsed:browserCleanupCalls>=BROWSER_TOOL_CLEANUP_CALL_BUDGET});
+          submissionIntentObserved=submissionIntentObserved||eventContainsSubmissionIntent(e)||manifestHasSubmissionIntent(leaseRoot);
+          const browserCall=browserToolCallInfo(e,{dir:leaseRoot,runIdOverride:runId,cleanupCallUsed:browserCleanupCalls>=BROWSER_TOOL_CLEANUP_CALL_BUDGET});
           if(browserCall){
             let callKey=browserCall.id;
             if(!callKey){
@@ -557,12 +574,12 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
             if(browserCall.phase==='started'&&browserCall.kind==='deferred_cleanup')deferredCleanupCallIds.add(callKey);
             else if(deferredCleanupCallIds.has(callKey)){
               deferredCleanupCallIds.delete(callKey);
-              const completed=browserToolCallInfo(e,{dir,cleanupCallUsed:browserCleanupCalls>=BROWSER_TOOL_CLEANUP_CALL_BUDGET});
-              registerBrowserToolCall(callKey,completed?.kind==='cleanup'?'cleanup':'business',e,completed?.stage||browserCall.stage);
+              const completed=browserToolCallInfo(e,{dir:leaseRoot,runIdOverride:runId,cleanupCallUsed:browserCleanupCalls>=BROWSER_TOOL_CLEANUP_CALL_BUDGET});
+              registerBrowserToolCall(callKey,completed?.kind==='cleanup'?'cleanup':'business',e,completed?.stage||browserCall.stage,{deferTermination:browserCall.phase==='started'});
             } else if(browserCall.kind==='deferred_cleanup'){
-              const completed=browserToolCallInfo(e,{dir,cleanupCallUsed:browserCleanupCalls>=BROWSER_TOOL_CLEANUP_CALL_BUDGET});
-              registerBrowserToolCall(callKey,completed?.kind==='cleanup'?'cleanup':'business',e,completed?.stage||browserCall.stage);
-            } else registerBrowserToolCall(callKey,browserCall.kind,e,browserCall.stage);
+              const completed=browserToolCallInfo(e,{dir:leaseRoot,runIdOverride:runId,cleanupCallUsed:browserCleanupCalls>=BROWSER_TOOL_CLEANUP_CALL_BUDGET});
+              registerBrowserToolCall(callKey,completed?.kind==='cleanup'?'cleanup':'business',e,completed?.stage||browserCall.stage,{deferTermination:browserCall.phase==='started'});
+            } else registerBrowserToolCall(callKey,browserCall.kind,e,browserCall.stage,{deferTermination:browserCall.phase==='started'});
           }
           const compact=boundedEvent(e);
           capturedEvents.push(compact);

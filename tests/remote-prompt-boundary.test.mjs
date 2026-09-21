@@ -44,6 +44,24 @@ test('executor prompt contains only the remote payload between composer delimite
   assert.doesNotMatch(instruction,/fs\.readFileSync|require\(|worker-request\.json|prompt\.txt/);
 });
 
+test('executor prompt keeps local helper commands outside CUA and uses no unavailable Node APIs',()=>{
+  const instruction=chatGptWebImagePrompt({
+    outputFile:'/tmp/result.png',
+    manifestFile:'/tmp/web-generation.json',
+    prompt:remotePrompt,
+    remotePrompt,
+    remotePromptLength:1329,
+    remotePromptSha256:expectedSha,
+    requestId:'11111111-1111-4111-8111-111111111111',
+    runId:'fixture-run',
+    referenceFiles:['/tmp/01.png'],
+  });
+  assert.doesNotMatch(instruction,/nodeRepl\.exec|require\s*\(/);
+  assert.match(instruction,/manifest\/lease helper.*独立的 command_execution/);
+  assert.match(instruction,/不得在 CUA js 脚本中拼接、执行或模拟本地 node 命令/);
+  assert.match(instruction,/文档支持的精简结果写出接口/);
+});
+
 test('menu fallback waits for the chooser only after clicking 从电脑上传',()=>{
   const instruction=chatGptWebImagePrompt({
     outputFile:'/tmp/result.png',

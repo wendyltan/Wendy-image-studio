@@ -31,7 +31,7 @@ export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,remoteProm
     : '新建一个 ChatGPT 对话；创建后把实际会话 URL 记录到执行清单。';
   const instruction = `你是温蒂创作室的后台网页生图执行器。用户已经在温蒂创作室网页执行带防重复标识的确认动作，明确授权本次单张生图和把下列参考图片上传到 chatgpt.com。授权、身份和附件台账已由本地 provider 冻结并验证；它已经满足发送前确认，不得再次询问；上传、发送、等待和下载必须在当前同一个回合完成。
 
-你只负责机械执行已经冻结的本次请求，不负责创意规划、质量判断或任务恢复。禁止读取仓库、memory、历史任务、其他作品、其他会话或任何未列出的文件；禁止自行调研、搜索或改写提示词。浏览器执行脚本不得使用 Node 模块加载器或自行读取本地控制文件；provider 已直接提供本次唯一的冻结附件路径和 remotePrompt，立即按下列步骤执行。不要在 accepted 前审查项目、扫描目录或调用额外工具。
+你只负责机械执行已经冻结的本次请求，不负责创意规划、质量判断或任务恢复。禁止读取仓库、memory、历史任务、其他作品、其他会话或任何未列出的文件；禁止自行调研、搜索或改写提示词。浏览器执行脚本不得使用 Node 模块加载器或自行读取本地控制文件；provider 已直接提供本次唯一的冻结附件路径和 remotePrompt，立即按下列步骤执行。所有 manifest/lease helper 只能作为独立的 command_execution 调用，由父流程提供并校验；不得在 CUA js 脚本中拼接、执行或模拟本地 node 命令。CUA js 只允许调用本次返回的 cua/tab/pageAssets 能力和文档支持的精简结果写出接口。不要在 accepted 前审查项目、扫描目录或调用额外工具。
 
 强制执行边界：
 - 禁止调用 image_gen 或任何图片生成 API。

@@ -421,7 +421,7 @@ export function confirmedUnsentWebAudit({dir,expected={}}={}){
  * is represented by the durable cleanup_pending/orphaned lease and can be
  * retried after unlock.
  */
-export async function recoverOwnedTabCleanup({codexBin,dir,signal,timeoutMs=120000,model=null,reasoningEffort=WEB_IMAGE_EXECUTOR_EFFORT,role='browser-cleanup'} = {}) {
+export async function recoverOwnedTabCleanup({codexBin,dir,signal,timeoutMs=120000,model=null,reasoningEffort=WEB_IMAGE_EXECUTOR_EFFORT,role='browser-cleanup',runCodexImpl=runCodex} = {}) {
   if (signal?.aborted) throw new Error('已暂停，cleanup-only 尚未启动。');
   const manifestFile=path.join(dir,'web-generation.json'),manifest=readWebManifest(manifestFile),runId=path.basename(path.resolve(dir));
   const requestId=manifest?.requestId;
@@ -439,17 +439,48 @@ export async function recoverOwnedTabCleanup({codexBin,dir,signal,timeoutMs=1200
   const prepared=prepareOwnedTabCleanup({dir,runId,requestId,ownedTabId:lease.ownedTabId});
   syncOwnedTabLeaseToManifest({dir,manifestFile,lease:prepared});
   const prompt=ownedTabCleanupPrompt({manifestFile,runId,requestId,ownedTabId:prepared.ownedTabId});
+  const cleanupDir=path.join(dir,'cleanup-only',`${Date.now()}-${crypto.randomUUID().slice(0,8)}`);
+  fs.mkdirSync(cleanupDir,{recursive:true});
   let failure=null;
   try {
-    await runCodex({codexBin:codexBin||findCodex(),dir,prompt,signal,browserMode:'chrome',image:false,timeoutMs,model,reasoningEffort,role});
+    await runCodexImpl({codexBin:codexBin||findCodex(),dir:cleanupDir,leaseDir:dir,runIdOverride:runId,prompt,signal,browserMode:'chrome',image:false,timeoutMs,model,reasoningEffort,role});
   } catch (error) { failure=error; }
   const finalLease=readOwnedTabLease(dir,{runId,requestId});
   if (finalLease) syncOwnedTabLeaseToManifest({dir,manifestFile,lease:finalLease});
-  if (finalLease?.state==='closed_verified') return {ok:true,lease:finalLease};
+  if (finalLease?.state==='closed_verified') return {ok:true,lease:finalLease,cleanupDir};
   const error=failure||new Error(`cleanup-only 未能确认关闭：${finalLease?.cleanupStatus||'not_observed'}。`);
   error.code=error.code||'OWNED_TAB_CLEANUP_UNCONFIRMED';
   error.lease=finalLease;
+  error.cleanupDir=cleanupDir;
   throw error;
+}
+
+/**
+ * Cleanup is deliberately best-effort and identity-bound.  It never creates
+ * another image request; a locked/unavailable browser leaves the durable
+ * orphaned/cleanup_pending marker for a later explicit cleanup-only attempt.
+ */
+export async function autoRecoverOwnedTabCleanup({codexBin,dir,signal,timeoutMs,model,reasoningEffort,role='browser-cleanup',runCodexImpl=runCodex} = {}) {
+  const manifestFile=path.join(dir,'web-generation.json'),runId=path.basename(path.resolve(dir));
+  const manifest=readWebManifest(manifestFile),requestId=manifest?.requestId;
+  // Read the persisted lease by run id first.  If the manifest was tampered
+  // with or belongs to another request, stop without touching any tab; trying
+  // to normalize it against the wrong request id would itself throw and mask
+  // the original worker result.
+  let lease=null;
+  try { lease=readOwnedTabLease(dir,{runId}); } catch { return {attempted:false,identityMismatch:true,lease:null}; }
+  if (!lease || !requestId || lease.requestId!==requestId || lease.state!=='orphaned' || !lease.ownedTabId) return {attempted:false,identityMismatch:Boolean(lease&&requestId&&lease.requestId!==requestId),lease:lease||null};
+  const startedAt=new Date().toISOString();
+  const safeReadLease=()=>{try{return readOwnedTabLease(dir,{runId,requestId});}catch{return null;}};
+  let outcome;
+  try {
+    const result=await recoverOwnedTabCleanup({codexBin,dir,signal,timeoutMs,model,reasoningEffort,role,runCodexImpl});
+    outcome={ok:true,cleanupDir:result.cleanupDir||null,lease:result.lease||safeReadLease()};
+  } catch (error) {
+    outcome={ok:false,error:String(error?.message||error).slice(0,1000),cleanupDir:error?.cleanupDir||null,lease:error?.lease||safeReadLease()};
+  }
+  writeJson(path.join(dir,'cleanup-recovery.json'),{schemaVersion:1,runId,requestId,ownedTabId:lease.ownedTabId,startedAt,completedAt:new Date().toISOString(),...outcome});
+  return {attempted:true,...outcome};
 }
 
 
@@ -493,6 +524,10 @@ export async function dispatchChatGptWebJob({codexBin,dir,outputFile,prompt,refe
   reserveOwnedTabCreate({dir,runId,requestId,sessionName});
   let result,failure;
   try{result=await runCodex({codexBin,dir,image:true,browserMode:'chrome',signal,timeoutMs,model,reasoningEffort,role,writableDirs:[path.dirname(path.resolve(outputFile))],prompt:executorPrompt});}catch(error){failure=error;}
+  // The business executor cannot call CUA close from Node.  Once it has
+  // durably finalized an orphaned exact handle, spend one independent
+  // cleanup-only invocation before projecting the image result.
+  await autoRecoverOwnedTabCleanup({codexBin,dir,signal,timeoutMs:Math.min(timeoutMs,120000),model,reasoningEffort,role:'browser-cleanup'});
   const lease=readOwnedTabLease(dir,{runId,requestId});
   if(lease)syncOwnedTabLeaseToManifest({dir,manifestFile,lease});
   const downloadEvidence=downloadEvidenceFromRun({dir,result,manifestFile,outputFile,requestId});
@@ -549,6 +584,7 @@ export async function resumeChatGptWebJob({codexBin,dir,signal,timeoutMs=900000,
   resetOwnedTabLeaseForResume({dir,runId,requestId,sessionName});
   reserveOwnedTabCreate({dir,runId,requestId,sessionName});
   try{result=await runCodex({codexBin,dir,image:true,browserMode:'chrome',signal,timeoutMs,model:model||worker.executorModel||null,reasoningEffort:reasoningEffort||worker.executorReasoningEffort||WEB_IMAGE_EXECUTOR_EFFORT,role:role||worker.role||WEB_IMAGE_EXECUTOR_ROLE,writableDirs:[path.dirname(outputFile)],prompt:nextInstruction});}catch(error){failure=error;}
+  await autoRecoverOwnedTabCleanup({codexBin,dir,signal,timeoutMs:Math.min(timeoutMs,120000),model:model||worker.executorModel||null,reasoningEffort:reasoningEffort||worker.executorReasoningEffort||WEB_IMAGE_EXECUTOR_EFFORT,role:'browser-cleanup'});
   const lease=readOwnedTabLease(dir,{runId,requestId});
   if(lease)syncOwnedTabLeaseToManifest({dir,manifestFile,lease});
   const downloadEvidence=downloadEvidenceFromRun({dir,result,manifestFile,outputFile,requestId});
