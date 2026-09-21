@@ -89,6 +89,22 @@ test('accept refuses a legacy titled page and accepts a re-composed current page
   assert(fs.existsSync(projectPage));
   assert.equal(fs.existsSync(path.join(E.projectDir(project.id),'v1','成品','01.png')),false);
   project.pages[0].compositionVersion=E.COMPOSITION_VERSION;
+  const pageBytes=fs.statSync(projectPage).size,pageSha=crypto.createHash('sha256').update(fs.readFileSync(projectPage)).digest('hex');
+  project.pages[0].integrity={sha256:pageSha,sizeBytes:pageBytes};
+  project.artifacts.find(item=>item.id==='page:1').integrity={sha256:pageSha,sizeBytes:pageBytes};
+  fs.appendFileSync(projectPage,'tamper');
+  await assert.rejects(E.accept(project,W.CHECKS),/完整性/);
+  fs.copyFileSync(pageFile,projectPage);
   await E.accept(project,W.CHECKS);
   assert.equal(project.accepted,true);assert(fs.existsSync(path.join(E.projectDir(project.id),'v1','成品','01.png')));
+  assert.equal(project.bundleIntegrity.entries.length,2);
+  assert.equal(project.artifacts.find(item=>item.id==='export:bundle')?.integrity.sha256,project.bundleIntegrity.sha256);
+});
+
+test('zip output reports and verifies each bundle entry',async()=>{
+  const first=path.join(temp,'bundle-a.png'),second=path.join(temp,'bundle-b.md'),output=path.join(temp,'bundle.zip'),spec=path.join(temp,'bundle-spec.json');
+  fs.writeFileSync(first,'one');fs.writeFileSync(second,'two');W.jsonWrite(spec,{output,files:[first,second]});
+  const result=JSON.parse(await B.pythonRun(['zip',spec]));
+  assert.equal(result.output,output);assert.equal(result.entries.length,2);assert.deepEqual(result.entries.map(entry=>entry.name),['bundle-a.png','bundle-b.md']);
+  assert.equal(result.bytes,fs.statSync(output).size);assert.equal(result.sha256,crypto.createHash('sha256').update(fs.readFileSync(output)).digest('hex'));
 });

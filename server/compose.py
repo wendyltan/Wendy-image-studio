@@ -1,5 +1,5 @@
 """Deterministic Chinese lettering, screen compositing, and page export."""
-import sys, json, math, zipfile
+import sys, json, math, zipfile, hashlib
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter
 FONT='/System/Library/Fonts/STHeiti Light.ttc'
@@ -142,8 +142,20 @@ def main():
     elif mode=='prepare-web':print(json.dumps(prepare_web(data),ensure_ascii=False))
     elif mode=='screen':print(json.dumps(screen(data),ensure_ascii=False))
     elif mode=='zip':
+        files=[Path(p) for p in data['files']]
+        names=[p.name for p in files]
+        if len(names)!=len(set(names)):raise ValueError('打包文件名重复，拒绝生成不明确的成品包。')
         with zipfile.ZipFile(data['output'],'w',zipfile.ZIP_DEFLATED) as z:
-            for p in data['files']:z.write(p,Path(p).name)
-        with zipfile.ZipFile(data['output']) as z:assert z.testzip() is None
-        print(data['output'])
+            for p in files:
+                if not p.is_file() or p.is_symlink():raise ValueError(f'打包源文件无效：{p}')
+                z.write(p,p.name)
+        with zipfile.ZipFile(data['output']) as z:
+            if z.testzip() is not None:raise ValueError('成品包校验失败，存在损坏条目。')
+            entries=[]
+            for p in files:
+                payload=z.read(p.name);source=p.read_bytes();
+                if payload!=source:raise ValueError(f'成品包条目校验失败：{p.name}')
+                entries.append({'name':p.name,'bytes':len(payload),'sha256':hashlib.sha256(payload).hexdigest()})
+        output=Path(data['output']);raw=output.read_bytes()
+        print(json.dumps({'output':str(output),'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest(),'entries':entries},ensure_ascii=False))
 if __name__=='__main__':main()

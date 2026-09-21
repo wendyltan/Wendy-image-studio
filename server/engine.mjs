@@ -187,6 +187,12 @@ export function refreshQuotaPauses(remaining){
 }
 function runDir(p,label){return path.join(projectDir(p.id),'.制作记录',`${Date.now()}-${crypto.randomUUID().slice(0,8)}-${label}`);}
 function recordArtifact(p,id,kind,file,dependsOn=[],extra={}){p.artifacts=Array.isArray(p.artifacts)?p.artifacts:[];p.artifacts=p.artifacts.filter(x=>x.id!==id);p.artifacts.push({id,kind,file,dependsOn,valid:true,at:new Date().toISOString(),...extra});p.artifacts=p.artifacts.slice(-200);}
+function integrityMatches(expected,actual){
+  if(!expected||typeof expected!=='object')return true;
+  const expectedBytes=expected.sizeBytes??expected.bytes;
+  return (!expected.sha256||expected.sha256===actual.sha256)&&(!Number.isFinite(Number(expectedBytes))||Number(expectedBytes)===Number(actual.sizeBytes))&&(!Number.isFinite(Number(expected.width))||Number(expected.width)===Number(actual.width))&&(!Number.isFinite(Number(expected.height))||Number(expected.height)===Number(actual.height))&&(!expected.format||String(expected.format).toUpperCase()===String(actual.format).toUpperCase());
+}
+function integrityMismatchMessage(label){return `${label} 完整性校验失败，文件可能被替换、截断或来自旧版本。`}
 function invalidateArtifacts(p,ids){
   // A panel can feed a page, which in turn feeds the story audit and export.
   // Walk the graph until it stops changing so a later export can never look valid
@@ -699,13 +705,18 @@ async function composePage(p,page,signal){
   if(previous&&previous.compositionVersion!==COMPOSITION_VERSION&&!alreadyArchived)invalidatePagePresentation(p,page.number,'composition-version-migration');
   const dir=runDir(p,`第${page.number}页排版`);const output=path.join(versionDir(p),'候选成稿',`${String(page.number).padStart(2,'0')}-${Date.now()}.png`);
   const images=page.panels.map((_,i)=>inside(projectDir(p.id),p.panels[`${page.number}-${i+1}`].file));
+  const sourceIntegrity=[];
+  for(const [index,file] of images.entries()){
+    const integrity=await verifyImage(file);
+    sourceIntegrity.push({key:`${page.number}-${index+1}`,file:path.relative(projectDir(p.id),file),format:String(integrity.format||'').toUpperCase(),width:integrity.width,height:integrity.height,sizeBytes:integrity.sizeBytes,sha256:integrity.sha256});
+  }
   const layoutHints=p.pageLayouts?.[page.number]||{style:'floating-v2'};
   jsonWrite(path.join(dir,'排版.json'),{page,total:p.plan.pages.length,images,output,layoutHints,compositionVersion:COMPOSITION_VERSION});
   await pythonRun(['compose',path.join(dir,'排版.json')]);checkpoint(signal);
   activity(p,`正在核对第 ${page.number} 页的文字、画面和连续性…`);
   const report=await qa(p,output,JSON.stringify(pageQaDefinition(page)),imageRefs(p,[...new Set(page.panels.flatMap(q=>q.references))]),signal,'1080×1440最终漫画页');
-  const result={number:page.number,file:path.relative(projectDir(p.id),output),qa:report,layoutHints,compositionVersion:COMPOSITION_VERSION,at:new Date().toISOString(),dependsOn:page.panels.map((_,i)=>artifactIdForImageKey(`${page.number}-${i+1}`))};
-  p.pages=p.pages.filter(q=>q.number!==page.number);p.pages.push(result);p.pages.sort((a,b)=>a.number-b.number);recordArtifact(p,`page:${page.number}`,'page',result.file,result.dependsOn,{compositionVersion:COMPOSITION_VERSION});saveProject(p);
+  const pageIntegrity=await verifyImage(output),result={number:page.number,file:path.relative(projectDir(p.id),output),qa:report,layoutHints,compositionVersion:COMPOSITION_VERSION,projectVersion:p.version,integrity:pageIntegrity,sourceIntegrity,at:new Date().toISOString(),dependsOn:page.panels.map((_,i)=>artifactIdForImageKey(`${page.number}-${i+1}`))};
+  p.pages=p.pages.filter(q=>q.number!==page.number);p.pages.push(result);p.pages.sort((a,b)=>a.number-b.number);recordArtifact(p,`page:${page.number}`,'page',result.file,result.dependsOn,{compositionVersion:COMPOSITION_VERSION,projectVersion:p.version,integrity:pageIntegrity,sourceIntegrity});saveProject(p);
   if(!report.pass){
     const actions=[...repairActions(report)],onlyLayout=actions.length>0&&actions.every(action=>['reletter','recompose','review'].includes(action));
     result.nextStep=onlyLayout?(actions.includes('reletter')?'重新排字':'重新排版'):'查看或修订';saveProject(p);
@@ -929,10 +940,26 @@ export function reviewImage(p,key){
 export async function accept(p,checks){
   if(active.has(p.id)||p.status!=='ready'||p.pages.length!==p.plan.pages.length||p.pages.some(q=>!pageIsCurrent(p,q))||!p.storyQA?.pass||(p.artifacts||[]).find(artifact=>artifact.id==='story:audit')?.valid!==true)throw new Error('请先完成全篇制作和校对。');
   if(!Array.isArray(checks)||!CHECKS.every(c=>checks.includes(c)))throw new Error('请先完成成稿验收。');
-  const finalDir=path.join(versionDir(p),'成品');fs.mkdirSync(finalDir,{recursive:true});
-  for(const q of p.pages){const file=path.join(finalDir,`${String(q.number).padStart(2,'0')}.png`);fs.copyFileSync(inside(projectDir(p.id),q.file),file);q.finalFile=path.relative(projectDir(p.id),file);}
+  const projectRoot=projectDir(p.id),finalDir=path.join(versionDir(p),'成品');fs.mkdirSync(finalDir,{recursive:true});
+  const finalFiles=[];
+  for(const q of p.pages){
+    if(q.projectVersion!==undefined&&Number(q.projectVersion)!==Number(p.version))throw new Error(`第 ${q.number} 页来自旧作品版本，拒绝打包。`);
+    const source=inside(projectRoot,q.file),sourceIntegrity=await verifyImage(source),pageArtifact=(p.artifacts||[]).find(artifact=>artifact.id===`page:${q.number}`&&artifact.file===q.file);
+    const expectedIntegrity=q.integrity||pageArtifact?.integrity;
+    if(!integrityMatches(expectedIntegrity,sourceIntegrity))throw new Error(integrityMismatchMessage(`第 ${q.number} 页源文件`));
+    const expectedSources=q.sourceIntegrity||pageArtifact?.sourceIntegrity;
+    if(Array.isArray(expectedSources))for(const expected of expectedSources){
+      const current=p.panels?.[expected.key];
+      if(!current?.file||expected.file&&expected.file!==current.file)throw new Error(integrityMismatchMessage(`第 ${q.number} 页第 ${expected.key?.split('-')[1]||'?'} 格来源`));
+      const actual=await verifyImage(inside(projectRoot,current.file));
+      if(!integrityMatches(expected,actual))throw new Error(integrityMismatchMessage(`第 ${q.number} 页第 ${expected.key?.split('-')[1]||'?'} 格来源`));
+    }
+    const file=path.join(finalDir,`${String(q.number).padStart(2,'0')}.png`),temp=`${file}.${crypto.randomUUID()}.tmp`;
+    try{fs.copyFileSync(source,temp);const copied=await verifyImage(temp);if(!integrityMatches(sourceIntegrity,copied))throw new Error(integrityMismatchMessage(`第 ${q.number} 页成品副本`));fs.renameSync(temp,file);q.finalIntegrity=copied;q.finalFile=path.relative(projectRoot,file);finalFiles.push(file);}catch(error){try{if(fs.existsSync(temp))fs.unlinkSync(temp);}catch{}throw error;}
+  }
   const dir=runDir(p,'作品打包');const output=path.join(versionDir(p),'温蒂漫画成品.zip');
-  jsonWrite(path.join(dir,'zip.json'),{output,files:[...p.pages.map(q=>inside(projectDir(p.id),q.finalFile)),path.join(versionDir(p),'已确认分镜.md')]});
-  await pythonRun(['zip',path.join(dir,'zip.json')]);
-  p.accepted=true;p.acceptance={at:new Date().toISOString(),checks};p.bundle=path.relative(projectDir(p.id),output);recordArtifact(p,'export:bundle','export',p.bundle,['story:audit']);p.status='complete';activity(p,'成品已保存到本地，可以下载整套图片。');return p;
+  const manifestFile=path.join(versionDir(p),'已确认分镜.md');jsonWrite(path.join(dir,'zip.json'),{output,files:[...finalFiles,manifestFile]});
+  const bundle=JSON.parse(await pythonRun(['zip',path.join(dir,'zip.json')])),actualBundle={bytes:fs.statSync(output).size,sha256:checksum(output)},expectedEntries=[...finalFiles,manifestFile].map(file=>path.basename(file)),actualEntries=Array.isArray(bundle.entries)?bundle.entries:[];
+  if(String(bundle.output)!==output||Number(bundle.bytes)!==actualBundle.bytes||String(bundle.sha256)!==actualBundle.sha256||actualEntries.length!==expectedEntries.length||actualEntries.some((entry,index)=>entry?.name!==expectedEntries[index]||!Number.isFinite(Number(entry.bytes))||!String(entry.sha256||'').match(/^[a-f0-9]{64}$/i)))throw new Error('成品包完整性校验失败，拒绝完成验收。');
+  p.accepted=true;p.acceptance={at:new Date().toISOString(),checks};p.bundle=path.relative(projectRoot,output);p.bundleIntegrity={bytes:actualBundle.bytes,sha256:actualBundle.sha256,entries:actualEntries,projectVersion:p.version,compositionVersion:COMPOSITION_VERSION};recordArtifact(p,'export:bundle','export',p.bundle,['story:audit'],{integrity:p.bundleIntegrity,projectVersion:p.version,compositionVersion:COMPOSITION_VERSION});p.status='complete';activity(p,'成品已保存到本地，可以下载整套图片。');saveProject(p);return p;
 }
