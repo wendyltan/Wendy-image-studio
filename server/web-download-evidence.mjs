@@ -263,6 +263,7 @@ const FILE_CHOOSER_EVENT_TIMEOUT_ERROR=/(?:FILE_CHOOSER_EVENT_TIMEOUT|filechoose
 const FILE_CHOOSER_ROUTE_UNAVAILABLE_ERROR=/(?:FILE_CHOOSER_ROUTE_UNAVAILABLE|(?:附件入口|上传照片|上传文件|from computer|upload route)[^\n]*(?:不可用|失败|未找到|unavailable))/i;
 const FILE_SET_FAILED_ERROR=/(?:FILE_SET_FAILED|(?:setFiles|设置附件|写入选择器)[^\n]*(?:失败|error|failed))/i;
 const ATTACHMENT_VERIFICATION_TIMEOUT_ERROR=/(?:ATTACHMENT_VERIFICATION_TIMEOUT|(?:附件|attachment)[^\n]*(?:verification|验证|核对)[^\n]*(?:timeout|超时|失败))/i;
+const BROWSER_TOOL_BUDGET_EXCEEDED_ERROR=/(?:BROWSER_TOOL_BUDGET_EXCEEDED|browser CUA[^\n]*(?:budget|上限)|浏览器 CUA 调用[^\n]*(?:上限|终止))/i;
 const DOWNLOAD_FAILED_ERROR=/(?:DOWNLOAD_FAILED|DOWNLOAD_CHROME_UNAVAILABLE|原始图片[^\n]*(?:下载|复制|校验)[^\n]*(?:失败|不可用)|download[^\n]*(?:failed|unavailable))/i;
 const FILE_UPLOAD_CHROME_UNAVAILABLE_ERROR=/(?:^|[^A-Z0-9_])FILE_UPLOAD_CHROME_UNAVAILABLE(?:$|[^A-Z0-9_])|(?:UPLOAD_ERROR[^\n]*(?:file chooser|文件选择器|附件入口|attachment control))/i;
 const WORKER_SCRIPT_RUNTIME_ERROR=/(?:WORKER_SCRIPT_RUNTIME_ERROR|(?:ReferenceError|SyntaxError|TypeError)[^\n]*(?:require is not defined|cua_repl|browser script|执行脚本)|require is not defined|js execution (?:failed|error)|浏览器执行脚本[^\n]*(?:运行时|异常|错误))/i;
@@ -316,8 +317,10 @@ export function executorRuntimeErrorEvidence(value){
 
 export function browserPreSubmissionUnavailableText(value){
   const text=String(value||'');
-  return IAB_UNAVAILABLE_ERROR.test(text)||WORKER_SCRIPT_RUNTIME_ERROR.test(text)||EXECUTOR_RUNTIME_ERROR.test(text)||FILE_UPLOAD_CHROME_UNAVAILABLE_ERROR.test(text)||BROWSER_CREATE_UNAVAILABLE_ERROR.test(text)||BROWSER_HANDLE_LOST_ERROR.test(text)||BROWSER_MODE_ENTRY_UNAVAILABLE_ERROR.test(text)||FILE_CHOOSER_EVENT_TIMEOUT_ERROR.test(text)||FILE_CHOOSER_ROUTE_UNAVAILABLE_ERROR.test(text)||FILE_SET_FAILED_ERROR.test(text)||ATTACHMENT_VERIFICATION_TIMEOUT_ERROR.test(text)||DOWNLOAD_FAILED_ERROR.test(text)||BROWSER_ORIGIN_PERMISSION_DENIED_ERROR.test(text)||BROWSER_FOCUS_ERROR.test(text)||BROWSER_TAB_BACKGROUND_ERROR.test(text)||CHROME_UNAVAILABLE_ERROR.test(text);
+  return IAB_UNAVAILABLE_ERROR.test(text)||WORKER_SCRIPT_RUNTIME_ERROR.test(text)||EXECUTOR_RUNTIME_ERROR.test(text)||FILE_UPLOAD_CHROME_UNAVAILABLE_ERROR.test(text)||BROWSER_CREATE_UNAVAILABLE_ERROR.test(text)||BROWSER_HANDLE_LOST_ERROR.test(text)||BROWSER_MODE_ENTRY_UNAVAILABLE_ERROR.test(text)||FILE_CHOOSER_EVENT_TIMEOUT_ERROR.test(text)||FILE_CHOOSER_ROUTE_UNAVAILABLE_ERROR.test(text)||FILE_SET_FAILED_ERROR.test(text)||ATTACHMENT_VERIFICATION_TIMEOUT_ERROR.test(text)||BROWSER_TOOL_BUDGET_EXCEEDED_ERROR.test(text)||DOWNLOAD_FAILED_ERROR.test(text)||BROWSER_ORIGIN_PERMISSION_DENIED_ERROR.test(text)||BROWSER_FOCUS_ERROR.test(text)||BROWSER_TAB_BACKGROUND_ERROR.test(text)||CHROME_UNAVAILABLE_ERROR.test(text);
 }
+
+export function browserToolBudgetExceededEvidence(value){return BROWSER_TOOL_BUDGET_EXCEEDED_ERROR.test(String(value||''));}
 
 export function browserOriginPermissionDeniedEvidence(value){
   return BROWSER_ORIGIN_PERMISSION_DENIED_ERROR.test(String(value||''));
@@ -406,6 +409,7 @@ export function browserFailurePrefix(errorCode){
   if(errorCode==='FILE_CHOOSER_ROUTE_UNAVAILABLE')return '附件入口或“从电脑上传”菜单不可用；本次未上传附件或发送消息';
   if(errorCode==='FILE_SET_FAILED')return '浏览器文件选择器未能接收冻结附件；本次未上传附件或发送消息';
   if(errorCode==='ATTACHMENT_VERIFICATION_TIMEOUT')return '附件数量、名称、顺序或上传状态未能在有界时间内核实；本次未发送消息';
+  if(errorCode==='BROWSER_TOOL_BUDGET_EXCEEDED')return '浏览器 CUA 调用超过父进程安全上限；本次执行已被终止，提交状态按证据处理';
   if(errorCode==='WORKER_SCRIPT_RUNTIME_ERROR')return '浏览器执行脚本发生运行时错误；本次未上传附件或发送消息';
   if(errorCode==='EXECUTOR_RUNTIME_ERROR')return '网页执行器发生运行时错误；本次未上传附件或发送消息';
   if(errorCode==='DOWNLOAD_FAILED')return '网页原图已提交，但原始图片下载或校验失败；不会自动重发';

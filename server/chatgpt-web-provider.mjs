@@ -1,12 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import {runCodex,findCodex,writeExecutorRuntimeError,readExecutorRuntimeError} from './bridge.mjs';
+import {runCodex,findCodex,writeExecutorRuntimeError,readExecutorRuntimeError,readBrowserToolBudget} from './bridge.mjs';
 import {identityFields,sameIdentityValue,readJsonObject as readRunJson,readRunIdentity,compareRunIdentity} from './run-identity.mjs';
 import {patchManifest} from './run-manifest.mjs';
 import {chatGptWebImagePrompt} from './web-executor-instructions.mjs';
 import {ensureOwnedTabLease,ownedTabSessionName,readOwnedTabLease,syncOwnedTabLeaseToManifest} from './owned-tab-lease.mjs';
-import {browserFailurePrefix,browserPreSubmissionUnavailableText,browserRunEvidenceText,structuredBrowserToolResultText,browserOriginPermissionDeniedEvidence,fileUploadChromeUnavailableEvidence,browserCreateUnavailableEvidence,browserHandleLostEvidence,browserModeEntryUnavailableEvidence,fileChooserEventTimeoutEvidence,fileChooserRouteUnavailableEvidence,fileSetFailedEvidence,attachmentVerificationTimeoutEvidence,workerScriptRuntimeErrorEvidence,executorRuntimeErrorEvidence,downloadFailedEvidence,iabUnavailableEvidence,browserTabBackgroundEvidence,chromeUnavailableEvidence,browserFocusEvidence,completeDownloadEvidence,enrichDownloadEvidenceIdentity,extractDownloadEvidence,inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence,writeDownloadEvidence} from './web-download-evidence.mjs';
+import {browserFailurePrefix,browserPreSubmissionUnavailableText,browserRunEvidenceText,structuredBrowserToolResultText,browserOriginPermissionDeniedEvidence,fileUploadChromeUnavailableEvidence,browserCreateUnavailableEvidence,browserHandleLostEvidence,browserModeEntryUnavailableEvidence,fileChooserEventTimeoutEvidence,fileChooserRouteUnavailableEvidence,fileSetFailedEvidence,attachmentVerificationTimeoutEvidence,browserToolBudgetExceededEvidence,workerScriptRuntimeErrorEvidence,executorRuntimeErrorEvidence,downloadFailedEvidence,iabUnavailableEvidence,browserTabBackgroundEvidence,chromeUnavailableEvidence,browserFocusEvidence,completeDownloadEvidence,enrichDownloadEvidenceIdentity,extractDownloadEvidence,inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence,writeDownloadEvidence} from './web-download-evidence.mjs';
 import {uploadEvidenceFailureCode,uploadEvidenceFromRun,validateUploadEvidence} from './web-upload-evidence.mjs';
 import {REMOTE_PROMPT_FILE,assertRemotePrompt,remotePromptMetadata,validateRemotePrompt} from './remote-prompt.mjs';
 // Keep the durable provider id for existing project records. The production
@@ -259,6 +259,17 @@ function recordBrowserPreSubmissionFailure(manifestFile,requestId,failure,dir){
   }catch{return manifest;}
 }
 
+function recordBrowserToolBudgetFailure(manifestFile,requestId,failure,dir){
+  const manifest=readWebManifest(manifestFile);
+  if(manifest?.requestId!==requestId)return manifest;
+  const budget=readBrowserToolBudget(dir)||{},projection=uploadProjection(dir,readJsonObject(path.join(dir,'worker-request.json'))),postIntent=budget.submissionIntentObserved===true||manifest.submissionIntent===true;
+  const detail=String(failure?.message||'BROWSER_TOOL_BUDGET_EXCEEDED').slice(0,1000),prefix=browserFailurePrefix('BROWSER_TOOL_BUDGET_EXCEEDED');
+  try{
+    patchManifestState(manifestFile,'failed',{...projection,submitted:postIntent?'true':'false',submissionIntent:postIntent?'true':'false',submissionUncertain:postIntent?'true':'false',preSubmissionFailure:postIntent?'false':'true',errorCode:'BROWSER_TOOL_BUDGET_EXCEEDED',failureStage:postIntent?'post_submit_unknown':'pre_submission_browser_budget',browserStage:postIntent?'submission_uncertain':'browser_budget_exceeded',error:`${prefix}；${postIntent?'已记录发送意图，但停止时无法确认消息是否送达，结果未知，禁止重发':'尚未记录发送意图，未上传或发送消息，可安全重试'}。原始错误：${detail}`});
+    return readWebManifest(manifestFile);
+  }catch{return manifest;}
+}
+
 function normalizeOriginPermissionDenied({manifestFile,requestId,dir,outputFile,manifest,failure}={}){
   if(!originPermissionDeniedForRun({dir,manifestFile,outputFile,requestId,manifest,failure}))return null;
   const detail=String(browserRunEvidenceText(dir,{manifest,failure})).slice(0,1000);
@@ -305,6 +316,7 @@ function finalizeWorkerResult({dir,manifestFile,outputFile,requestId,result,fail
   let manifest=readWebManifest(manifestFile);
   const normalizedOrigin=normalizeOriginPermissionDenied({manifestFile,requestId,dir,outputFile,manifest,failure});
   if(normalizedOrigin)manifest=normalizedOrigin;
+  else if(failure?.code==='BROWSER_TOOL_BUDGET_EXCEEDED'||browserToolBudgetExceededEvidence(browserRunEvidenceText(dir,{manifest,failure})))manifest=recordBrowserToolBudgetFailure(manifestFile,requestId,failure,dir);
   else if((failure||explicitManifestErrorCode(manifest))&&browserPreSubmissionFailureObserved(dir,failure,manifest))manifest=recordBrowserPreSubmissionFailure(manifestFile,requestId,failure,dir);
   if(manifest?.requestId===requestId&&(!manifest.role||!manifest.executorReasoningEffort)){
     try{

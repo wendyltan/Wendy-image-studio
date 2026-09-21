@@ -40,6 +40,7 @@ const BROWSER_STAGE_FAILURE_KIND=Object.freeze({
   FILE_CHOOSER_ROUTE_UNAVAILABLE:'file-chooser-route-unavailable',
   FILE_SET_FAILED:'file-set-failed',
   ATTACHMENT_VERIFICATION_TIMEOUT:'attachment-verification-timeout',
+  BROWSER_TOOL_BUDGET_EXCEEDED:'browser-tool-budget-exceeded',
   WORKER_SCRIPT_RUNTIME_ERROR:'worker-script-runtime-error',
   EXECUTOR_RUNTIME_ERROR:'executor-runtime-error',
   REFERENCE_FILES_INVALID:'reference-files-invalid',
@@ -376,6 +377,7 @@ function failureMessage(failure){
     'file-chooser-route-unavailable':'附件按钮及同一标签页菜单 fallback 均不可用；本次未上传附件或发送消息。',
     'file-set-failed':'浏览器文件选择器未能接收冻结附件；本次未上传附件或发送消息。',
     'attachment-verification-timeout':'附件数量、名称、顺序或上传状态未能在有界时间内核实；本次未发送消息。',
+    'browser-tool-budget-exceeded':'浏览器 CUA 调用达到父进程安全上限；提交前可安全重试，提交后的不确定结果禁止重发。',
     'reference-files-invalid':'服务端冻结附件台账无效；本次未打开浏览器、上传附件或发送消息。',
   };
   if(stageMessages[failure.kind])return `${stageMessages[failure.kind]}${usage}上一版原图仍保留；修复对应阶段后点击“${action}”，只会重试这一张。`;

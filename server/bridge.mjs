@@ -8,7 +8,9 @@ import {finalizeOwnedTabLease,readOwnedTabLease,syncOwnedTabLeaseToManifest} fro
 
 const IMAGE_PATH = /(?:^|[\s"'`(])((?:\/[^\n<>"'`]+?)\.(?:png|webp|jpe?g))(?:$|[\s"'`,)])/gi;
 const EXECUTOR_RUNTIME_ERROR_FILE = 'executor-runtime-error.json';
-const MAX_EVENT_TEXT = 24000;
+const BROWSER_TOOL_BUDGET_FILE = 'browser-tool-budget.json';
+export const BROWSER_TOOL_CALL_BUDGET = 3;
+const MAX_EVENT_TEXT = 4096;
 const MAX_ERROR_TEXT = 1200;
 const CLEAR_NO_IMAGE = /(?:未产生(?:任何)?图片|未产出(?:任何)?图片|未能生成(?:图片)?|没有生成(?:替代品|图片)|没有(?:任何)?图片(?:产出|生成)?|目标路径尚不存在|未写入目标路径|Browser is not available:\s*(?:iab|chrome)|隐藏\s*IAB.*不可用|BROWSER_(?:FOCUS|TAB_BACKGROUND|CHROME)_(?:UNAVAILABLE|RESTORE_FAILED)|BROWSER_ORIGIN_PERMISSION_DENIED|The user declined permission(?: for this action)?|Browser use cannot access\s+https?:\/\/chatgpt\.com\b[^\n]*(?:denied permission|permission denied)|https?:\/\/chatgpt\.com\b[^\n]*browser security policy|browser security policy[^\n]*https?:\/\/chatgpt\.com\b|browser security policy|Chrome management capability is not advertised|焦点(?:恢复|管理)能力(?:不可用|未提供|未广告)|无法恢复创作室焦点|no image (?:was )?(?:generated|produced|created)|image generation (?:did not|failed to) (?:produce|create))/i;
 const NETWORK_INTERRUPTION = /(?:network|connection|connect(?:ion)? (?:reset|refused|failed|closed)|websocket|tls|ssl|tunnel|econn(?:reset|refused|timeout)|enotfound|连接(?:错误|中断|失败|超时)?|网络(?:错误|中断|失败|超时)?|代理|隧道)/i;
@@ -90,6 +92,46 @@ function compactResponseFile(file){
     .replace(/[A-Za-z0-9+/=]{1024,}/g,match=>`[binary-data-redacted:${match.length} chars]`);
   if(compact!==original)fs.writeFileSync(file,compact,{mode:0o600});
   return compact;
+}
+
+function browserToolCallInfo(event){
+  const item=event?.item&&typeof event.item==='object'?event.item:event&&typeof event==='object'?event:{};
+  if(item.type!=='mcp_tool_call')return null;
+  const namespace=[item.server,item.serverName,event?.server,event?.serverName,item.tool,item.name,event?.tool].filter(Boolean).join(' ');
+  const tool=String(item.tool||item.name||event?.tool||'').toLowerCase();
+  const isBrowserNamespace=/(?:mcp__)?cua[_-]?repl|browser(?:[_-]?use)?|computer[_-]?use/i.test(namespace);
+  const isBrowserTool=/^(?:js|browser|computer(?:[_-]?use)?)$/i.test(tool);
+  if(!isBrowserNamespace||!isBrowserTool)return null;
+  const type=String(event?.type||'').toLowerCase();
+  return {id:String(item.id||event?.item_id||event?.id||''),phase:type.includes('started')?'started':type.includes('completed')?'completed':'other'};
+}
+
+function eventContainsSubmissionIntent(event){
+  const item=event?.item&&typeof event.item==='object'?event.item:{};
+  const fields=[item.arguments?.code,item.arguments?.command,item.result?.structured_content,item.result?.content,event?.message,event?.error].filter(Boolean);
+  let source='';
+  try{source=JSON.stringify(fields);}catch{source=String(fields);}
+  return /(?:submission-intent|submissionIntent|submission_intent_recorded)/i.test(source);
+}
+
+function manifestHasSubmissionIntent(dir){
+  try{
+    const value=JSON.parse(fs.readFileSync(path.join(dir,'web-generation.json'),'utf8'));
+    return value?.submissionIntent===true||value?.state==='submitted'||value?.submitted===true;
+  }catch{return false;}
+}
+
+function writeBrowserToolBudget(dir,value={}){
+  if(!dir||!value)return null;
+  const record={schemaVersion:1,errorCode:'BROWSER_TOOL_BUDGET_EXCEEDED',limit:BROWSER_TOOL_CALL_BUDGET,observed:Number(value.observed)||0,submissionIntentObserved:value.submissionIntentObserved===true,stage:value.submissionIntentObserved===true?'post_submission_intent':'pre_submission_intent',terminationRequestedAt:new Date().toISOString()};
+  try{
+    const file=path.join(dir,BROWSER_TOOL_BUDGET_FILE),temp=`${file}.tmp-${crypto.randomUUID()}`;
+    fs.writeFileSync(temp,JSON.stringify(record,null,2)+'\n',{mode:0o600});fs.renameSync(temp,file);return record;
+  }catch{return null;}
+}
+
+export function readBrowserToolBudget(dir){
+  try{return JSON.parse(fs.readFileSync(path.join(dir,BROWSER_TOOL_BUDGET_FILE),'utf8'));}catch{return null;}
 }
 
 function browserToolStage(value){
@@ -349,6 +391,8 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
     let buf='',last='',error='',settled=false,timedOut=false,usage=null;
     const capturedEvents=[];
     let runtimeError=null;
+    let browserToolCalls=0,submissionIntentObserved=false,budgetFailure=null,anonymousBrowserStarted=false;
+    const browserToolCallIds=new Set();
     const persistRuntimeError=(candidate)=>{
       if(!candidate||runtimeError)return;
       runtimeError=writeExecutorRuntimeError(dir,candidate);
@@ -360,7 +404,7 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
     const finish=(err,result,{responseText='',exitCode=null}={})=>{
       if(settled)return;settled=true;clearTimeout(timer);signal?.removeEventListener('abort',abort);log.end();
       try{compactResponseFile(resultPath);}catch{}
-      saveExecution({state:err?'failed':'completed',endedAt:new Date().toISOString(),exitCode,durationMs:Math.max(0,Date.now()-Date.parse(startedAt)),error:err?String(err.message||err).slice(0,500):null});
+      saveExecution({state:err?'failed':'completed',endedAt:new Date().toISOString(),exitCode,durationMs:Math.max(0,Date.now()-Date.parse(startedAt)),error:err?String(err.message||err).slice(0,500):null,browserToolCallCount:browserToolCalls,browserToolCallBudget:BROWSER_TOOL_CALL_BUDGET,browserToolBudgetExceeded:Boolean(budgetFailure),submissionIntentObserved});
       // The CUA executor is the only component allowed to close its tab.  If
       // it exited before writing verified close evidence, persist an explicit
       // unconfirmed/orphaned lease instead of claiming that the tab vanished.
@@ -388,7 +432,22 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
       for(const line of lines){
         if(!line.trim())continue;
         try{
-          const e=JSON.parse(line),compact=compactEvent(e);
+          const e=JSON.parse(line),compact=compactEvent(e),browserCall=browserToolCallInfo(e);
+          if(browserCall){
+            const anonymousCompletion=browserCall.id===''&&browserCall.phase==='completed'&&anonymousBrowserStarted;
+            const callKey=browserCall.id||`anonymous-${browserToolCalls+1}`;
+            if(browserCall.id===''&&browserCall.phase==='started')anonymousBrowserStarted=true;
+            if(!anonymousCompletion&&!browserToolCallIds.has(callKey)){
+              browserToolCallIds.add(callKey);browserToolCalls+=1;
+              submissionIntentObserved=submissionIntentObserved||eventContainsSubmissionIntent(e)||manifestHasSubmissionIntent(dir);
+              if(browserToolCalls>BROWSER_TOOL_CALL_BUDGET&&!budgetFailure){
+                const record=writeBrowserToolBudget(dir,{observed:browserToolCalls,submissionIntentObserved});
+                budgetFailure={code:'BROWSER_TOOL_BUDGET_EXCEEDED',observed:browserToolCalls,limit:BROWSER_TOOL_CALL_BUDGET,submissionIntentObserved,message:`BROWSER_TOOL_BUDGET_EXCEEDED: 浏览器 CUA 调用已达到 ${BROWSER_TOOL_CALL_BUDGET} 次上限；第 ${browserToolCalls} 次调用已被父进程终止。`};
+                const budgetEvent={type:'browser_tool_budget_exceeded',errorCode:budgetFailure.code,observed:browserToolCalls,limit:BROWSER_TOOL_CALL_BUDGET,submissionIntentObserved,stage:record?.stage||(budgetFailure.submissionIntentObserved?'post_submission_intent':'pre_submission_intent')};
+                capturedEvents.push(budgetEvent);log.write(JSON.stringify(budgetEvent)+'\n');stop();
+              }
+            }
+          }
           capturedEvents.push(compact);
           const candidate=runtimeCandidate(e);if(candidate)persistRuntimeError(candidate);
           if(e.type==='item.completed'&&e.item?.type==='agent_message')last=e.item.text;
@@ -410,6 +469,10 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
     child.on('close',code=>{
       if(signal?.aborted)return finish(new Error('已暂停，已保存完成部分。'),null,{exitCode:code});
       if(timedOut)return finish(new Error('本次等待时间较长，已暂停。已收到的图片保留在本地，可检查后继续。'),null,{exitCode:code});
+      if(budgetFailure){
+        const budgetError=new Error(budgetFailure.message);Object.assign(budgetError,budgetFailure);
+        return finish(budgetError,null,{exitCode:code});
+      }
       if(code!==0){
         const message=error||'创作连接中断，请确认账号可用后继续。';
         persistRuntimeError({category:'executor_exit',message,stack:'',toolStage:'executor',source:'process'});
