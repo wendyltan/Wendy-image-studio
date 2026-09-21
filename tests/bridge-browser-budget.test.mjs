@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {dispatchChatGptWebJob} from '../server/chatgpt-web-provider.mjs';
-import {BROWSER_CLEANUP_MARKER,BROWSER_TOOL_BUSINESS_CALL_BUDGET,BROWSER_TOOL_CLEANUP_CALL_BUDGET,BROWSER_TOOL_STAGE_BUDGETS,readBrowserToolBudget,runCodex} from '../server/bridge.mjs';
+import {BROWSER_CLEANUP_MARKER,BROWSER_TOOL_BUSINESS_CALL_BUDGET,BROWSER_TOOL_CLEANUP_CALL_BUDGET,BROWSER_TOOL_STAGE_BUDGETS,browserToolStage,readBrowserToolBudget,runCodex} from '../server/bridge.mjs';
 
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'wendi-browser-budget-'));
 
@@ -22,10 +22,10 @@ const closed=${JSON.stringify(closed)};
 const after=${JSON.stringify(after)};
 const marker=${JSON.stringify(BROWSER_CLEANUP_MARKER)};
 const emit=(index,code='noop')=>{const item={id:'item_'+index,type:'mcp_tool_call',server:'cua_repl',tool:'js',arguments:{code},result:{content:[{type:'image',data:'data:image/png;base64:'+'A'.repeat(12000)}],_meta:{browser_use:{screenshot:{pageUrl:'https://chatgpt.com',tabId:'fixture',url:'data:image/png;base64:'+'B'.repeat(12000)}}}}};console.log(JSON.stringify({type:'item.started',item}));console.log(JSON.stringify({type:'item.completed',item}));};
-const businessCode=index=>index===1&&mode==='post-intent'?'submission-intent':'noop';
-const calls=mode==='four-business-close'?['bootstrap','bootstrap','bootstrap','upload','close']:mode==='close-abuse'?['bootstrap','bootstrap','bootstrap','abuse','business']:mode==='pre-intent'?['bootstrap','bootstrap','bootstrap','upload','upload','upload']:mode==='post-intent'?['bootstrap','bootstrap','bootstrap','submit','submit']:['business','business','business','business','business'];
+const emitIntentHelper=index=>{const item={id:'item_'+index,type:'command_execution',command:'node run-manifest.mjs submission-intent --manifest-file fixture/web-generation.json',aggregated_output:'{"ok":true,"submissionIntent":true}'};console.log(JSON.stringify({type:'item.started',item}));console.log(JSON.stringify({type:'item.completed',item}));};
+const calls=mode==='four-business-close'?['bootstrap','bootstrap','bootstrap','upload','close']:mode==='close-abuse'?['bootstrap','bootstrap','bootstrap','abuse','business']:mode==='pre-intent'?['bootstrap','bootstrap','bootstrap','upload','upload','upload']:mode==='post-intent'?['bootstrap','bootstrap','bootstrap','intent-helper','submit','submit']:mode==='intent-and-send'?['bootstrap','bootstrap','bootstrap','upload','intent-helper','submit']:['business','business','business','business','business'];
 let index=0;
-const next=()=>{const kind=calls[index];if(!kind){setTimeout(()=>{fs.writeFileSync(after,'1');process.exit(0)},800);return;}index+=1;if((index===5||index===6)&&kind==='business' || (mode==='pre-intent'&&index===6))fs.writeFileSync(fifth,'1');if(kind==='close'){const leaseFile=path.join(dir,'owned-tab-lease.json');const lease=JSON.parse(fs.readFileSync(leaseFile,'utf8'));lease.state='closing';fs.writeFileSync(leaseFile,JSON.stringify(lease));fs.writeFileSync(closed,'1');fs.writeFileSync(after,'1');emit(index,marker+'; await tab.close(); --run-id "'+runId+'" --owned-tab-id "tab-fixture" --state closing;');setTimeout(()=>process.exit(0),120);return;}if(kind==='abuse')emit(index,marker+'; await tab.close(); --run-id "'+runId+'" --owned-tab-id "tab-fixture" --state closing;');else if(kind==='submit')emit(index,index===4?'submission-intent; send':'send');else emit(index,kind==='business'?'noop':kind);setTimeout(next,60)};
+const next=()=>{const kind=calls[index];if(!kind){setTimeout(()=>{fs.writeFileSync(after,'1');process.exit(0)},800);return;}index+=1;if((index===5||index===6)&&kind==='business' || (mode==='pre-intent'&&index===6))fs.writeFileSync(fifth,'1');if(kind==='close'){const leaseFile=path.join(dir,'owned-tab-lease.json');const lease=JSON.parse(fs.readFileSync(leaseFile,'utf8'));lease.state='closing';fs.writeFileSync(leaseFile,JSON.stringify(lease));fs.writeFileSync(closed,'1');fs.writeFileSync(after,'1');emit(index,marker+'; await tab.close(); --run-id "'+runId+'" --owned-tab-id "tab-fixture" --state closing;');setTimeout(()=>process.exit(0),120);return;}if(kind==='abuse')emit(index,marker+'; await tab.close(); --run-id "'+runId+'" --owned-tab-id "tab-fixture" --state closing;');else if(kind==='intent-helper')emitIntentHelper(index);else if(kind==='submit')emit(index,'const send=tab.playwright.getByRole("button",{name:/发送提示词/}); await send.click();');else if(kind==='upload')emit(index,'await chooser.setFiles(files); const send=tab.playwright.getByRole("button",{name:/发送提示词/}); const sendEnabled=await send.isEnabled();');else emit(index,kind==='business'?'noop':kind);setTimeout(next,60)};
 next();
 `;
   fs.writeFileSync(bin,source,{mode:0o755});
@@ -36,6 +36,26 @@ async function flush(){await new Promise(resolve=>setImmediate(resolve));}
 function persistedEvents(dir){
   return fs.readFileSync(path.join(dir,'events.jsonl'),'utf8').trim().split('\n').filter(Boolean).map(line=>{assert.ok(Buffer.byteLength(line,'utf8')<=4096,`event exceeds 4096 bytes: ${Buffer.byteLength(line,'utf8')}`);return JSON.parse(line)});
 }
+
+test('send-button inspection stays in upload while an actual click is submit',()=>{
+  const upload=`await chooser.setFiles(files); const send=tab.playwright.getByRole('button',{name:/发送提示词/}); const sendEnabled=await send.isEnabled();`;
+  const send=`const send=tab.playwright.getByRole('button',{name:/发送提示词/}); await send.click();`;
+  assert.equal(browserToolStage(upload),'upload');
+  assert.equal(browserToolStage(send),'submit');
+});
+
+test('manifest submission-intent helper is not a browser budget call',async()=>{
+  const run=fixture('intent-and-send');
+  const result=await runCodex({codexBin:run.codexBin,dir:run.dir,prompt:'fixture',browserMode:'chrome',timeoutMs:5000});
+  await flush();
+  assert.equal(result.text,'');
+  assert.equal(readBrowserToolBudget(run.dir),null);
+  const execution=JSON.parse(fs.readFileSync(path.join(run.dir,'execution.json'),'utf8'));
+  assert.equal(execution.browserToolCallCount,5);
+  assert.equal(execution.browserBusinessCallCount,5);
+  assert.deepEqual(execution.browserBusinessStageCounts,{bootstrap:3,upload:1,submit:1});
+  assert.equal(execution.submissionIntentObserved,true);
+});
 
 test('four business calls plus one audited cleanup call pass and remain within separate slots',async()=>{
   const run=fixture('four-business-close');

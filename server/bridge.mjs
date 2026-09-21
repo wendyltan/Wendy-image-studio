@@ -149,6 +149,14 @@ function browserToolCallInfo(event,{dir,cleanupCallUsed=false}={}){
   if(!isBrowserNamespace||!isBrowserTool)return null;
   const type=String(event?.type||'').toLowerCase();
   const source=String(item.arguments?.code||item.arguments?.command||'');
+  // A CUA namespace can also be used by the executor to run a local manifest
+  // helper.  That helper is an accounting/state write, not a browser action;
+  // do not spend a browser slot on a call which contains no CUA/tab operation.
+  // If the same script also touches the owned tab, it remains a real browser
+  // call and is counted normally.
+  const manifestOnly=/(?:nodeRepl\.(?:exec|write)|run-manifest\.mjs|owned-tab-lease\.mjs)/i.test(source)
+    && !/(?:\bcua\.[A-Za-z_$][\w$]*|\b(?:tab|globalThis\.__wendiOwnedTab)\s*\.|createBrowserTab|filechooser|pageAssets|\.getByRole\(|\.locator\()/i.test(source);
+  if(manifestOnly)return null;
   const closeLike=/(?:globalThis\.__wendiOwnedTab|__wendiOwnedTab|\btab)\s*\.\s*close\s*\(/i.test(source);
   const fixedCleanup=source.includes(BROWSER_CLEANUP_MARKER)&&closeLike&&/(?:--state[^\n]{0,120}closing|ownedTabStage[^\n]*closing|cleanup-status|\bfinally\b)/i.test(source);
   let lease=null;
@@ -167,7 +175,7 @@ function browserToolCallInfo(event,{dir,cleanupCallUsed=false}={}){
 
 function eventContainsSubmissionIntent(event){
   const item=event?.item&&typeof event.item==='object'?event.item:{};
-  const fields=[item.arguments?.code,item.arguments?.command,item.result?.structured_content,item.result?.content,event?.message,event?.error].filter(Boolean);
+  const fields=[item.arguments?.code,item.arguments?.command,item.command,item.result?.structured_content,item.result?.content,item.aggregated_output,event?.message,event?.error].filter(Boolean);
   let source='';
   try{source=JSON.stringify(fields);}catch{source=String(fields);}
   return /(?:submission-intent|submissionIntent|submission_intent_recorded)/i.test(source);
@@ -193,10 +201,18 @@ export function readBrowserToolBudget(dir){
   try{return JSON.parse(fs.readFileSync(path.join(dir,BROWSER_TOOL_BUDGET_FILE),'utf8'));}catch{return null;}
 }
 
-function browserToolStage(value){
+export function browserToolStage(value){
   const source=typeof value==='string'?value:JSON.stringify(value||{});
   if(/close\(\)/i.test(source))return 'cleanup';
-  if(/submission[-_ ]?intent|发送提示词|pressKey\([^)]*(?:Enter|Return)|composer-submit-button|\.click\([^)]*send/i.test(source))return 'submit';
+  // Merely inspecting the send button is part of upload verification.  The
+  // previous matcher treated `getByRole(...发送提示词...)` and
+  // `sendEnabled` as a submission, so the upload call consumed the one-call
+  // submit budget before the real send.  Only an intent marker, Enter/Return,
+  // or an actual send-button click is a submit call.
+  const intentMarker=/(?:submission[-_ ]?intent|submission_intent_recorded)/i.test(source);
+  const enterSubmit=/(?:pressKey|press)\([^)]*(?:Enter|Return)\)/i.test(source);
+  const sendButtonClick=/(?:\b(?:send|submit|sendButton|submitButton|composerSubmit)\b\s*\.\s*(?:click|press)\s*\(|(?:getByRole|locator)\([^)]*(?:发送提示词|composer-submit-button)[^)]*\)\s*\.\s*(?:click|press)\s*\()/i.test(source);
+  if(intentMarker||enterSubmit||sendButtonClick)return 'submit';
   if(/pageAssets|\.bundle\(|\.list\(\)|download-evidence|下载原图|生成结果|停止生成|等待生成/i.test(source))return 'wait_download';
   if(/\bupload\b|setFiles|filechooser|从电脑上传|上传文件|上传照片|attachment(?:s|Signals|Expected|Observed|Pending)|上传中|等待文件上传|remotePrompt|填入冻结|\.fill\(|\.paste\(|prompt-textarea|textbox/i.test(source))return 'upload';
   if(/createBrowserTab|\.goto\(|waitForLoadState|getAXState|聊天模式|创建图片|composer|登录/i.test(source))return 'bootstrap';
@@ -524,7 +540,13 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
       for(const line of lines){
         if(!line.trim())continue;
         try{
-          const e=JSON.parse(line),browserCall=browserToolCallInfo(e,{dir,cleanupCallUsed:browserCleanupCalls>=BROWSER_TOOL_CLEANUP_CALL_BUDGET});
+          const e=JSON.parse(line);
+          // Submission intent is a persisted lifecycle fact, not a browser
+          // call.  Observe it from command/helper events as well as from the
+          // next CUA call, so a budget failure immediately after the helper
+          // still gets the correct post-intent safety classification.
+          submissionIntentObserved=submissionIntentObserved||eventContainsSubmissionIntent(e)||manifestHasSubmissionIntent(dir);
+          const browserCall=browserToolCallInfo(e,{dir,cleanupCallUsed:browserCleanupCalls>=BROWSER_TOOL_CLEANUP_CALL_BUDGET});
           if(browserCall){
             let callKey=browserCall.id;
             if(!callKey){
