@@ -211,6 +211,45 @@ export function ensureOwnedTabLease({dir, runId, requestId, sessionName = null} 
   });
 }
 
+/**
+ * Start a separately audited resume attempt without erasing the prior lease.
+ * The caller must archive the old lease evidence first.  A non-terminal lease
+ * is still live/ambiguous and therefore cannot be reset into another create.
+ */
+export function resetOwnedTabLeaseForResume({dir, runId, requestId, sessionName = null} = {}) {
+  const expected = {runId: text(runId) || path.basename(path.resolve(String(dir || ''))), requestId};
+  return withLease(dir, expected, (file, current) => {
+    if (!current) {
+      const initial = normalizeLease({
+        runId: expected.runId,
+        requestId: expected.requestId,
+        sessionName: sessionName || ownedTabSessionName(expected.runId, expected.requestId),
+        state: 'not_created',
+        cleanupStatus: 'not_attempted',
+      }, expected);
+      atomicWrite(file, initial);
+      return initial;
+    }
+    const lease = normalizeLease(current, expected);
+    if (!TERMINAL_STATES.has(lease.state) && lease.state !== 'not_created') {
+      const error = new Error(`本次 run 的 owned tab 仍处于 ${lease.state}，无法安全续接并再次创建。`);
+      error.code = 'OWNED_TAB_RESUME_UNSAFE';
+      error.lease = lease;
+      throw error;
+    }
+    return writeLease(file, lease, {
+      state: 'not_created',
+      ownedTabId: null,
+      createdAt: null,
+      cleanupStatus: 'not_attempted',
+      cleanupVerifiedAt: null,
+      cleanupError: null,
+      kernelReset: false,
+      sessionName: lease.sessionName || sessionName || ownedTabSessionName(expected.runId, expected.requestId),
+    });
+  });
+}
+
 /** Atomically reserve the one and only createBrowserTab attempt. */
 export function reserveOwnedTabCreate({dir, runId, requestId, sessionName = null} = {}) {
   const expected = {runId: text(runId) || path.basename(path.resolve(String(dir || ''))), requestId};

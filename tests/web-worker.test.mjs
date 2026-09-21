@@ -23,6 +23,7 @@ let input='';process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>{
  const write=m=>fs.writeFileSync(req.manifestFile,JSON.stringify(m));
  if(mode==='hang'){setInterval(()=>{},100);return;}
  if(mode==='empty')return;
+ if(mode==='lease-order'){const lease=JSON.parse(fs.readFileSync(path.join(dir,'owned-tab-lease.json'),'utf8'));fs.writeFileSync(path.join(dir,'lease-before-worker.json'),JSON.stringify(lease));if(lease.state!=='creating'){console.error('parent reservation was not durable before worker start');process.exitCode=1;return;}}
  if(mode==='usage-limit-once'){const marker=path.join(dir,'usage-limit-once');if(!fs.existsSync(marker)){fs.writeFileSync(marker,'1');console.log(JSON.stringify({type:'error',message:"You've hit your usage limit. Try again later."}));process.exitCode=1;return;}}
  if(mode==='legacy-confirmed-unsent-once'){const marker=path.join(dir,'legacy-confirmed-unsent-once');if(!fs.existsSync(marker)){fs.writeFileSync(marker,'1');write({...base,state:'failed',submitted:true,submissionIntent:true,referenceCount:2,readyAt:new Date().toISOString(),submittedAt:new Date().toISOString(),conversationUrl:'https://chatgpt.com/c/fixture-conversation',errorCode:'FILE_UPLOAD_CHROME_UNAVAILABLE',error:'upload wait remained disabled; no user message appeared'});process.exitCode=1;return;}}
  if(mode==='home-confirmed-unsent-once'){const marker=path.join(dir,'home-confirmed-unsent-once');if(!fs.existsSync(marker)){fs.writeFileSync(marker,'1');write({...base,state:'failed',submitted:false,submissionIntent:false,referenceCount:0,conversationUrl:'https://chatgpt.com/',errorCode:'FILE_UPLOAD_CHROME_UNAVAILABLE',error:'chooser failed before submission; no user message appeared'});process.exitCode=1;return;}}
@@ -65,6 +66,14 @@ test('latest 6-1 fixture keeps the 1329-character remote prompt out of the execu
  const args=setup('success');args.prompt=latest61RemotePrompt;args.capsule='X'.repeat(62*1024);const result=await dispatchChatGptWebJob(args);assert.equal(result.manifest.state,'downloaded');
  const request=JSON.parse(fs.readFileSync(path.join(args.dir,'worker-request.json'),'utf8'));assert.equal(request.remotePromptLength,1329);assert.equal(request.remotePromptSha256,'496dcd3fc948fa98cc06fa83a17e1a062d7fc1254fc6708f3b1f99de13f17984');
  const instruction=fs.readFileSync(path.join(args.dir,'prompt.txt'),'utf8'),match=instruction.match(/<remote_prompt>\n([\s\S]*?)\n<\/remote_prompt>/);assert(match);assert.equal(match[1],latest61RemotePrompt);assert.doesNotMatch(match[1],/X{1024}/);assert.doesNotMatch(instruction,/fs\.readFileSync|require\(|worker-request\.json/);
+});
+test('parent persists reserve-create before the browser worker can create a tab',async()=>{
+ const args=setup('lease-order'),result=await dispatchChatGptWebJob(args);assert.equal(result.manifest.state,'downloaded');
+ const lease=JSON.parse(fs.readFileSync(path.join(args.dir,'lease-before-worker.json')));assert.equal(lease.state,'creating');assert.equal(lease.ownedTabId,null);
+ const instruction=fs.readFileSync(path.join(args.dir,'prompt.txt'),'utf8');
+ assert.doesNotMatch(instruction,/第一次 CUA js 调用中且只调用一次本地 lease 命令/);
+ assert.match(instruction,/父流程已经在启动执行器前持久完成 reserve-create/);
+ assert.match(instruction,/reserve-create[\s\S]*createBrowserTab\("chrome"/);
 });
 test('existing conversation navigation timeout is checked before pre-submission failure',async()=>{
  const args={...setup('success'),timeoutMs:5000};

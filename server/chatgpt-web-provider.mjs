@@ -5,7 +5,7 @@ import {runCodex,findCodex,writeExecutorRuntimeError,readExecutorRuntimeError,re
 import {identityFields,sameIdentityValue,readJsonObject as readRunJson,readRunIdentity,compareRunIdentity} from './run-identity.mjs';
 import {patchManifest} from './run-manifest.mjs';
 import {chatGptWebImagePrompt} from './web-executor-instructions.mjs';
-import {ensureOwnedTabLease,ownedTabSessionName,readOwnedTabLease,syncOwnedTabLeaseToManifest} from './owned-tab-lease.mjs';
+import {ensureOwnedTabLease,ownedTabSessionName,readOwnedTabLease,resetOwnedTabLeaseForResume,reserveOwnedTabCreate,syncOwnedTabLeaseToManifest} from './owned-tab-lease.mjs';
 import {browserFailurePrefix,browserPreSubmissionUnavailableText,browserRunEvidenceText,structuredBrowserToolResultText,browserOriginPermissionDeniedEvidence,fileUploadChromeUnavailableEvidence,browserCreateUnavailableEvidence,browserHandleLostEvidence,browserModeEntryUnavailableEvidence,fileChooserEventTimeoutEvidence,fileChooserRouteUnavailableEvidence,fileSetFailedEvidence,attachmentVerificationTimeoutEvidence,browserToolBudgetExceededEvidence,workerScriptRuntimeErrorEvidence,executorRuntimeErrorEvidence,downloadFailedEvidence,iabUnavailableEvidence,browserTabBackgroundEvidence,chromeUnavailableEvidence,browserFocusEvidence,completeDownloadEvidence,enrichDownloadEvidenceIdentity,extractDownloadEvidence,inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence,writeDownloadEvidence} from './web-download-evidence.mjs';
 import {uploadEvidenceFailureCode,uploadEvidenceFromRun,validateUploadEvidence} from './web-upload-evidence.mjs';
 import {REMOTE_PROMPT_FILE,assertRemotePrompt,remotePromptMetadata,validateRemotePrompt} from './remote-prompt.mjs';
@@ -342,7 +342,7 @@ function archivePreAcceptanceAttempt(dir,manifest,execution){
   const attemptsDir=path.join(dir,'attempts');fs.mkdirSync(attemptsDir,{recursive:true});
   const serial=String(fs.readdirSync(attemptsDir).filter(name=>/^\d{3}-preaccept-usage-limit$/.test(name)).length+1).padStart(3,'0');
   const archive=path.join(attemptsDir,`${serial}-preaccept-usage-limit`);fs.mkdirSync(archive,{recursive:false});
-  for(const name of ['execution.json','events.jsonl','response.txt','result.json','prompt.txt','web-generation.json','run-identity.json']){
+  for(const name of ['execution.json','events.jsonl','response.txt','result.json','prompt.txt','web-generation.json','run-identity.json','owned-tab-lease.json']){
     const source=path.join(dir,name);if(fs.existsSync(source))fs.copyFileSync(source,path.join(archive,name));
   }
   const remotePrompt=path.join(dir,REMOTE_PROMPT_FILE);if(fs.existsSync(remotePrompt))fs.copyFileSync(remotePrompt,path.join(archive,REMOTE_PROMPT_FILE));
@@ -354,7 +354,7 @@ function archiveConfirmedUnsentAttempt(dir,manifest,execution,audit){
   const attemptsDir=path.join(dir,'attempts');fs.mkdirSync(attemptsDir,{recursive:true});
   const serial=String(fs.readdirSync(attemptsDir).filter(name=>/^\d{3}-/.test(name)).length+1).padStart(3,'0');
   const archive=path.join(attemptsDir,`${serial}-confirmed-unsent`);fs.mkdirSync(archive,{recursive:false});
-  for(const name of ['execution.json','events.jsonl','response.txt','result.json','prompt.txt','web-generation.json','run-identity.json','web-audit.json']){
+  for(const name of ['execution.json','events.jsonl','response.txt','result.json','prompt.txt','web-generation.json','run-identity.json','web-audit.json','owned-tab-lease.json']){
     const source=path.join(dir,name);if(fs.existsSync(source))fs.copyFileSync(source,path.join(archive,name));
   }
   const remotePrompt=path.join(dir,REMOTE_PROMPT_FILE);if(fs.existsSync(remotePrompt))fs.copyFileSync(remotePrompt,path.join(archive,REMOTE_PROMPT_FILE));
@@ -448,6 +448,10 @@ export async function dispatchChatGptWebJob({codexBin,dir,outputFile,prompt,refe
     throw error;
   }
   const executorPrompt=chatGptWebImagePrompt({outputFile,manifestFile,prompt:remotePrompt,remotePrompt:frozenRemote.value,remotePromptLength:remotePromptInfo.remotePromptLength,remotePromptSha256:remotePromptInfo.remotePromptSha256,referenceFiles,editTarget,conversationUrl,capsule,requestId,runId,sessionName});
+  // Persist the single create attempt before the browser executor starts. The
+  // child may create the actual tab, but it must never be able to create one
+  // before the local ownership boundary is durable.
+  reserveOwnedTabCreate({dir,runId,requestId,sessionName});
   let result,failure;
   try{result=await runCodex({codexBin,dir,image:true,browserMode:'chrome',signal,timeoutMs,model,reasoningEffort,role,writableDirs:[path.dirname(path.resolve(outputFile))],prompt:executorPrompt});}catch(error){failure=error;}
   const lease=readOwnedTabLease(dir,{runId,requestId});
@@ -503,7 +507,8 @@ export async function resumeChatGptWebJob({codexBin,dir,signal,timeoutMs=900000,
   const resumeArgs={resumeCount:Number(manifest.resumeCount||0)+1,resumedAt,...(preAcceptance?{lastPreAcceptanceAttempt:archive}:{lastConfirmedUnsentAttempt:archive,confirmedUnsentAudit:'web-audit.json'})};
   patchManifestState(manifestFile,'resume',resumeArgs);
   let result,failure;
-  ensureOwnedTabLease({dir,runId,requestId,sessionName});
+  resetOwnedTabLeaseForResume({dir,runId,requestId,sessionName});
+  reserveOwnedTabCreate({dir,runId,requestId,sessionName});
   try{result=await runCodex({codexBin,dir,image:true,browserMode:'chrome',signal,timeoutMs,model:model||worker.executorModel||null,reasoningEffort:reasoningEffort||worker.executorReasoningEffort||WEB_IMAGE_EXECUTOR_EFFORT,role:role||worker.role||WEB_IMAGE_EXECUTOR_ROLE,writableDirs:[path.dirname(outputFile)],prompt:nextInstruction});}catch(error){failure=error;}
   const lease=readOwnedTabLease(dir,{runId,requestId});
   if(lease)syncOwnedTabLeaseToManifest({dir,manifestFile,lease});

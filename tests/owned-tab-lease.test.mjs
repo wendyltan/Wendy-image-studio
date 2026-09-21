@@ -11,6 +11,7 @@ import {
   markOwnedTabStage,
   ownedTabSessionName,
   readOwnedTabLease,
+  resetOwnedTabLeaseForResume,
   reserveOwnedTabCreate,
 } from '../server/owned-tab-lease.mjs';
 
@@ -35,6 +36,45 @@ test('reserve-create is atomic and a second create attempt is refused', () => {
   assert.equal(reserved.state, 'creating');
   assert.throws(() => reserveOwnedTabCreate(run), error => error.code === 'OWNED_TAB_ALREADY_CREATED');
   assert.equal(readOwnedTabLease(run.dir, run).state, 'creating');
+});
+
+test('the parent reservation is required before stage-created and binds the returned handle', () => {
+  const run = fixture();
+  ensureOwnedTabLease(run);
+  assert.throws(() => markOwnedTabStage({...run, state: 'created', ownedTabId: 'tab-before-reserve'}), error => error.code === 'OWNED_TAB_CREATE_NOT_RESERVED');
+  const reserved = reserveOwnedTabCreate(run);
+  assert.equal(reserved.state, 'creating');
+  const created = markOwnedTabStage({...run, state: 'created', ownedTabId: 'tab-real-returned-by-createBrowserTab'});
+  assert.equal(created.state, 'created');
+  assert.equal(created.ownedTabId, 'tab-real-returned-by-createBrowserTab');
+  assert.throws(() => markOwnedTabStage({...run, state: 'created', ownedTabId: 'tab-second-create'}), error => error.code === 'OWNED_TAB_ID_MISMATCH');
+});
+
+test('a failed create remains not-observed and never becomes verified closed', () => {
+  const run = fixture();
+  ensureOwnedTabLease(run);
+  reserveOwnedTabCreate(run);
+  const failed = markOwnedTabCleanup({...run, status: 'not_observed', error: 'createBrowserTab returned no owned handle'});
+  assert.equal(failed.state, 'orphaned');
+  assert.equal(failed.cleanupStatus, 'not_observed');
+  assert.equal(failed.ownedTabId, null);
+  assert.equal(failed.cleanupVerifiedAt, null);
+  assert.throws(() => markOwnedTabCleanup({...run, status: 'closed', verification: 'exact-owned-tab-close-returned'}), error => error.code === 'OWNED_TAB_LEASE_TERMINAL');
+});
+
+test('an audited resume resets only a terminal prior lease before reserving again', () => {
+  const run = fixture();
+  ensureOwnedTabLease(run);
+  reserveOwnedTabCreate(run);
+  markOwnedTabStage({...run, state: 'created', ownedTabId: 'tab-old'});
+  markOwnedTabCleanup({...run, status: 'closed', ownedTabId: 'tab-old', verification: 'exact-owned-tab-close-returned'});
+  const reset = resetOwnedTabLeaseForResume(run);
+  assert.equal(reset.state, 'not_created');
+  assert.equal(reset.cleanupStatus, 'not_attempted');
+  assert.equal(reset.ownedTabId, null);
+  const reserved = reserveOwnedTabCreate(run);
+  assert.equal(reserved.state, 'creating');
+  assert.throws(() => resetOwnedTabLeaseForResume(run), error => error.code === 'OWNED_TAB_RESUME_UNSAFE');
 });
 
 test('stage transitions expose upload and send boundaries and reject regressions', () => {
