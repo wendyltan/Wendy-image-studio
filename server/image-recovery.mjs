@@ -3,6 +3,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {readJsonObject,readRunIdentity,compareRunIdentity,readRunEvidence} from './run-identity.mjs';
 import {appendDownloadEvidenceTrace,enrichDownloadEvidenceIdentity,inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence,writeDownloadEvidence} from './web-download-evidence.mjs';
+import {inspectNativeDownloadEvidence,NATIVE_DOWNLOAD_EVIDENCE_FILE} from './native-download-evidence.mjs';
+import {patchManifest} from './run-manifest.mjs';
 
 function iso(value){const parsed=Date.parse(String(value||''));return Number.isFinite(parsed)?new Date(parsed).toISOString():null;}
 function latestIso(values=[]){const times=values.map(iso).filter(Boolean).map(value=>Date.parse(value));return times.length?new Date(Math.max(...times)).toISOString():null;}
@@ -322,6 +324,49 @@ export function createImageRecovery({webImageProvider,readGenerationEvidence,gen
     }
   }
 
+  /**
+   * Promote one already-submitted, otherwise-unknown run after a separately
+   * captured Chrome native-download record passes every identity and byte
+   * check. This never sends, retries, or scans arbitrary local files.
+   */
+  async function adoptNativeDownload(p,{dir=null,file=null,target=null,evidenceFile=null}={}){
+    verifyApproval(p);
+    if(hasActive(p.id))throw new Error('当前作品仍有运行中的任务，不能采用原生下载结果。');
+    if(!p.pending)throw new Error('没有可恢复的待确认网页生图任务。');
+    const pending=p.pending;assertCurrentPending(p,pending);
+    const runDir=path.resolve(String(dir||pending.dir||'')),projectRoot=path.resolve(projectDir(p.id));
+    if(!runDir.startsWith(path.join(projectRoot,'.制作记录')+path.sep))throw new Error('原生下载证据目录不属于当前作品制作记录。');
+    if(runDir!==path.resolve(String(pending.dir||'')))throw new Error('原生下载证据目录与当前 pending 不一致。');
+    const key=String(target||pending.key||'').trim(),panelKey=panelKeyFromImageKey?.(key);
+    if(!panelKey)throw new Error('原生下载恢复只支持正式分镜。');
+    const [pageNumber,panelNumber]=panelKey.split('-').map(Number),definition=p.plan?.pages?.[pageNumber-1]?.panels?.[panelNumber-1];
+    if(!definition)throw new Error(`当前方案中不存在 ${key}，拒绝采用。`);
+    const task=(p.tasks||[]).find(item=>item.id===pending.taskId);
+    if(!task||p.currentTask?.id!==task.id||task.target!==key)throw new Error('当前任务不是这次原生下载对应的 pending 任务。');
+    const run=readRunIdentity(runDir,{strict:true}),manifest=readWebManifest(path.join(runDir,'web-generation.json')),result=readJsonObject(path.join(runDir,'result.json'));
+    if(!run.request||!run.worker||!manifest||!run.execution)throw new Error('原生下载恢复缺少完整执行记录。');
+    if(manifest.state==='downloaded'||result?.acceptanceState==='downloaded'||result?.outcome==='artifact_saved')throw new Error('当前 request 已有下载结果，拒绝重复恢复。');
+    const expectedOutput=path.resolve(String(file||pending.file||run.expectedOutput||run.worker.outputFile||''));
+    const evidencePath=path.resolve(String(evidenceFile||path.join(runDir,NATIVE_DOWNLOAD_EVIDENCE_FILE)));
+    if(!evidencePath.startsWith(runDir+path.sep))throw new Error('原生下载证据文件必须属于当前制作记录目录。');
+    const checked=inspectNativeDownloadEvidence(evidencePath,{expectedIdentity:{projectId:p.id,projectVersion:p.version,taskId:pending.taskId,target:key,requestId:manifest.requestId,runId:run.runId},projectRoot,request:run.request,worker:run.worker,manifest,execution:run.execution,outputFile:expectedOutput});
+    if(!checked.ok)throw new Error(`Chrome 原生下载证据未通过校验：${checked.errors.slice(0,6).join('；')}`);
+    if(expectedOutput!==path.resolve(String(pending.file||'')))throw new Error('原生下载输出路径与当前 pending 不一致。');
+    const integrity={...checked.actual,path:expectedOutput,bytes:checked.actual.bytes,sizeBytes:checked.actual.bytes,format:String(checked.actual.format||'').toUpperCase(),extension:checked.actual.extension};
+    const recoveredAt=new Date().toISOString(),priorFailure={state:manifest.state,errorCode:manifest.errorCode||null,error:manifest.error||null,failedAt:manifest.failedAt||null,submissionUncertain:manifest.submissionUncertain===true};
+    const promoted=patchManifest({stage:'native-download-recovery',manifestFile:path.join(runDir,'web-generation.json'),args:{nativeEvidenceFile:evidencePath}});
+    const evidence=checked.evidence,timeline=recoveryTimeline({executionEndedAt:run.execution?.endedAt,priorResult:result,priorTask:task,downloadedAt:evidence.downloadedAt,recoveryCompletedAt:recoveredAt,now:Date.parse(recoveredAt)}),relativeFile=path.relative(projectRoot,expectedOutput);
+    const record={key,file:relativeFile,provider:webImageProvider,conversationUrl:evidence.conversationUrl,prompt:pending.prompt,basePrompt:pending.basePrompt||pending.prompt,revisionDelta:pending.revisionDelta||null,revisionBase:pending.revisionBase||null,executor:{model:pending.executorModel||run.worker.executorModel||null,reasoningEffort:pending.executorReasoningEffort||run.worker.executorReasoningEffort||null,role:pending.role||run.worker.role||'browser-executor'},refs:Array.isArray(pending.refs)?pending.refs:[],telemetry:pending.telemetry||null,integrity,downloadEvidence:null,nativeDownloadEvidence:evidence,recoveredFrom:'native-download',generationCompletedAt:timeline.generationCompletedAt,recoveryCompletedAt:timeline.recoveryCompletedAt,qa:{pass:null,status:'manual_review',summary:'原图已通过 Chrome 原生下载证据安全恢复，等待人工视觉校对。',issues:[],repairPrompt:'',source:'native_download_recovery'},at:recoveredAt};
+    invalidatePanelDownstream(p,panelKey);attachImageRecord(p,record);recordArtifact(p,artifactIdForImageKey(key),'image',relativeFile,[],{integrity,nativeDownloadEvidence:evidence,recoveredFrom:'native-download',recoveryAt:recoveredAt});jsonWrite(expectedOutput+'.json',record);
+    writeRunResult(runDir,{schemaVersion:2,provider:webImageProvider,projectId:p.id,projectVersion:p.version,taskId:pending.taskId,target:key,requestId:manifest.requestId,runId:run.runId,endedAt:recoveredAt,generationCompletedAt:timeline.generationCompletedAt,priorCompletedAt:timeline.priorCompletedAt,recoveryCompletedAt:timeline.recoveryCompletedAt,downloadedAt:evidence.downloadedAt,acceptanceState:'downloaded',accepted:true,submitted:true,artifact:relativeFile,integrity,nativeDownloadEvidence:evidence,recoveredFrom:'native-download',sourceOutcome:result?.outcome||null,priorFailure,diagnostics:generationDiagnosticSummary(runEvidence(runDir))});
+    fs.appendFileSync(path.join(runDir,'events.jsonl'),`${JSON.stringify({type:'native_download_recovered',schemaVersion:1,recoveredAt,projectId:p.id,projectVersion:p.version,taskId:pending.taskId,target:key,requestId:manifest.requestId,runId:run.runId,outputFile:expectedOutput,downloadedAt:evidence.downloadedAt,sha256:integrity.sha256,recoveredFrom:'native-download',priorFailure})}\n`,{encoding:'utf8',mode:0o600});
+    p.pending=null;p.lastFailure=null;p.error=null;p.status='paused';p.message=`${key} 已通过 Chrome 原生下载证据安全恢复，等待人工视觉校对；未重新生图。`;p.recoveryImports=Array.isArray(p.recoveryImports)?p.recoveryImports:[];p.recoveryImports.push({sourceRunDir:runDir,sourceOutputFile:expectedOutput,importedAt:recoveredAt,target:key,projectId:p.id,projectVersion:p.version,taskId:pending.taskId,requestId:manifest.requestId,outputFile:expectedOutput,sha256:integrity.sha256,recoveredFrom:'native-download'});p.recoveryImports=p.recoveryImports.slice(-40);
+    const webTimings={...task.webTimings,submittedAt:manifest.submittedAt||task.webTimings?.submittedAt||null,downloadedAt:evidence.downloadedAt,generationCompletedAt:timeline.generationCompletedAt,recoveryCompletedAt:timeline.recoveryCompletedAt,recoveredFrom:'native-download'};
+    finishTask(p,task,'recovered_local',{completedAt:recoveredAt,generationCompletedAt:timeline.generationCompletedAt,priorCompletedAt:timeline.priorCompletedAt,recoveryCompletedAt:timeline.recoveryCompletedAt,artifact:expectedOutput,qa:'manual_review',qaStatus:'manual_review',webState:'downloaded',webTimings,errorCode:null,error:null,recoverySource:{runDir,outputFile:expectedOutput,requestId:manifest.requestId,downloadedAt:evidence.downloadedAt,sha256:integrity.sha256,recoveredFrom:'native-download'},nativeDownloadEvidence:evidence});
+    saveProject(p);
+    return {project:p,runDir,file:expectedOutput,record,task,manifest:promoted.manifest,result, nativeDownloadEvidence:evidence,integrity,recoveredAt};
+  }
+
   function syncRecoveredMetadata(p,{dir,target,taskId,requestId,file}={}){
     const runDir=path.resolve(String(dir||'')),projectRoot=path.resolve(projectDir(p.id));
     if(!runDir.startsWith(path.join(projectRoot,'.制作记录')+path.sep))throw new Error('恢复元数据目录不属于当前作品制作记录。');
@@ -346,7 +391,7 @@ export function createImageRecovery({webImageProvider,readGenerationEvidence,gen
     p.pending=null;p.lastFailure=null;p.status='paused';p.error=null;const webTimings={...task.webTimings,downloadedAt:timeline.downloadedAt,generationCompletedAt:timeline.generationCompletedAt,recoveryCompletedAt:timeline.recoveryCompletedAt};finishTask(p,task,'recovered_local',{completedAt:timeline.recoveryCompletedAt,generationCompletedAt:timeline.generationCompletedAt,priorCompletedAt:timeline.priorCompletedAt,recoveryCompletedAt:timeline.recoveryCompletedAt,artifact:expectedOutput,qa:'manual_review',qaStatus:'manual_review',webState:'downloaded',webTimings,errorCode:null,error:null});saveProject(p);return p;
   }
 
-  return Object.freeze({checksum,verifyImage,matchingWebRunRecord,matchingPendingManifest:matchingManifest,inspectOrphanImageEvidence,persistImage,writeRunResult,runEvidence,attributableCandidates,assertCurrentPending,recoverImage,adoptRecoveredRun,syncRecoveredMetadata});
+  return Object.freeze({checksum,verifyImage,matchingWebRunRecord,matchingPendingManifest:matchingManifest,inspectOrphanImageEvidence,persistImage,writeRunResult,runEvidence,attributableCandidates,assertCurrentPending,recoverImage,adoptRecoveredRun,adoptNativeDownload,syncRecoveredMetadata});
 }
 
 export {generatedCandidates,extensionForImage,checksum};

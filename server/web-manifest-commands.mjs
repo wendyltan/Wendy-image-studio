@@ -49,6 +49,7 @@ export function buildManifestCommands(manifestFile,{helperFile=DEFAULT_HELPER,re
     submissionIntent:command('submission-intent'),
     submitted:command('submitted',' --conversation-url "<当前会话地址>" --submission-confirmed-by "new_user_message_and_stop_generation_control"'),
     downloaded:command('downloaded',' --conversation-url "<当前会话地址>"'),
+    nativeDownloadRecovery:command('native-download-recovery',' --native-evidence-file "<当前制作记录目录>/native-download-evidence.json"'),
     failed:command('failed',' --error-code "<错误代码>" --error "<简短原始错误>" --submitted <true或false> --submission-intent <true或false> --submission-uncertain <true或false> --pre-submission-failure <true或false>'),
     loginFailed:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'CHATGPT_LOGIN_REQUIRED',error:'ChatGPT 登录状态不可用'}),
     navigationFailed:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'CHATGPT_NAVIGATION_FAILED',error:'既有会话导航和同一标签页复查均未确认可用聊天输入框'}),

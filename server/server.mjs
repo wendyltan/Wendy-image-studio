@@ -6,7 +6,7 @@ import {execFile,spawn} from 'node:child_process';
 import {APP,ROOT,REFS,CHECKS,inside,digest} from './workflow.mjs';
 import {connectionStatus,appServerSnapshot,normalizeRateLimits} from './bridge.mjs';
 import {WEB_IMAGE_PROVIDER,readWebManifest,webWorkerStatus} from './chatgpt-web-provider.mjs';
-import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,decidePanel,rejectPanel,resume,reviseImage,repairPageLayout,unifyPageLayouts,recoverImage,reviewImage,retryMissingImage,imageRetryState,accept,recover,projectDir,syncRunningProject,refreshQuotaPauses,hasLiveWork} from './engine.mjs';
+import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,decidePanel,rejectPanel,resume,reviseImage,repairPageLayout,unifyPageLayouts,recoverImage,adoptNativeDownload,reviewImage,retryMissingImage,imageRetryState,accept,recover,projectDir,syncRunningProject,refreshQuotaPauses,hasLiveWork} from './engine.mjs';
 import {CATEGORIES,listDocuments,listAssets,discoverArchiveStories,archiveStory,stageUpload,readCandidate,inspectStagedCandidate,saveManualAsset,searchAssets,analyzeAsset,saveAssetProposal,applyAssetProposal,saveDocument,suggestDocument,deleteProjectFolder,deleteArchiveStory} from './library.mjs';
 import {applyProjectStorageCleanup,reportDownloadsRedundancy,reportProjectStorage} from './storage-hygiene.mjs';
 import {classifyFailure} from './failure-classifier.mjs';
@@ -321,6 +321,7 @@ const server=http.createServer(async(req,res)=>{
       else if(action==='repair-page-layout')repairPageLayout(p,b.pageNumber);
       else if(action==='unify-page-layouts')unifyPageLayouts(p);
       else if(action==='recover-image')recoverImage(p);
+      else if(action==='recover-native-download')await adoptNativeDownload(p,{dir:p.pending?.dir,file:p.pending?.file,target:p.pending?.key,evidenceFile:b.evidenceFile});
       else if(action==='review-image')reviewImage(p,b.key);
       else if(action==='accept')await accept(p,b.checks);
       else if(action==='settings'){

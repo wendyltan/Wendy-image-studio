@@ -5,10 +5,11 @@ import crypto from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 import {RUN_LOCKED_FIELDS,readJsonObject,readRunIdentity,compareRunIdentity} from './run-identity.mjs';
 import {inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence} from './web-download-evidence.mjs';
+import {inspectNativeDownloadEvidence,NATIVE_DOWNLOAD_EVIDENCE_FILE} from './native-download-evidence.mjs';
 
 const MANIFEST_STATES=new Set(['queued','accepted','ready','submitted','downloaded','failed']);
 const URL_RE=/^https:\/\/chatgpt\.com\/(?:c\/[^\s?#]+)?(?:[?#][^\s]*)?$/;
-const VALUE_KEYS=new Set(['conversationUrl','referenceCount','attachmentExpectedCount','attachmentObservedCount','attachmentPending','sendEnabled','failureStage','browserStage','runtimeErrorCategory','runtimeErrorMessage','runtimeErrorStack','runtimeErrorToolStage','runtimeErrorBrowserBudgetStage','errorCode','error','submissionConfirmedBy','artifactPath','accepted','submitted','submissionIntent','submissionUncertain','preSubmissionFailure','resumeCount','resumedAt','lastPreAcceptanceAttempt','lastConfirmedUnsentAttempt','confirmedUnsentAudit','role','executorModel','executorReasoningEffort','focusPolicy','ownedTabId','ownedTabCleanupStatus','ownedTabState','sessionName','ownedTabCreatedAt','cleanupStatus','cleanupVerifiedAt','cleanupError','kernelReset']);
+const VALUE_KEYS=new Set(['conversationUrl','referenceCount','attachmentExpectedCount','attachmentObservedCount','attachmentPending','sendEnabled','failureStage','browserStage','runtimeErrorCategory','runtimeErrorMessage','runtimeErrorStack','runtimeErrorToolStage','runtimeErrorBrowserBudgetStage','errorCode','error','submissionConfirmedBy','artifactPath','accepted','submitted','submissionIntent','submissionUncertain','preSubmissionFailure','resumeCount','resumedAt','lastPreAcceptanceAttempt','lastConfirmedUnsentAttempt','confirmedUnsentAudit','role','executorModel','executorReasoningEffort','focusPolicy','ownedTabId','ownedTabCleanupStatus','ownedTabState','sessionName','ownedTabCreatedAt','cleanupStatus','cleanupVerifiedAt','cleanupError','kernelReset','nativeEvidenceFile','recoveredFrom','recoveryEvidenceFile','recoveryAt','priorState','priorErrorCode','priorError','priorFailedAt']);
 
 function now(){return new Date().toISOString();}
 function usageError(message){const error=new Error(message);error.code='MANIFEST_PATCH_REJECTED';return error;}
@@ -108,11 +109,11 @@ function writeAtomic(file,value){
   try{fd=fs.openSync(temp,'wx',0o600);fs.writeFileSync(fd,text,{encoding:'utf8'});fs.fsyncSync(fd);fs.closeSync(fd);fd=null;fs.renameSync(temp,file);}
   catch(error){if(fd!==undefined&&fd!==null)try{fs.closeSync(fd);}catch{}try{fs.unlinkSync(temp);}catch{}throw error;}
 }
-function ensureState(currentManifest,next){
+function ensureState(currentManifest,next,{allowSubmittedFailureRecovery=false}={}){
   const current=currentManifest?.state;
   if(!MANIFEST_STATES.has(next))throw usageError(`非法 manifest 状态：${next}`);
   if(current==='downloaded'&&next!=='downloaded')throw usageError('已下载的 manifest 不允许回退状态。');
-  if(current==='failed'&&next!=='failed'&&currentManifest?.submitted===true)throw usageError('提交后的失败结果不允许被重置。');
+  if(current==='failed'&&next!=='failed'&&currentManifest?.submitted===true&&!allowSubmittedFailureRecovery)throw usageError('提交后的失败结果不允许被重置。');
 }
 function validateUrl(value){if(!URL_RE.test(String(value||'')))throw usageError('conversationUrl 必须是 chatgpt.com 会话地址。');return String(value);}
 function validateLockedPatch(patch){
@@ -178,6 +179,15 @@ function stagePatch(stage,args,record){
     patch.state='downloaded';patch.accepted=true;patch.submitted=true;patch.submissionIntent=true;patch.submissionUncertain=false;patch.preSubmissionFailure=false;patch.artifactPath=artifact;patch.downloadedAt=now();patch.errorCode=null;patch.error=null;patch.failedAt=null;
     applyOwnedTabPatch(patch,args);
     if(args.conversationUrl)patch.conversationUrl=validateUrl(args.conversationUrl);
+  }else if(stage==='native-download-recovery'){
+    if(!['failed','submitted'].includes(current.state)||current.accepted!==true||current.submitted!==true||current.submissionIntent!==true)throw usageError('原生下载恢复只允许已接单且已提交的 failed/submitted 请求。');
+    if(current.state==='failed'&&current.submissionUncertain!==true)throw usageError('failed 请求必须明确标记 submissionUncertain 才能恢复。');
+    const evidenceFile=path.resolve(String(args.nativeEvidenceFile||path.join(record.dir,NATIVE_DOWNLOAD_EVIDENCE_FILE)));
+    if(!evidenceFile.startsWith(path.resolve(record.dir)+path.sep))throw usageError('native evidence 文件必须属于当前制作记录目录。');
+    const checked=inspectNativeDownloadEvidence(evidenceFile,{expectedIdentity:{projectId:record.request?.projectId,projectVersion:record.request?.projectVersion,taskId:record.request?.taskId,target:record.request?.target,requestId:current.requestId,runId:record.runId},projectRoot:record.projectRoot,request:record.request,worker:record.worker,manifest:current,execution:record.execution,outputFile:outputPath(record)});
+    if(!checked.ok)throw usageError(`Chrome 原生下载证据未通过校验：${checked.errors.slice(0,6).join('；')}`);
+    patch.state='downloaded';patch.accepted=true;patch.submitted=true;patch.submissionIntent=true;patch.submissionUncertain=false;patch.preSubmissionFailure=false;patch.artifactPath=outputPath(record);patch.downloadedAt=checked.evidence.downloadedAt;patch.conversationUrl=validateUrl(checked.evidence.conversationUrl);patch.nativeEvidenceFile=evidenceFile;patch.recoveredFrom='native-download';patch.recoveryEvidenceFile=evidenceFile;patch.recoveryAt=now();patch.priorState=current.state;patch.priorErrorCode=current.errorCode||null;patch.priorError=current.error||null;patch.priorFailedAt=current.failedAt||null;patch.errorCode=null;patch.error=null;patch.failedAt=null;
+    applyOwnedTabPatch(patch,args);
   }else if(stage==='failed'){
     const flags=failureFlags(args,current),{submitted,submissionIntent,submissionUncertain,preSubmissionFailure}=flags;
     patch.state='failed';patch.accepted=current.accepted===true;patch.submitted=submitted;patch.errorCode=String(args.errorCode||'WEB_IMAGE_FAILED').slice(0,120);patch.error=String(args.error||'网页生图未完成。').slice(0,2000);patch.failedAt=now();
@@ -214,7 +224,7 @@ function stagePatch(stage,args,record){
     if(patch.ownedTabCleanupStatus!==undefined&&patch.cleanupStatus===undefined)patch.cleanupStatus=patch.ownedTabCleanupStatus;
   }else throw usageError(`不支持的 manifest 阶段：${stage}`);
   validateLockedPatch(patch);
-  ensureState(current.state,patch.state);
+  ensureState(current,patch.state,{allowSubmittedFailureRecovery:stage==='native-download-recovery'||stage==='resume'&&Boolean(args.confirmedUnsentAudit)});
   return patch;
 }
 
