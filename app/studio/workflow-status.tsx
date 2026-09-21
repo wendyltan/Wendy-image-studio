@@ -213,6 +213,9 @@ export function WorkflowStatus({
     task?.status === 'artifact_saved_unchecked' ||
     task?.status === 'review_required' ||
     task?.errorCode === 'QA_UNAVAILABLE';
+  const recoveredExecutorIssue =
+    task?.artifactAcceptanceState === 'recovered' ||
+    task?.webTimings?.artifactAcceptanceState === 'recovered';
   const statusMessage =
     webFailureText ||
     (ownedTabState === 'uploading' || ownedTabState === 'uploaded'
@@ -220,7 +223,9 @@ export function WorkflowStatus({
       : ownedTabText && ['close_unconfirmed', 'orphaned'].includes(ownedTabState)
         ? ownedTabText
         : '') ||
-    (savedArtifactQaUnavailable
+    (recoveredExecutorIssue
+      ? task?.recoveryNotice || '原图已恢复，执行器曾异常；请人工校对。'
+      : savedArtifactQaUnavailable
       ? '原图已保存，自动校对未完成，请人工查看；不会自动重生'
       : task?.status === 'not_accepted'
         ? '后台尚未确认接单，已停止本机等待；请求已保留，不会自动重试。'

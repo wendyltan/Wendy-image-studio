@@ -9,7 +9,7 @@ import {inspectNativeDownloadEvidence,NATIVE_DOWNLOAD_EVIDENCE_FILE} from './nat
 
 const MANIFEST_STATES=new Set(['queued','accepted','ready','submitted','downloaded','failed']);
 const URL_RE=/^https:\/\/chatgpt\.com\/(?:c\/[^\s?#]+)?(?:[?#][^\s]*)?$/;
-const VALUE_KEYS=new Set(['conversationUrl','referenceCount','attachmentExpectedCount','attachmentObservedCount','attachmentPending','sendEnabled','failureStage','browserStage','runtimeErrorCategory','runtimeErrorMessage','runtimeErrorStack','runtimeErrorToolStage','runtimeErrorBrowserBudgetStage','errorCode','error','submissionConfirmedBy','artifactPath','accepted','submitted','submissionIntent','submissionUncertain','preSubmissionFailure','resumeCount','resumedAt','lastPreAcceptanceAttempt','lastConfirmedUnsentAttempt','confirmedUnsentAudit','role','executorModel','executorReasoningEffort','focusPolicy','ownedTabId','ownedTabCleanupStatus','ownedTabState','sessionName','ownedTabCreatedAt','cleanupStatus','cleanupVerifiedAt','cleanupError','kernelReset','nativeEvidenceFile','recoveredFrom','recoveryEvidenceFile','recoveryAt','priorState','priorErrorCode','priorError','priorFailedAt']);
+const VALUE_KEYS=new Set(['conversationUrl','referenceCount','attachmentExpectedCount','attachmentObservedCount','attachmentPending','sendEnabled','failureStage','browserStage','runtimeErrorCategory','runtimeErrorMessage','runtimeErrorStack','runtimeErrorToolStage','runtimeErrorBrowserBudgetStage','errorCode','error','submissionConfirmedBy','artifactPath','accepted','submitted','submissionIntent','submissionUncertain','preSubmissionFailure','resumeCount','resumedAt','lastPreAcceptanceAttempt','lastConfirmedUnsentAttempt','confirmedUnsentAudit','role','executorModel','executorReasoningEffort','focusPolicy','ownedTabId','ownedTabCleanupStatus','ownedTabState','sessionName','ownedTabCreatedAt','cleanupStatus','cleanupVerifiedAt','cleanupError','kernelReset','nativeEvidenceFile','recoveredFrom','recoveryEvidenceFile','recoveryAt','priorState','priorErrorCode','priorError','priorFailedAt','priorFailure','executorExecutionState','artifactAcceptanceState']);
 
 function now(){return new Date().toISOString();}
 function usageError(message){const error=new Error(message);error.code='MANIFEST_PATCH_REJECTED';return error;}
@@ -60,6 +60,26 @@ function optionalInteger(value,key){
 function optionalBoolean(value,key){
   if(value===undefined)return undefined;
   return bool(value,key);
+}
+function executorExecutionState(value){
+  const normalized=String(value??'').trim();
+  const allowed=['not_started','queued','accepted','ready','submission_intent','submitted','generating','completed','failed','unknown','recovered'];
+  if(!allowed.includes(normalized))throw usageError(`executorExecutionState 不支持：${normalized}`);
+  return normalized;
+}
+function artifactAcceptanceState(value){
+  const normalized=String(value??'').trim();
+  const allowed=['none','ready','submitted','unknown','downloaded','recovered'];
+  if(!allowed.includes(normalized))throw usageError(`artifactAcceptanceState 不支持：${normalized}`);
+  return normalized;
+}
+function applyLayeredStatePatch(patch,args){
+  if(args.executorExecutionState!==undefined)patch.executorExecutionState=executorExecutionState(args.executorExecutionState);
+  if(args.artifactAcceptanceState!==undefined)patch.artifactAcceptanceState=artifactAcceptanceState(args.artifactAcceptanceState);
+  if(args.priorFailure!==undefined){
+    if(args.priorFailure===null||String(args.priorFailure).trim()==='')patch.priorFailure=null;
+    else{try{const value=JSON.parse(String(args.priorFailure));if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('not-object');patch.priorFailure=value;}catch{throw usageError('priorFailure 必须是 JSON 对象。');}}
+  }
 }
 function applyAttachmentPatch(patch,args){
   const integerFields=[['attachmentExpectedCount','attachmentExpectedCount'],['attachmentObservedCount','attachmentObservedCount']];
@@ -150,10 +170,10 @@ function stagePatch(stage,args,record){
   const patch={};
   if(stage==='accepted'){
     if(current.state!=='queued'||current.accepted===true)throw usageError('accepted 只能从 queued 且未接单状态写入。');
-    patch.state='accepted';patch.accepted=true;patch.acceptedAt=now();
+    patch.state='accepted';patch.accepted=true;patch.acceptedAt=now();patch.executorExecutionState='accepted';patch.artifactAcceptanceState='none';
   }else if(stage==='ready'){
     if(!['accepted','ready'].includes(current.state)||current.accepted!==true)throw usageError('ready 前必须已经 accepted。');
-    patch.state='ready';patch.accepted=true;patch.submitted=false;patch.conversationUrl=validateUrl(args.conversationUrl);patch.referenceCount=integer(args.referenceCount,'referenceCount');patch.readyAt=now();applyAttachmentPatch(patch,args);
+    patch.state='ready';patch.accepted=true;patch.submitted=false;patch.conversationUrl=validateUrl(args.conversationUrl);patch.referenceCount=integer(args.referenceCount,'referenceCount');patch.readyAt=now();patch.executorExecutionState='ready';patch.artifactAcceptanceState='ready';applyAttachmentPatch(patch,args);
     if(patch.attachmentExpectedCount===undefined)patch.attachmentExpectedCount=patch.referenceCount;
     if(patch.attachmentObservedCount===undefined)patch.attachmentObservedCount=patch.referenceCount;
     if(patch.attachmentPending===undefined)patch.attachmentPending=false;
@@ -162,10 +182,10 @@ function stagePatch(stage,args,record){
   }else if(stage==='submission-intent'){
     if(!['ready','submitted'].includes(current.state)||current.accepted!==true)throw usageError('submission-intent 前必须已经 ready。');
     if(current.submitted===true)throw usageError('已提交的请求不能再次写入 submission-intent。');
-    patch.state='ready';patch.submissionIntent=true;patch.submitted=false;patch.submissionAttemptAt=now();patch.browserStage='submission_intent_recorded';
+    patch.state='ready';patch.submissionIntent=true;patch.submitted=false;patch.submissionAttemptAt=now();patch.executorExecutionState='submission_intent';patch.artifactAcceptanceState='ready';patch.browserStage='submission_intent_recorded';
   }else if(stage==='submitted'){
     if(current.accepted!==true||current.submissionIntent!==true)throw usageError('submitted 前必须先写入 submission-intent。');
-    patch.state='submitted';patch.accepted=true;patch.submitted=true;patch.submittedAt=now();patch.submissionConfirmedBy=String(args.submissionConfirmedBy||'positive_browser_evidence');patch.browserStage='submitted';
+    patch.state='submitted';patch.accepted=true;patch.submitted=true;patch.submittedAt=now();patch.executorExecutionState='submitted';patch.artifactAcceptanceState='submitted';patch.submissionConfirmedBy=String(args.submissionConfirmedBy||'positive_browser_evidence');patch.browserStage='submitted';
     if(args.conversationUrl)patch.conversationUrl=validateUrl(args.conversationUrl);
   }else if(stage==='downloaded'){
     if(current.submitted!==true)throw usageError('downloaded 前必须已经 submitted。');
@@ -176,7 +196,7 @@ function stagePatch(stage,args,record){
       const evidence=readDownloadEvidence(record.dir),result=readJsonObject(path.join(record.dir,'result.json')),validation=validateDownloadEvidence(evidence,{expectedIdentity:{projectId:record.request?.projectId,projectVersion:record.request?.projectVersion,taskId:record.request?.taskId,target:record.request?.target,requestId:current.requestId,runId:record.runId,conversationUrl:String(args.conversationUrl||current.conversationUrl||''),outputFile:artifact},request:record.request,worker:record.worker,result,manifest:current,outputFile:artifact,actual});
       if(!validation.ok)throw usageError(`结构化 pageAssets 下载证据未通过校验：${validation.errors.slice(0,4).join('；')}`);
     }
-    patch.state='downloaded';patch.accepted=true;patch.submitted=true;patch.submissionIntent=true;patch.submissionUncertain=false;patch.preSubmissionFailure=false;patch.artifactPath=artifact;patch.downloadedAt=now();patch.errorCode=null;patch.error=null;patch.failedAt=null;
+    patch.state='downloaded';patch.accepted=true;patch.submitted=true;patch.submissionIntent=true;patch.submissionUncertain=false;patch.preSubmissionFailure=false;patch.artifactPath=artifact;patch.downloadedAt=now();patch.errorCode=null;patch.error=null;patch.failedAt=null;patch.failureStage=null;patch.browserStage=null;patch.runtimeErrorCategory=null;patch.runtimeErrorMessage=null;patch.runtimeErrorStack=null;patch.runtimeErrorToolStage=null;patch.runtimeErrorBrowserBudgetStage=null;patch.executorExecutionState='completed';patch.artifactAcceptanceState='downloaded';
     applyOwnedTabPatch(patch,args);
     if(args.conversationUrl)patch.conversationUrl=validateUrl(args.conversationUrl);
   }else if(stage==='native-download-recovery'){
@@ -186,11 +206,11 @@ function stagePatch(stage,args,record){
     if(!evidenceFile.startsWith(path.resolve(record.dir)+path.sep))throw usageError('native evidence 文件必须属于当前制作记录目录。');
     const checked=inspectNativeDownloadEvidence(evidenceFile,{expectedIdentity:{projectId:record.request?.projectId,projectVersion:record.request?.projectVersion,taskId:record.request?.taskId,target:record.request?.target,requestId:current.requestId,runId:record.runId},projectRoot:record.projectRoot,request:record.request,worker:record.worker,manifest:current,execution:record.execution,outputFile:outputPath(record)});
     if(!checked.ok)throw usageError(`Chrome 原生下载证据未通过校验：${checked.errors.slice(0,6).join('；')}`);
-    patch.state='downloaded';patch.accepted=true;patch.submitted=true;patch.submissionIntent=true;patch.submissionUncertain=false;patch.preSubmissionFailure=false;patch.artifactPath=outputPath(record);patch.downloadedAt=checked.evidence.downloadedAt;patch.conversationUrl=validateUrl(checked.evidence.conversationUrl);patch.nativeEvidenceFile=evidenceFile;patch.recoveredFrom='native-download';patch.recoveryEvidenceFile=evidenceFile;patch.recoveryAt=now();patch.priorState=current.state;patch.priorErrorCode=current.errorCode||null;patch.priorError=current.error||null;patch.priorFailedAt=current.failedAt||null;patch.errorCode=null;patch.error=null;patch.failedAt=null;
+    patch.state='downloaded';patch.accepted=true;patch.submitted=true;patch.submissionIntent=true;patch.submissionUncertain=false;patch.preSubmissionFailure=false;patch.artifactPath=outputPath(record);patch.submittedAt=checked.evidence.submittedAt||current.submittedAt||null;patch.downloadedAt=checked.evidence.downloadedAt;patch.conversationUrl=validateUrl(checked.evidence.conversationUrl);patch.nativeEvidenceFile=evidenceFile;patch.recoveredFrom='native-download';patch.recoveryEvidenceFile=evidenceFile;patch.recoveryAt=now();patch.priorState=current.state;patch.priorErrorCode=current.errorCode||null;patch.priorError=current.error||null;patch.priorFailedAt=current.failedAt||null;patch.priorFailure={state:current.state,errorCode:current.errorCode||null,error:current.error||null,failedAt:current.failedAt||null,submissionUncertain:current.submissionUncertain===true,failureStage:current.failureStage||null,browserStage:current.browserStage||null,runtimeErrorCategory:current.runtimeErrorCategory||null,runtimeErrorMessage:current.runtimeErrorMessage||null,runtimeErrorStack:current.runtimeErrorStack||null,runtimeErrorToolStage:current.runtimeErrorToolStage||null,runtimeErrorBrowserBudgetStage:current.runtimeErrorBrowserBudgetStage||null,executorExecutionState:current.executorExecutionState||null,artifactAcceptanceState:current.artifactAcceptanceState||null,ownedTabState:current.ownedTabState||null,ownedTabCleanupStatus:current.ownedTabCleanupStatus||current.cleanupStatus||null,cleanupError:current.cleanupError||null};patch.errorCode=null;patch.error=null;patch.failedAt=null;patch.failureStage=null;patch.browserStage=null;patch.runtimeErrorCategory=null;patch.runtimeErrorMessage=null;patch.runtimeErrorStack=null;patch.runtimeErrorToolStage=null;patch.runtimeErrorBrowserBudgetStage=null;patch.executorExecutionState=current.executorExecutionState==='failed'||record.execution?.state==='failed'?'failed':'completed';patch.artifactAcceptanceState='recovered';
     applyOwnedTabPatch(patch,args);
   }else if(stage==='failed'){
     const flags=failureFlags(args,current),{submitted,submissionIntent,submissionUncertain,preSubmissionFailure}=flags;
-    patch.state='failed';patch.accepted=current.accepted===true;patch.submitted=submitted;patch.errorCode=String(args.errorCode||'WEB_IMAGE_FAILED').slice(0,120);patch.error=String(args.error||'网页生图未完成。').slice(0,2000);patch.failedAt=now();
+    patch.state='failed';patch.accepted=current.accepted===true;patch.submitted=submitted;patch.errorCode=String(args.errorCode||'WEB_IMAGE_FAILED').slice(0,120);patch.error=String(args.error||'网页生图未完成。').slice(0,2000);patch.failedAt=now();patch.executorExecutionState='failed';patch.artifactAcceptanceState=submitted?'unknown':'none';
     if(!submitted)patch.referenceCount=0;
     patch.submissionIntent=submissionIntent;
     patch.submissionUncertain=submissionUncertain;
@@ -201,7 +221,7 @@ function stagePatch(stage,args,record){
   }else if(stage==='resume'){
     const confirmedUnsent=Boolean(args.confirmedUnsentAudit);
     if(!['queued','failed'].includes(current.state)||current.submitted===true&&!confirmedUnsent)throw usageError('只有未提交或确认未发送的请求可以续接。');
-    patch.state='queued';patch.accepted=false;patch.submitted=false;patch.submissionIntent=false;patch.submissionUncertain=false;patch.preSubmissionFailure=false;patch.referenceCount=0;patch.attachmentExpectedCount=0;patch.attachmentObservedCount=0;patch.attachmentPending=null;patch.sendEnabled=false;patch.failureStage=null;patch.browserStage='queued';patch.runtimeErrorCategory=null;patch.runtimeErrorMessage=null;patch.runtimeErrorStack=null;patch.runtimeErrorToolStage=null;patch.runtimeErrorBrowserBudgetStage=null;patch.acceptedAt=null;patch.readyAt=null;patch.submissionAttemptAt=null;patch.submittedAt=null;patch.downloadedAt=null;patch.artifactPath=null;patch.errorCode=null;patch.error=null;
+    patch.state='queued';patch.accepted=false;patch.submitted=false;patch.submissionIntent=false;patch.submissionUncertain=false;patch.preSubmissionFailure=false;patch.referenceCount=0;patch.attachmentExpectedCount=0;patch.attachmentObservedCount=0;patch.attachmentPending=null;patch.sendEnabled=false;patch.failureStage=null;patch.browserStage='queued';patch.runtimeErrorCategory=null;patch.runtimeErrorMessage=null;patch.runtimeErrorStack=null;patch.runtimeErrorToolStage=null;patch.runtimeErrorBrowserBudgetStage=null;patch.executorExecutionState='queued';patch.artifactAcceptanceState='none';patch.acceptedAt=null;patch.readyAt=null;patch.submissionAttemptAt=null;patch.submittedAt=null;patch.downloadedAt=null;patch.artifactPath=null;patch.errorCode=null;patch.error=null;
     if(args.resumeCount!==undefined)patch.resumeCount=integer(args.resumeCount,'resumeCount');
     if(args.resumedAt!==undefined)patch.resumedAt=String(args.resumedAt);
     if(args.lastPreAcceptanceAttempt!==undefined)patch.lastPreAcceptanceAttempt=String(args.lastPreAcceptanceAttempt);
@@ -214,6 +234,7 @@ function stagePatch(stage,args,record){
     }
     if(args.resumeCount!==undefined)patch.resumeCount=integer(args.resumeCount,'resumeCount');
     applyAttachmentPatch(patch,args);
+    applyLayeredStatePatch(patch,args);
     applyOwnedTabPatch(patch,args);
   }else if(stage==='cleanup'){
     patch.state=current.state;
