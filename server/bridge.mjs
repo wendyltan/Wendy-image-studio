@@ -141,9 +141,16 @@ function browserToolCallInfo(event,{dir,cleanupCallUsed=false}={}){
   const fixedCleanup=source.includes(BROWSER_CLEANUP_MARKER)&&closeLike&&/(?:--state[^\n]{0,120}closing|ownedTabStage[^\n]*closing|cleanup-status|\bfinally\b)/i.test(source);
   let lease=null;
   try{lease=dir?readOwnedTabLease(dir):null;}catch{}
-  const ownedTabHeld=Boolean(lease?.ownedTabId)&&!['not_created','creating','closed_verified','orphaned'].includes(lease?.state);
-  const cleanupAuthorized=fixedCleanup&&ownedTabHeld&&!cleanupCallUsed;
-  return {id:String(item.id||event?.item_id||event?.id||''),phase:type.includes('started')?'started':type.includes('completed')?'completed':'other',kind:cleanupAuthorized?'cleanup':'business',closeLike,fixedCleanup,ownedTabHeld,leaseState:lease?.state||null};
+  const runId=path.basename(path.resolve(String(dir||'')));
+  const leaseRunMatches=Boolean(lease?.runId)&&lease.runId===runId;
+  const sourceRunId=source.match(/--run-id\s+(?:"([^"]+)"|'([^']+)'|([^\s;,)]+))/i)?.slice(1).find(Boolean)||source.match(/--run-id["']\s*,\s*["']([^"']+)/i)?.[1]||null;
+  const sourceRunMatches=Boolean(sourceRunId&&sourceRunId===runId);
+  const leaseOwnedTabId=String(lease?.ownedTabId||'');
+  const sourceOwnedTabId=source.match(/--owned-tab-id\s+(?:"([^"]+)"|'([^']+)'|([^\s;,)]+))/i)?.slice(1).find(Boolean)||source.match(/--owned-tab-id["']\s*,\s*["']([^"']+)/i)?.[1]||null;
+  const ownedTabMatches=Boolean(leaseOwnedTabId&&sourceOwnedTabId&&leaseOwnedTabId===sourceOwnedTabId);
+  const cleanupCandidate=fixedCleanup&&closeLike;
+  const cleanupAuthorized=cleanupCandidate&&lease?.state==='closing'&&leaseRunMatches&&sourceRunMatches&&ownedTabMatches&&!cleanupCallUsed;
+  return {id:String(item.id||event?.item_id||event?.id||''),phase:type.includes('started')?'started':type.includes('completed')?'completed':'other',kind:cleanupAuthorized?'cleanup':cleanupCandidate?'deferred_cleanup':'business',closeLike,fixedCleanup,cleanupCandidate,leaseState:lease?.state||null,leaseRunMatches,sourceRunMatches,ownedTabMatches,ownedTabId:leaseOwnedTabId||null};
 }
 
 function eventContainsSubmissionIntent(event){
@@ -431,8 +438,9 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
     let buf='',last='',error='',settled=false,timedOut=false,usage=null;
     const capturedEvents=[];
     let runtimeError=null;
-    let browserToolCalls=0,browserBusinessCalls=0,browserCleanupCalls=0,submissionIntentObserved=false,budgetFailure=null,anonymousBrowserStarts=0;
+    let browserToolCalls=0,browserBusinessCalls=0,browserCleanupCalls=0,submissionIntentObserved=false,budgetFailure=null,anonymousCallSequence=0;
     const browserToolCallIds=new Set();
+    const deferredCleanupCallIds=new Set(),anonymousActiveCallIds=[];
     const persistRuntimeError=(candidate)=>{
       if(!candidate||runtimeError)return;
       runtimeError=writeExecutorRuntimeError(dir,candidate);
@@ -466,6 +474,18 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
       }
       resolve(result);
     };
+    const registerBrowserToolCall=(callKey,kind,event)=>{
+      if(browserToolCallIds.has(callKey))return;
+      browserToolCallIds.add(callKey);browserToolCalls+=1;
+      if(kind==='cleanup')browserCleanupCalls+=1;else browserBusinessCalls+=1;
+      submissionIntentObserved=submissionIntentObserved||eventContainsSubmissionIntent(event)||manifestHasSubmissionIntent(dir);
+      if(browserBusinessCalls>BROWSER_TOOL_BUSINESS_CALL_BUDGET&&!budgetFailure){
+        const record=writeBrowserToolBudget(dir,{observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,budgetKind:'business',submissionIntentObserved});
+        budgetFailure={code:'BROWSER_TOOL_BUDGET_EXCEEDED',observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,limit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,submissionIntentObserved,message:`BROWSER_TOOL_BUDGET_EXCEEDED: 浏览器业务 CUA 调用已达到 ${BROWSER_TOOL_BUSINESS_CALL_BUDGET} 次上限；第 ${browserBusinessCalls} 个业务调用已被父进程终止。`};
+        const budgetEvent={type:'browser_tool_budget_exceeded',errorCode:budgetFailure.code,observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,limit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,cleanupLimit:BROWSER_TOOL_CLEANUP_CALL_BUDGET,submissionIntentObserved,stage:record?.stage||(budgetFailure.submissionIntentObserved?'post_submission_intent':'pre_submission_intent')};
+        capturedEvents.push(budgetEvent);log.write(boundedEventLine(budgetEvent)+'\n');stop();
+      }
+    };
     child.stdout.on('data',c=>{
       buf+=c;
       const lines=buf.split('\n');buf=lines.pop();
@@ -474,21 +494,21 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
         try{
           const e=JSON.parse(line),browserCall=browserToolCallInfo(e,{dir,cleanupCallUsed:browserCleanupCalls>=BROWSER_TOOL_CLEANUP_CALL_BUDGET});
           if(browserCall){
-            const anonymousCompletion=browserCall.id===''&&browserCall.phase==='completed'&&anonymousBrowserStarts>0;
-            const callKey=browserCall.id||`anonymous-${browserToolCalls+1}`;
-            if(browserCall.id===''&&browserCall.phase==='started')anonymousBrowserStarts+=1;
-            if(anonymousCompletion)anonymousBrowserStarts-=1;
-            if(!anonymousCompletion&&!browserToolCallIds.has(callKey)){
-              browserToolCallIds.add(callKey);browserToolCalls+=1;
-              if(browserCall.kind==='cleanup')browserCleanupCalls+=1;else browserBusinessCalls+=1;
-              submissionIntentObserved=submissionIntentObserved||eventContainsSubmissionIntent(e)||manifestHasSubmissionIntent(dir);
-              if(browserBusinessCalls>BROWSER_TOOL_BUSINESS_CALL_BUDGET&&!budgetFailure){
-                const record=writeBrowserToolBudget(dir,{observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,budgetKind:'business',submissionIntentObserved});
-                budgetFailure={code:'BROWSER_TOOL_BUDGET_EXCEEDED',observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,limit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,submissionIntentObserved,message:`BROWSER_TOOL_BUDGET_EXCEEDED: 浏览器业务 CUA 调用已达到 ${BROWSER_TOOL_BUSINESS_CALL_BUDGET} 次上限；第 ${browserBusinessCalls} 个业务调用已被父进程终止。`};
-                const budgetEvent={type:'browser_tool_budget_exceeded',errorCode:budgetFailure.code,observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,limit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,cleanupLimit:BROWSER_TOOL_CLEANUP_CALL_BUDGET,submissionIntentObserved,stage:record?.stage||(budgetFailure.submissionIntentObserved?'post_submission_intent':'pre_submission_intent')};
-                capturedEvents.push(budgetEvent);log.write(boundedEventLine(budgetEvent)+'\n');stop();
-              }
+            let callKey=browserCall.id;
+            if(!callKey){
+              if(browserCall.phase==='started'){callKey=`anonymous-${++anonymousCallSequence}`;anonymousActiveCallIds.push(callKey);}
+              else if(browserCall.phase==='completed')callKey=anonymousActiveCallIds.shift()||`anonymous-${++anonymousCallSequence}`;
+              else callKey=`anonymous-${++anonymousCallSequence}`;
             }
+            if(browserCall.phase==='started'&&browserCall.kind==='deferred_cleanup')deferredCleanupCallIds.add(callKey);
+            else if(deferredCleanupCallIds.has(callKey)){
+              deferredCleanupCallIds.delete(callKey);
+              const completed=browserToolCallInfo(e,{dir,cleanupCallUsed:browserCleanupCalls>=BROWSER_TOOL_CLEANUP_CALL_BUDGET});
+              registerBrowserToolCall(callKey,completed?.kind==='cleanup'?'cleanup':'business',e);
+            } else if(browserCall.kind==='deferred_cleanup'){
+              const completed=browserToolCallInfo(e,{dir,cleanupCallUsed:browserCleanupCalls>=BROWSER_TOOL_CLEANUP_CALL_BUDGET});
+              registerBrowserToolCall(callKey,completed?.kind==='cleanup'?'cleanup':'business',e);
+            } else registerBrowserToolCall(callKey,browserCall.kind,e);
           }
           const compact=boundedEvent(e);
           capturedEvents.push(compact);

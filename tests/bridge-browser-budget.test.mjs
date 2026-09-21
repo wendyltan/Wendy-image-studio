@@ -10,9 +10,12 @@ const root=fs.mkdtempSync(path.join(os.tmpdir(),'wendi-browser-budget-'));
 
 function fixture(mode){
   const dir=fs.mkdtempSync(path.join(root,`${mode}-`)),bin=path.join(dir,'fixture-worker.mjs'),fifth=path.join(dir,'fifth-business'),closed=path.join(dir,'cleanup-call'),after=path.join(dir,'after-budget');
-  if(mode==='four-business-close'||mode==='close-abuse')fs.writeFileSync(path.join(dir,'owned-tab-lease.json'),JSON.stringify({schemaVersion:1,runId:path.basename(dir),requestId:'11111111-1111-4111-8111-111111111111',sessionName:'fixture',ownedTabId:'tab-fixture',createdAt:new Date().toISOString(),state:mode==='four-business-close'?'closing':'created',cleanupStatus:'open',cleanupVerifiedAt:null,cleanupError:null,kernelReset:false,updatedAt:new Date().toISOString()}));
+  if(mode==='four-business-close'||mode==='close-abuse')fs.writeFileSync(path.join(dir,'owned-tab-lease.json'),JSON.stringify({schemaVersion:1,runId:path.basename(dir),requestId:'11111111-1111-4111-8111-111111111111',sessionName:'fixture',ownedTabId:'tab-fixture',createdAt:new Date().toISOString(),state:mode==='four-business-close'?'downloaded':'created',cleanupStatus:'open',cleanupVerifiedAt:null,cleanupError:null,kernelReset:false,updatedAt:new Date().toISOString()}));
   const source=`#!/usr/bin/env node
 import fs from 'node:fs';
+import path from 'node:path';
+const dir=process.cwd();
+const runId=path.basename(process.cwd());
 const mode=${JSON.stringify(mode)};
 const fifth=${JSON.stringify(fifth)};
 const closed=${JSON.stringify(closed)};
@@ -22,7 +25,7 @@ const emit=(index,code='noop')=>{const item={id:'item_'+index,type:'mcp_tool_cal
 const businessCode=index=>index===1&&mode==='post-intent'?'submission-intent':'noop';
 const calls=mode==='four-business-close'?['business','business','business','business','close']:mode==='close-abuse'?['abuse','business','business','business','business']:['business','business','business','business','business'];
 let index=0;
-const next=()=>{const kind=calls[index];if(!kind){setTimeout(()=>{fs.writeFileSync(after,'1');process.exit(0)},800);return;}index+=1;if(index===5&&kind==='business')fs.writeFileSync(fifth,'1');if(kind==='close'){fs.writeFileSync(closed,'1');fs.writeFileSync(after,'1');emit(index,marker+'; await tab.close(); await execFile("owned-tab-lease","--state","closing");');setTimeout(()=>process.exit(0),120);return;}if(kind==='abuse')emit(index,'await tab.close();');else emit(index,businessCode(index));setTimeout(next,60)};
+const next=()=>{const kind=calls[index];if(!kind){setTimeout(()=>{fs.writeFileSync(after,'1');process.exit(0)},800);return;}index+=1;if(index===5&&kind==='business')fs.writeFileSync(fifth,'1');if(kind==='close'){const leaseFile=path.join(dir,'owned-tab-lease.json');const lease=JSON.parse(fs.readFileSync(leaseFile,'utf8'));lease.state='closing';fs.writeFileSync(leaseFile,JSON.stringify(lease));fs.writeFileSync(closed,'1');fs.writeFileSync(after,'1');emit(index,marker+'; await tab.close(); --run-id "'+runId+'" --owned-tab-id "tab-fixture" --state closing;');setTimeout(()=>process.exit(0),120);return;}if(kind==='abuse')emit(index,marker+'; await tab.close(); --run-id "'+runId+'" --owned-tab-id "tab-fixture" --state closing;');else emit(index,businessCode(index));setTimeout(next,60)};
 next();
 `;
   fs.writeFileSync(bin,source,{mode:0o755});
