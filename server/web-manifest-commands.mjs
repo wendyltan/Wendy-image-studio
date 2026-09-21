@@ -70,7 +70,7 @@ export function buildManifestCommands(manifestFile,{helperFile=DEFAULT_HELPER,re
     ownedTabReserveCreate:leaseCommand('reserve-create',{manifestFile,runId,requestId,sessionName}),
     ownedTabCreated:(ownedTabId,tabSessionName=sessionName)=>leaseCommand('stage',{manifestFile,runId,requestId,state:'created',ownedTabId,sessionName:tabSessionName}),
     ownedTabStage:(state,ownedTabId)=>leaseCommand('stage',{manifestFile,runId,requestId,state,ownedTabId}),
-    ownedTabCleanup:(status,ownedTabId,error,verification='exact-owned-tab-close-returned')=>leaseCommand('cleanup',{manifestFile,runId,requestId,status,ownedTabId,error,verification}),
+    ownedTabCleanup:(status,ownedTabId,error,verification)=>leaseCommand('cleanup',{manifestFile,runId,requestId,status,ownedTabId,error,verification:verification??(status==='closed'?'exact-owned-tab-close-returned':'')}),
     focusUnavailable:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'BROWSER_FOCUS_UNAVAILABLE',error:'Chrome 专用标签页焦点能力不可用'}),
     confirmedUnsentUploadFailed:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.confirmedUnsent,errorCode:'ATTACHMENT_VERIFICATION_TIMEOUT',error:'已记录发送意图但页面确认未发送'}),
     submissionUncertain:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.uncertain,errorCode:'SUBMISSION_UNCERTAIN',error:'点击发送后无法确认是否送达'}),

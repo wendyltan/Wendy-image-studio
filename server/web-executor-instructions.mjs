@@ -2,6 +2,7 @@ import path from 'node:path';
 import {buildManifestCommands} from './web-manifest-commands.mjs';
 import {ownedTabSessionName} from './owned-tab-lease.mjs';
 import {assertRemotePrompt} from './remote-prompt.mjs';
+import {BROWSER_CLEANUP_MARKER} from './bridge.mjs';
 
 function listedFiles(files=[]){
   return files.map((file,index)=>`${index+1}. ${JSON.stringify(path.resolve(file))}`).join('\n');
@@ -53,7 +54,7 @@ export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,remoteProm
 - 参考文件必须作为彼此独立的附件上传并逐项确认。不得用截图代替附件。
 - 完成后必须下载网页生成的原始图片。网页截图、屏幕截图和程序绘制图片都不能作为结果。
 - 除写入下列目标图片和执行记录外，不修改本地文件。
-- CUA 输出必须保持紧凑：每次浏览器 CUA 调用可能自动附带截图并进入执行器上下文，因此父进程对整个本次执行设置硬上限：所有 cua_repl/js 浏览器调用（包括创建专用 tab 和最后 close；创建与 close 不另有豁免）合计最多 3 次，第 4 次会被父进程终止并记录 BROWSER_TOOL_BUDGET_EXCEEDED；必须把创建、导航/模式/上传/填词、发送确认和下载+close 合并到这 3 次内。不要为每个按钮或每个附件单独发起 CUA 调用。禁止调用 getScreenshot()、getAXStateAndScreenshot() 或 domSnapshot()。需要读取 DOM 时，只在当前脚本变量中调用 tab.getAXState({emit:false})，解析成布尔值、附件名称数组、数量、发送按钮状态、当前 URL 和错误摘要，再通过 nodeRepl.write(JSON.stringify(summary)) 返回；任何中间输出不得包含 AX 原文、页面截图、data:image/base64、完整侧边栏或提示词，单次摘要不超过 4KB。必须把导航、创建图片入口、路径 A/B、setFiles、附件核验和填词合并到尽可能少的 CUA 调用；通过 ready 后把 submission-intent 与紧接着的一次发送/正向确认合并到同一个最短 CUA 调用。完整截图/base64 不属于状态证据，禁止写入事件、回复或下一轮上下文。
+- CUA 输出必须保持紧凑：每次浏览器 CUA 调用可能自动附带截图并进入执行器上下文。父进程对本次执行设置 4 个业务 CUA/js 槽位，另保留 1 个独立 cleanup/close 槽位：第 5 个业务调用立即终止并记录 BROWSER_TOOL_BUDGET_EXCEEDED；cleanup 槽位不计入业务槽，但只接受同时满足以下审计条件的最后清理调用：仍持有本次 owned tab、脚本包含固定标记 ${BROWSER_CLEANUP_MARKER}、已先写入 owned-tab 的 closing 阶段、并在同一 finally/固定收尾路径调用同一句柄的 close。普通业务脚本即使出现 close() 也按业务调用计数，不能伪装成 cleanup；cleanup 只能使用一次。推荐把业务调用固定规划为：1) create/nav/login/mode/创建图片入口；2) upload+verify+fill（路径 A/B 和最长等待都在同一脚本）；3) ready+submission-intent+send+confirm；4) wait+download（第 4 次内部可用一个长 timeout 的轮询，不得再发第 5 个业务调用）；最后另发一个独立 cleanup/close 调用。不要为每个按钮或每个附件单独发起 CUA 调用。禁止调用 getScreenshot()、getAXStateAndScreenshot() 或 domSnapshot()。需要读取 DOM 时，只在当前脚本变量中调用 tab.getAXState({emit:false})，解析成布尔值、附件名称数组、数量、发送按钮状态、当前 URL 和错误摘要，再通过 nodeRepl.write(JSON.stringify(summary)) 返回；任何中间输出不得包含 AX 原文、页面截图、data:image/base64、完整侧边栏或提示词，单次摘要不超过 4KB。必须把导航、创建图片入口、路径 A/B、setFiles、附件核验和填词合并到尽可能少的 CUA 调用；通过 ready 后把 submission-intent 与紧接着的一次发送/正向确认合并到同一个最短 CUA 调用。完整截图/base64 不属于状态证据，禁止写入事件、回复或下一轮上下文。
 
 失败阶段矩阵（必须按阶段写入完整字段，不得省略）：
 - 通用失败命令模板（必须替换为对应阶段的 typed 值）：${commands.failed}
@@ -68,7 +69,7 @@ export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,remoteProm
 1. 真正开始处理本次 requestId（${requestId||'由本地 provider 冻结'}），并使用下方已经冻结的 manifestFile、outputFile、附件路径和 remotePrompt。不要读取本地执行指令来重建这些值；不要把任何控制字段或附件路径写入 ChatGPT composer。未写入 accepted 前不得打开或准备网页、登录、上传附件。manifest 只能通过预置的原子生命周期 helper 更新，禁止手工拼接、覆盖或重建 JSON，也禁止改变或删除 projectId、projectVersion、taskId、target、requestId、runId、outputFile。先执行：
    ${commands.accepted}
    只有命令返回 JSON 中的 ok=true 后，才算 accepted 成功；helper 会从同一执行目录复核 request、worker、execution 和锁定身份并自行生成 ISO 时间。若 helper 失败，立即停止，不要用其他命令补写；若需记录失败，只执行上面的 typed failed helper。
-2. 在第一次 CUA js 调用中且只调用一次本地 lease 命令 ${commands.ownedTabReserveCreate}，只有命令返回 ok=true 后才允许执行 globalThis.__wendiOwnedTab=await cua.createBrowserTab("chrome",undefined,{sessionName:${JSON.stringify(resolvedSessionName)}})，并把返回句柄的 id 记录到 globalThis.__wendiOwnedTabId；不传入 visible，不创建第二个标签页。创建成功后立即执行 ${commands.ownedTabCreated('<实际 ownedTabId>','<本次 sessionName>')}，其中 &lt;实际 ownedTabId&gt; 必须来自返回句柄，禁止填占位符。随后每一次独立 CUA 调用都先执行 const tab=globalThis.__wendiOwnedTab 并验证它仍然存在，再用这个 tab 执行 await tab.goto("https://chatgpt.com") 以及本次页面的导航、登录、上传、发送和下载。不要依赖跨调用的 const tab，因为它不会持久保留。逻辑上相当于 try { 使用 globalThis.__wendiOwnedTab } finally { 用同一句柄清理 }，但这些块不能跨 CUA 调用伪造；全部工作结束后，最后一次 CUA 调用才执行 await tab.close()；只有 close 返回成功才执行 ${commands.ownedTabCleanup('closed','<实际 ownedTabId>','')} 并记录 cleanup-status=closed，异常执行 ${commands.ownedTabCleanup('close_failed','<实际 ownedTabId>','<真实异常>','')}，句柄丢失执行 ${commands.ownedTabCleanup('not_observed','<实际或 unknown ownedTabId>','<真实句柄丢失原因>','')}。创建时 Chrome 可能短暂取得焦点，公开 CUA 没有焦点恢复接口，因此不得声称零焦点切换或后台隐藏。${conversation}
+2. 在第一次 CUA js 调用中且只调用一次本地 lease 命令 ${commands.ownedTabReserveCreate}，只有命令返回 ok=true 后才允许执行 globalThis.__wendiOwnedTab=await cua.createBrowserTab("chrome",undefined,{sessionName:${JSON.stringify(resolvedSessionName)}})，并把返回句柄的 id 记录到 globalThis.__wendiOwnedTabId；不传入 visible，不创建第二个标签页。创建成功后立即执行 ${commands.ownedTabCreated('<实际 ownedTabId>','<本次 sessionName>')}，其中 &lt;实际 ownedTabId&gt; 必须来自返回句柄，禁止填占位符。随后每一次独立 CUA 调用都先执行 const tab=globalThis.__wendiOwnedTab 并验证它仍然存在，再用这个 tab 执行 await tab.goto("https://chatgpt.com") 以及本次页面的导航、登录、上传、发送和下载。不要依赖跨调用的 const tab，因为它不会持久保留。逻辑上相当于 try { 使用 globalThis.__wendiOwnedTab } finally { 使用同一句柄清理 }，但这些块不能跨 CUA 调用伪造；业务调用结束或发生错误时，最后单独使用固定 cleanup CUA 调用；该调用必须包含 ${BROWSER_CLEANUP_MARKER}，先执行 ${commands.ownedTabStage('closing','<实际 ownedTabId>')}，再在 finally/固定收尾路径中用同一个 globalThis.__wendiOwnedTab 句柄执行 close。只有 close 返回成功才执行 ${commands.ownedTabCleanup('closed','<实际 ownedTabId>','')} 并记录 cleanup-status=closed，异常执行 ${commands.ownedTabCleanup('close_failed','<实际 ownedTabId>','<真实异常>','')}，句柄丢失执行 ${commands.ownedTabCleanup('not_observed','<实际或 unknown ownedTabId>','<真实句柄丢失原因>')}。普通业务调用中出现 close 不获得 cleanup 槽位。创建时 Chrome 可能短暂取得焦点，公开 CUA 没有焦点恢复接口，因此不得声称零焦点切换或后台隐藏。${conversation}
 3. 等待页面完成加载并读取新状态，不用首屏占位内容判断登录。若存在“聊天/工作”切换，选择“聊天”并确认选中；不得在“工作”模式发送生图提示。确认已登录且聊天输入框可用，在添加菜单确认“创建图片”入口（需要时选择该模式）。若显示登录按钮，执行 ${commands.loginFailed}，随后停止，不得上传或发送。开始附件前先执行 ${commands.ownedTabStage('uploading','<实际 ownedTabId>')}；按上一条 DOM 自适应的两段式附件流程上传所有参考文件，并在每次菜单变化后重新读取当前 DOM 的精简 AX 状态、逐项确认附件；不得操作系统文件选择窗口。若脚本自身出现未定义模块、语法或运行时异常，立即执行 ${commands.workerScriptRuntimeError}，不要把它描述成附件入口或 chooser 不可用。
 4. 在发送聊天消息前，严格执行上面的附件完成门：附件 group 名称和数量、冻结数组顺序、上传状态和发送按钮必须全部通过；继续有界等待所有附件上传进度或“等待文件上传”状态消失，最长 240 秒，每次核对都在当前批处理脚本内用 tab.getAXState({emit:false}) 读取并记录精简阶段日志。只有发送按钮真实可用才能进入下一步；按钮仍 disabled 时禁止点击，也不得先执行 ready 或 submission-intent。通过附件完成门后先执行 ${commands.ownedTabStage('uploaded','<实际 ownedTabId>')}，再执行：
    ${commands.ready}
@@ -101,5 +102,5 @@ ${frozenRemotePrompt.prompt}
 </remote_prompt>`;
   // Keep the close call on its own line so legacy audit regexes cannot
   // mistake a numeric run token for a numbered step. This is formatting only.
-  return instruction.replace('；全部工作结束后，最后一次 CUA 调用才执行 await tab.close()', '；全部工作结束后，最后一次 CUA 调用才执行\nawait tab.close()');
+  return `${instruction}\n固定 cleanup 调用必须实际执行 await tab.close()，不得用其他 close 表达式替代。`.replace('；全部工作结束后，最后一次 CUA 调用才执行 await tab.close()', '；全部工作结束后，最后一次 CUA 调用才执行\nawait tab.close()');
 }
