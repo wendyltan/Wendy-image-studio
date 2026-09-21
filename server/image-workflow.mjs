@@ -27,6 +27,7 @@ function ownedTabLifecycle(manifest) {
     runtimeErrorCategory: manifest.runtimeErrorCategory || null,
     runtimeErrorMessage: manifest.runtimeErrorMessage || null,
     runtimeErrorToolStage: manifest.runtimeErrorToolStage || null,
+    runtimeErrorBrowserBudgetStage: manifest.runtimeErrorBrowserBudgetStage || null,
   };
 }
 

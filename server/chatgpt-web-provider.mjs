@@ -173,7 +173,7 @@ function runtimeProjection(dir,manifest,failure){
   if(stored)return stored;
   const message=String(failure?.message||manifest?.error||'').trim();
   if(!message)return null;
-  return {schemaVersion:1,category:'control_flow',message:message.slice(0,1200),stack:'',toolStage:manifest?.browserStage||'post_upload_pre_submit',source:'manifest',capturedAt:new Date().toISOString()};
+  return {schemaVersion:1,category:'control_flow',message:message.slice(0,1200),stack:'',toolStage:'executor',browserBudgetStage:manifest?.browserStage||'post_upload_pre_submit',source:'manifest',capturedAt:new Date().toISOString()};
 }
 
 function originPermissionDeniedForRun({dir,manifestFile,outputFile,requestId,manifest}={}){
@@ -253,7 +253,7 @@ function recordBrowserPreSubmissionFailure(manifestFile,requestId,failure,dir){
     const projection=uploadProjection(dir,worker),runtime=errorCode==='WORKER_SCRIPT_RUNTIME_ERROR'||errorCode==='EXECUTOR_RUNTIME_ERROR'?runtimeProjection(dir,manifest,failure):null;
     const complete=projection.attachmentObservedCount!==null&&projection.attachmentExpectedCount!==null&&projection.attachmentObservedCount===projection.attachmentExpectedCount&&projection.attachmentPending===false&&projection.sendEnabled===true;
     const failureStage=complete?'post_upload_pre_submit':(projection.failureStage||null);
-    patchManifestState(manifestFile,'failed',{submitted:'false',submissionIntent:manifest.submissionIntent===true?'true':'false',preSubmissionFailure:'true',errorCode,...projection,failureStage,browserStage:projection.browserStage||null,...(runtime?{runtimeErrorCategory:runtime.category,runtimeErrorMessage:runtime.message,runtimeErrorStack:runtime.stack,runtimeErrorToolStage:runtime.toolStage}:{}),error:`${prefix}；${projection.attachmentObservedCount!==null&&projection.attachmentExpectedCount!==null?`已观察到 ${projection.attachmentObservedCount}/${projection.attachmentExpectedCount} 个附件，发送前失败，未发送消息`:'未上传附件或发送消息'}。原始错误：${detail}`});
+    patchManifestState(manifestFile,'failed',{submitted:'false',submissionIntent:manifest.submissionIntent===true?'true':'false',preSubmissionFailure:'true',errorCode,...projection,failureStage,browserStage:projection.browserStage||null,...(runtime?{runtimeErrorCategory:runtime.category,runtimeErrorMessage:runtime.message,runtimeErrorStack:runtime.stack,runtimeErrorToolStage:runtime.toolStage,runtimeErrorBrowserBudgetStage:runtime.browserBudgetStage||null}:{}),error:`${prefix}；${projection.attachmentObservedCount!==null&&projection.attachmentExpectedCount!==null?`已观察到 ${projection.attachmentObservedCount}/${projection.attachmentExpectedCount} 个附件，发送前失败，未发送消息`:'未上传附件或发送消息'}。原始错误：${detail}`});
     if(runtime&&!readExecutorRuntimeError(dir))writeExecutorRuntimeError(dir,runtime);
     return readWebManifest(manifestFile);
   }catch{return manifest;}

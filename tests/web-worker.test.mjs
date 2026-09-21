@@ -160,7 +160,7 @@ test('explicit file-upload failure wins over permission words in prompt and comm
 test('cua require runtime failure is classified before upload and never as chooser failure',async()=>{
  const args=setup('worker-runtime');await assert.rejects(dispatchChatGptWebJob(args),error=>error.code==='WORKER_SCRIPT_RUNTIME_ERROR'&&error.webManifest?.submitted===false);
  const manifest=readWebManifest(path.join(args.dir,'web-generation.json'));assert.equal(manifest.errorCode,'WORKER_SCRIPT_RUNTIME_ERROR');assert.equal(manifest.submitted,false);assert.equal(manifest.referenceCount,0);assert.equal(manifest.preSubmissionFailure,true);assert.match(manifest.error,/浏览器执行脚本发生运行时错误/);assert.doesNotMatch(manifest.error,/chooser|文件选择器|附件入口/i);
- const runtime=readExecutorRuntimeError(args.dir);assert.equal(runtime.category,'javascript_runtime');assert.match(runtime.message,/ReferenceError/);assert.match(runtime.stack,/require is not defined/);assert.equal(runtime.toolStage,'executor');assert.equal(manifest.runtimeErrorCategory,'javascript_runtime');assert.match(manifest.runtimeErrorMessage,/ReferenceError/);
+ const runtime=readExecutorRuntimeError(args.dir);assert.equal(runtime.category,'javascript_runtime');assert.match(runtime.message,/ReferenceError/);assert.match(runtime.stack,/require is not defined/);assert.equal(runtime.toolStage,'executor');assert.equal(runtime.browserBudgetStage,'bootstrap');assert.equal(manifest.runtimeErrorBrowserBudgetStage,'bootstrap');assert.equal(manifest.runtimeErrorCategory,'javascript_runtime');assert.match(manifest.runtimeErrorMessage,/ReferenceError/);
 });
 test('executor event logs redact image payloads while retaining compact evidence',async()=>{
  const args=setup('event-with-image-data');await dispatchChatGptWebJob(args);

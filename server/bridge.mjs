@@ -220,19 +220,24 @@ function runtimeCandidate(event){
   const source=String(raw);
   const match=source.match(/(ReferenceError|TypeError|SyntaxError|RangeError|Error)\s*:\s*([^\n]+)/i);
   const category=match?.[1] ? 'javascript_runtime' : 'executor_error';
+  const browserBudgetStage=browserToolBusinessStage(source);
   return {
     schemaVersion:1,
     category,
     message:redactRuntimeText(match?`${match[1]}: ${match[2]}`:source),
     stack:redactRuntimeText(raw,2400),
-    toolStage:browserToolStage(item.arguments?.code||item.command||source),
+    // Keep the historical runtime-error contract: this is an executor
+    // failure, not a browser lifecycle stage. The budget classifier gets its
+    // own field so diagnostics can still say which phase was active.
+    toolStage:'executor',
+    browserBudgetStage,
     source:item.server||item.type||event.type||'executor',
   };
 }
 
 export function writeExecutorRuntimeError(dir,value={}){
   if(!dir||!value)return null;
-  const record={schemaVersion:1,category:redactRuntimeText(value.category,120),message:redactRuntimeText(value.message),stack:redactRuntimeText(value.stack,2400),toolStage:redactRuntimeText(value.toolStage,120),source:redactRuntimeText(value.source,120),capturedAt:new Date().toISOString()};
+  const record={schemaVersion:1,category:redactRuntimeText(value.category,120),message:redactRuntimeText(value.message),stack:redactRuntimeText(value.stack,2400),toolStage:redactRuntimeText(value.toolStage||'executor',120),...(value.browserBudgetStage?{browserBudgetStage:redactRuntimeText(value.browserBudgetStage,120)}:{}),source:redactRuntimeText(value.source,120),capturedAt:new Date().toISOString()};
   try{
     const file=path.join(dir,EXECUTOR_RUNTIME_ERROR_FILE),temp=`${file}.tmp-${crypto.randomUUID()}`;
     fs.writeFileSync(temp,JSON.stringify(record,null,2)+'\n',{mode:0o600});fs.renameSync(temp,file);return record;

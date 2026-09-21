@@ -8,7 +8,7 @@ import {inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence} f
 
 const MANIFEST_STATES=new Set(['queued','accepted','ready','submitted','downloaded','failed']);
 const URL_RE=/^https:\/\/chatgpt\.com\/(?:c\/[^\s?#]+)?(?:[?#][^\s]*)?$/;
-const VALUE_KEYS=new Set(['conversationUrl','referenceCount','attachmentExpectedCount','attachmentObservedCount','attachmentPending','sendEnabled','failureStage','browserStage','runtimeErrorCategory','runtimeErrorMessage','runtimeErrorStack','runtimeErrorToolStage','errorCode','error','submissionConfirmedBy','artifactPath','accepted','submitted','submissionIntent','submissionUncertain','preSubmissionFailure','resumeCount','resumedAt','lastPreAcceptanceAttempt','lastConfirmedUnsentAttempt','confirmedUnsentAudit','role','executorModel','executorReasoningEffort','focusPolicy','ownedTabId','ownedTabCleanupStatus','ownedTabState','sessionName','ownedTabCreatedAt','cleanupStatus','cleanupVerifiedAt','cleanupError','kernelReset']);
+const VALUE_KEYS=new Set(['conversationUrl','referenceCount','attachmentExpectedCount','attachmentObservedCount','attachmentPending','sendEnabled','failureStage','browserStage','runtimeErrorCategory','runtimeErrorMessage','runtimeErrorStack','runtimeErrorToolStage','runtimeErrorBrowserBudgetStage','errorCode','error','submissionConfirmedBy','artifactPath','accepted','submitted','submissionIntent','submissionUncertain','preSubmissionFailure','resumeCount','resumedAt','lastPreAcceptanceAttempt','lastConfirmedUnsentAttempt','confirmedUnsentAudit','role','executorModel','executorReasoningEffort','focusPolicy','ownedTabId','ownedTabCleanupStatus','ownedTabState','sessionName','ownedTabCreatedAt','cleanupStatus','cleanupVerifiedAt','cleanupError','kernelReset']);
 
 function now(){return new Date().toISOString();}
 function usageError(message){const error=new Error(message);error.code='MANIFEST_PATCH_REJECTED';return error;}
@@ -65,7 +65,7 @@ function applyAttachmentPatch(patch,args){
   for(const [field,key] of integerFields){const value=optionalInteger(args[key],key);if(value!==undefined)patch[field]=value;}
   const pending=optionalBoolean(args.attachmentPending,'attachmentPending');if(pending!==undefined)patch.attachmentPending=pending;
   const enabled=optionalBoolean(args.sendEnabled,'sendEnabled');if(enabled!==undefined)patch.sendEnabled=enabled;
-  for(const [field,max] of [['failureStage',100],['browserStage',100],['runtimeErrorCategory',120],['runtimeErrorMessage',1200],['runtimeErrorStack',2400],['runtimeErrorToolStage',120]]){
+  for(const [field,max] of [['failureStage',100],['browserStage',100],['runtimeErrorCategory',120],['runtimeErrorMessage',1200],['runtimeErrorStack',2400],['runtimeErrorToolStage',120],['runtimeErrorBrowserBudgetStage',120]]){
     if(args[field]!==undefined)patch[field]=optionalText(args[field],max);
   }
 }
@@ -191,7 +191,7 @@ function stagePatch(stage,args,record){
   }else if(stage==='resume'){
     const confirmedUnsent=Boolean(args.confirmedUnsentAudit);
     if(!['queued','failed'].includes(current.state)||current.submitted===true&&!confirmedUnsent)throw usageError('只有未提交或确认未发送的请求可以续接。');
-    patch.state='queued';patch.accepted=false;patch.submitted=false;patch.submissionIntent=false;patch.submissionUncertain=false;patch.preSubmissionFailure=false;patch.referenceCount=0;patch.attachmentExpectedCount=0;patch.attachmentObservedCount=0;patch.attachmentPending=null;patch.sendEnabled=false;patch.failureStage=null;patch.browserStage='queued';patch.runtimeErrorCategory=null;patch.runtimeErrorMessage=null;patch.runtimeErrorStack=null;patch.runtimeErrorToolStage=null;patch.acceptedAt=null;patch.readyAt=null;patch.submissionAttemptAt=null;patch.submittedAt=null;patch.downloadedAt=null;patch.artifactPath=null;patch.errorCode=null;patch.error=null;
+    patch.state='queued';patch.accepted=false;patch.submitted=false;patch.submissionIntent=false;patch.submissionUncertain=false;patch.preSubmissionFailure=false;patch.referenceCount=0;patch.attachmentExpectedCount=0;patch.attachmentObservedCount=0;patch.attachmentPending=null;patch.sendEnabled=false;patch.failureStage=null;patch.browserStage='queued';patch.runtimeErrorCategory=null;patch.runtimeErrorMessage=null;patch.runtimeErrorStack=null;patch.runtimeErrorToolStage=null;patch.runtimeErrorBrowserBudgetStage=null;patch.acceptedAt=null;patch.readyAt=null;patch.submissionAttemptAt=null;patch.submittedAt=null;patch.downloadedAt=null;patch.artifactPath=null;patch.errorCode=null;patch.error=null;
     if(args.resumeCount!==undefined)patch.resumeCount=integer(args.resumeCount,'resumeCount');
     if(args.resumedAt!==undefined)patch.resumedAt=String(args.resumedAt);
     if(args.lastPreAcceptanceAttempt!==undefined)patch.lastPreAcceptanceAttempt=String(args.lastPreAcceptanceAttempt);
