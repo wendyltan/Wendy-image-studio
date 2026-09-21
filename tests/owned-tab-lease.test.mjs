@@ -10,6 +10,7 @@ import {
   markOwnedTabCleanup,
   markOwnedTabStage,
   ownedTabSessionName,
+  prepareOwnedTabCleanup,
   readOwnedTabLease,
   resetOwnedTabLeaseForResume,
   reserveOwnedTabCreate,
@@ -59,10 +60,10 @@ test('a failed create remains not-observed and never becomes verified closed', (
   assert.equal(failed.cleanupStatus, 'not_observed');
   assert.equal(failed.ownedTabId, null);
   assert.equal(failed.cleanupVerifiedAt, null);
-  assert.throws(() => markOwnedTabCleanup({...run, status: 'closed', verification: 'exact-owned-tab-close-returned'}), error => error.code === 'OWNED_TAB_LEASE_TERMINAL');
+  assert.throws(() => markOwnedTabCleanup({...run, status: 'closed', verification: 'exact-owned-tab-close-returned'}), error => error.code === 'OWNED_TAB_ID_MISSING');
 });
 
-test('an audited resume resets only a terminal prior lease before reserving again', () => {
+test('an audited resume resets a terminal lease and a pre-create reservation before reserving again', () => {
   const run = fixture();
   ensureOwnedTabLease(run);
   reserveOwnedTabCreate(run);
@@ -74,7 +75,11 @@ test('an audited resume resets only a terminal prior lease before reserving agai
   assert.equal(reset.ownedTabId, null);
   const reserved = reserveOwnedTabCreate(run);
   assert.equal(reserved.state, 'creating');
-  assert.throws(() => resetOwnedTabLeaseForResume(run), error => error.code === 'OWNED_TAB_RESUME_UNSAFE');
+  // `creating` without an ownedTabId means the executor stopped before
+  // createBrowserTab returned. It is a safe pre-creation reservation, not an
+  // ambiguous live tab, so an accepted-before-start quota resume may reuse it.
+  const resetPreCreate = resetOwnedTabLeaseForResume(run);
+  assert.equal(resetPreCreate.state, 'not_created');
 });
 
 test('stage transitions expose upload and send boundaries and reject regressions', () => {
@@ -152,14 +157,14 @@ test('a downloaded run still records verified cleanup evidence', () => {
   assert.equal(closed.kernelReset, false);
 });
 
-test('executor exit writes unconfirmed cleanup and never claims a tab closed', () => {
+test('executor exit records pending cleanup and never claims a tab closed', () => {
   const run = fixture();
   ensureOwnedTabLease(run);
   reserveOwnedTabCreate(run);
   markOwnedTabStage({...run, state: 'created', ownedTabId: 'tab-exit'});
   const result = finalizeOwnedTabLease({...run, reason: 'timeout'});
   assert.equal(result.state, 'orphaned');
-  assert.equal(result.cleanupStatus, 'not_observed');
+  assert.equal(result.cleanupStatus, 'cleanup_pending');
   assert.equal(result.cleanupVerifiedAt, null);
   assert.match(result.cleanupError, /无法直接调用 CUA close/);
 });
@@ -172,19 +177,34 @@ test('approval, abort, timeout, and CLI exit all use the same conservative final
     markOwnedTabStage({...run, state: 'created', ownedTabId: `tab-${reason}`});
     const result = finalizeOwnedTabLease({...run, reason});
     assert.equal(result.state, 'orphaned');
-    assert.equal(result.cleanupStatus, 'not_observed');
+    assert.equal(result.cleanupStatus, 'cleanup_pending');
     assert.equal(result.ownedTabId, `tab-${reason}`);
     assert.match(result.cleanupError, new RegExp(reason));
   }
 });
 
-test('executor exit with no observed handle becomes orphaned/not_observed', () => {
+test('executor exit before a handle is observed keeps the pre-create reservation clean', () => {
   const run = fixture();
   ensureOwnedTabLease(run);
   reserveOwnedTabCreate(run);
   const result = finalizeOwnedTabLease({...run, reason: 'kernel-reset', kernelReset: true});
-  assert.equal(result.state, 'orphaned');
-  assert.equal(result.cleanupStatus, 'not_observed');
+  assert.equal(result.state, 'creating');
+  assert.equal(result.cleanupStatus, 'not_attempted');
   assert.equal(result.ownedTabId, null);
-  assert.equal(result.kernelReset, true);
+  assert.equal(result.kernelReset, false);
+});
+
+test('orphaned lease can enter cleanup-only closing only with the exact handle', () => {
+  const run = fixture();
+  ensureOwnedTabLease(run);
+  reserveOwnedTabCreate(run);
+  markOwnedTabStage({...run, state: 'created', ownedTabId: 'tab-orphan'});
+  finalizeOwnedTabLease({...run, reason: 'budget'});
+  const prepared = prepareOwnedTabCleanup({...run, ownedTabId: 'tab-orphan'});
+  assert.equal(prepared.state, 'closing');
+  assert.equal(prepared.cleanupStatus, 'cleanup_pending');
+  assert.throws(() => prepareOwnedTabCleanup({...run, ownedTabId: 'tab-other'}), error => error.code === 'OWNED_TAB_ID_MISMATCH');
+  assert.throws(() => markOwnedTabStage({...run, state: 'uploaded'}), error => error.code === 'OWNED_TAB_ORPHANED_RECOVERY_REQUIRED' || error.code === 'OWNED_TAB_STAGE_REGRESSION');
+  const closed = markOwnedTabCleanup({...run, status: 'closed', ownedTabId: 'tab-orphan', verification: 'exact-owned-tab-close-returned'});
+  assert.equal(closed.state, 'closed_verified');
 });

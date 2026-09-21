@@ -36,7 +36,7 @@ export function failureCommand(manifestFile,flags){
 }
 
 export function browserHandleLostCommand(manifestFile){
-  return manifestCommand('failed',{manifestFile,args:` --error-code "BROWSER_HANDLE_LOST" --error "Chrome 专用标签页句柄未能保留，无法继续执行本次上传" --submitted false --submission-intent false --submission-uncertain false --pre-submission-failure true --owned-tab-id "<returned ownedTabId or unknown>" --owned-tab-cleanup-status "<closed|close_failed|not_observed>" --kernel-reset "<true或false>"`});
+  return manifestCommand('failed',{manifestFile,args:` --error-code "BROWSER_HANDLE_LOST" --error "Chrome 专用标签页句柄未能保留，无法继续执行本次上传" --submitted false --submission-intent false --submission-uncertain false --pre-submission-failure true --owned-tab-id "<returned ownedTabId or unknown>" --owned-tab-cleanup-status "<closed|close_failed|cleanup_pending|not_observed>" --kernel-reset "<true或false>"`});
 }
 
 export function buildManifestCommands(manifestFile,{helperFile=DEFAULT_HELPER,requestId=null,sessionName=null}={}){

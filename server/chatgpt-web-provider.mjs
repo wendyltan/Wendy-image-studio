@@ -4,8 +4,8 @@ import crypto from 'node:crypto';
 import {runCodex,findCodex,writeExecutorRuntimeError,readExecutorRuntimeError,readBrowserToolBudget} from './bridge.mjs';
 import {identityFields,sameIdentityValue,readJsonObject as readRunJson,readRunIdentity,compareRunIdentity} from './run-identity.mjs';
 import {patchManifest} from './run-manifest.mjs';
-import {chatGptWebImagePrompt} from './web-executor-instructions.mjs';
-import {ensureOwnedTabLease,ownedTabSessionName,readOwnedTabLease,resetOwnedTabLeaseForResume,reserveOwnedTabCreate,syncOwnedTabLeaseToManifest} from './owned-tab-lease.mjs';
+import {chatGptWebImagePrompt,ownedTabCleanupPrompt} from './web-executor-instructions.mjs';
+import {ensureOwnedTabLease,ownedTabSessionName,readOwnedTabLease,resetOwnedTabLeaseForResume,reserveOwnedTabCreate,prepareOwnedTabCleanup,syncOwnedTabLeaseToManifest} from './owned-tab-lease.mjs';
 import {browserFailurePrefix,browserPreSubmissionUnavailableText,browserRunEvidenceText,structuredBrowserToolResultText,browserOriginPermissionDeniedEvidence,fileUploadChromeUnavailableEvidence,browserCreateUnavailableEvidence,browserHandleLostEvidence,browserModeEntryUnavailableEvidence,fileChooserEventTimeoutEvidence,fileChooserRouteUnavailableEvidence,fileSetFailedEvidence,attachmentVerificationTimeoutEvidence,browserToolBudgetExceededEvidence,workerScriptRuntimeErrorEvidence,executorRuntimeErrorEvidence,downloadFailedEvidence,iabUnavailableEvidence,browserTabBackgroundEvidence,chromeUnavailableEvidence,browserFocusEvidence,completeDownloadEvidence,enrichDownloadEvidenceIdentity,extractDownloadEvidence,inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence,writeDownloadEvidence} from './web-download-evidence.mjs';
 import {uploadEvidenceFailureCode,uploadEvidenceFromRun,validateUploadEvidence} from './web-upload-evidence.mjs';
 import {REMOTE_PROMPT_FILE,assertRemotePrompt,remotePromptMetadata,validateRemotePrompt} from './remote-prompt.mjs';
@@ -411,6 +411,45 @@ export function confirmedUnsentWebAudit({dir,expected={}}={}){
     assertExpectedIdentity(expected,request,worker,manifest);
     return matchingConfirmedUnsentAudit({dir,request,worker,manifest,expected});
   }catch{return null;}
+}
+
+/**
+ * Recover one orphaned owned tab without creating a new image request.
+ * This is intentionally a separate executor invocation so a business-budget
+ * kill cannot remove the only opportunity to close the tab.  The caller must
+ * invoke it only when the local runtime is allowed to use Chrome; a locked Mac
+ * is represented by the durable cleanup_pending/orphaned lease and can be
+ * retried after unlock.
+ */
+export async function recoverOwnedTabCleanup({codexBin,dir,signal,timeoutMs=120000,model=null,reasoningEffort=WEB_IMAGE_EXECUTOR_EFFORT,role='browser-cleanup'} = {}) {
+  if (signal?.aborted) throw new Error('已暂停，cleanup-only 尚未启动。');
+  const manifestFile=path.join(dir,'web-generation.json'),manifest=readWebManifest(manifestFile),runId=path.basename(path.resolve(dir));
+  const requestId=manifest?.requestId;
+  const lease=readOwnedTabLease(dir,{runId,requestId});
+  if (!lease || !requestId || !lease.ownedTabId) {
+    const error=new Error('cleanup-only 缺少可验证的本次 ownedTabId 或 requestId。');
+    error.code='OWNED_TAB_CLEANUP_ID_MISSING';
+    throw error;
+  }
+  if (!['orphaned','closing'].includes(lease.state) || !['cleanup_pending','not_observed','orphaned'].includes(lease.cleanupStatus)) {
+    const error=new Error(`当前 owned tab lease 不需要 cleanup-only：${lease.state}/${lease.cleanupStatus}。`);
+    error.code='OWNED_TAB_CLEANUP_NOT_PENDING';
+    throw error;
+  }
+  const prepared=prepareOwnedTabCleanup({dir,runId,requestId,ownedTabId:lease.ownedTabId});
+  syncOwnedTabLeaseToManifest({dir,manifestFile,lease:prepared});
+  const prompt=ownedTabCleanupPrompt({manifestFile,runId,requestId,ownedTabId:prepared.ownedTabId});
+  let failure=null;
+  try {
+    await runCodex({codexBin:codexBin||findCodex(),dir,prompt,signal,browserMode:'chrome',image:false,timeoutMs,model,reasoningEffort,role});
+  } catch (error) { failure=error; }
+  const finalLease=readOwnedTabLease(dir,{runId,requestId});
+  if (finalLease) syncOwnedTabLeaseToManifest({dir,manifestFile,lease:finalLease});
+  if (finalLease?.state==='closed_verified') return {ok:true,lease:finalLease};
+  const error=failure||new Error(`cleanup-only 未能确认关闭：${finalLease?.cleanupStatus||'not_observed'}。`);
+  error.code=error.code||'OWNED_TAB_CLEANUP_UNCONFIRMED';
+  error.lease=finalLease;
+  throw error;
 }
 
 

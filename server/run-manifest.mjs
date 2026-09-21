@@ -44,7 +44,7 @@ function ownedTabId(value){
 }
 function cleanupStatus(value){
   const normalized=String(value??'').trim();
-  if(!['open','closed','close_failed','not_observed','not_attempted','orphaned'].includes(normalized))throw usageError('ownedTabCleanupStatus 必须是 open、closed、close_failed、not_observed、orphaned 或 not_attempted。');
+  if(!['open','closed','close_failed','not_observed','cleanup_pending','not_attempted','orphaned'].includes(normalized))throw usageError('ownedTabCleanupStatus 必须是 open、closed、close_failed、not_observed、cleanup_pending、orphaned 或 not_attempted。');
   return normalized;
 }
 function optionalText(value,max=1000){

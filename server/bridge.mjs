@@ -9,11 +9,23 @@ import {finalizeOwnedTabLease,readOwnedTabLease,syncOwnedTabLeaseToManifest} fro
 const IMAGE_PATH = /(?:^|[\s"'`(])((?:\/[^\n<>"'`]+?)\.(?:png|webp|jpe?g))(?:$|[\s"'`,)])/gi;
 const EXECUTOR_RUNTIME_ERROR_FILE = 'executor-runtime-error.json';
 const BROWSER_TOOL_BUDGET_FILE = 'browser-tool-budget.json';
-export const BROWSER_TOOL_BUSINESS_CALL_BUDGET = 4;
 export const BROWSER_TOOL_CLEANUP_CALL_BUDGET = 1;
+// The browser executor needs a small, explicit budget for each lifecycle
+// phase.  A single total counter used to kill the normal attachment
+// verification call before submission.  Keep the limits finite, but let the
+// normal create -> upload -> send -> download path finish without making
+// every page observation compete with every other phase.
+export const BROWSER_TOOL_STAGE_BUDGETS = Object.freeze({
+  bootstrap: 3,
+  upload: 2,
+  submit: 1,
+  wait_download: 2,
+  total: 8,
+});
 // Kept as the compatibility name for callers that only need the business
-// budget.  The cleanup slot is tracked separately and is never a fifth
+// budget.  The cleanup slot is tracked separately and is never a ninth
 // business call.
+export const BROWSER_TOOL_BUSINESS_CALL_BUDGET = BROWSER_TOOL_STAGE_BUDGETS.total;
 export const BROWSER_TOOL_CALL_BUDGET = BROWSER_TOOL_BUSINESS_CALL_BUDGET;
 export const BROWSER_CLEANUP_MARKER = 'WENDI_OWNED_TAB_CLEANUP_V1';
 const MAX_EVENT_TEXT = 4096;
@@ -150,7 +162,7 @@ function browserToolCallInfo(event,{dir,cleanupCallUsed=false}={}){
   const ownedTabMatches=Boolean(leaseOwnedTabId&&sourceOwnedTabId&&leaseOwnedTabId===sourceOwnedTabId);
   const cleanupCandidate=fixedCleanup&&closeLike;
   const cleanupAuthorized=cleanupCandidate&&lease?.state==='closing'&&leaseRunMatches&&sourceRunMatches&&ownedTabMatches&&!cleanupCallUsed;
-  return {id:String(item.id||event?.item_id||event?.id||''),phase:type.includes('started')?'started':type.includes('completed')?'completed':'other',kind:cleanupAuthorized?'cleanup':cleanupCandidate?'deferred_cleanup':'business',closeLike,fixedCleanup,cleanupCandidate,leaseState:lease?.state||null,leaseRunMatches,sourceRunMatches,ownedTabMatches,ownedTabId:leaseOwnedTabId||null};
+  return {id:String(item.id||event?.item_id||event?.id||''),phase:type.includes('started')?'started':type.includes('completed')?'completed':'other',kind:cleanupAuthorized?'cleanup':cleanupCandidate?'deferred_cleanup':'business',stage:browserToolBusinessStage(source),closeLike,fixedCleanup,cleanupCandidate,leaseState:lease?.state||null,leaseRunMatches,sourceRunMatches,ownedTabMatches,ownedTabId:leaseOwnedTabId||null};
 }
 
 function eventContainsSubmissionIntent(event){
@@ -170,7 +182,7 @@ function manifestHasSubmissionIntent(dir){
 
 function writeBrowserToolBudget(dir,value={}){
   if(!dir||!value)return null;
-  const record={schemaVersion:1,errorCode:'BROWSER_TOOL_BUDGET_EXCEEDED',limit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,businessLimit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,cleanupLimit:BROWSER_TOOL_CLEANUP_CALL_BUDGET,observed:Number(value.observed)||0,observedBusiness:Number(value.observedBusiness)||0,observedCleanup:Number(value.observedCleanup)||0,budgetKind:value.budgetKind||'business',submissionIntentObserved:value.submissionIntentObserved===true,stage:value.submissionIntentObserved===true?'post_submission_intent':'pre_submission_intent',terminationRequestedAt:new Date().toISOString()};
+  const record={schemaVersion:2,errorCode:'BROWSER_TOOL_BUDGET_EXCEEDED',limit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,businessLimit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,cleanupLimit:BROWSER_TOOL_CLEANUP_CALL_BUDGET,stageBudgets:BROWSER_TOOL_STAGE_BUDGETS,observed:Number(value.observed)||0,observedBusiness:Number(value.observedBusiness)||0,observedCleanup:Number(value.observedCleanup)||0,stageCounts:value.stageCounts&&typeof value.stageCounts==='object'?{...value.stageCounts}:{},budgetKind:value.budgetKind||'business',stageName:value.stageName||null,stageLimit:Number(value.stageLimit)||null,stageCount:Number(value.stageCount)||null,submissionIntentObserved:value.submissionIntentObserved===true,stage:value.submissionIntentObserved===true?'post_submission_intent':'pre_submission_intent',terminationRequestedAt:new Date().toISOString()};
   try{
     const file=path.join(dir,BROWSER_TOOL_BUDGET_FILE),temp=`${file}.tmp-${crypto.randomUUID()}`;
     fs.writeFileSync(temp,JSON.stringify(record,null,2)+'\n',{mode:0o600});fs.renameSync(temp,file);return record;
@@ -183,12 +195,17 @@ export function readBrowserToolBudget(dir){
 
 function browserToolStage(value){
   const source=typeof value==='string'?value:JSON.stringify(value||{});
-  if(/setFiles|filechooser|从电脑上传|上传文件|上传照片/i.test(source))return 'upload';
-  if(/发送提示词|pressKey\([^)]*(?:Enter|Return)|submission-intent|submitted/i.test(source))return 'submit';
-  if(/填入冻结|\.fill\(|\.paste\(|textbox/i.test(source))return 'prompt_fill';
-  if(/domSnapshot|getAXState|waitForLoadState|goto\(/i.test(source))return 'browser_observe';
   if(/close\(\)/i.test(source))return 'cleanup';
-  return 'executor';
+  if(/submission[-_ ]?intent|发送提示词|pressKey\([^)]*(?:Enter|Return)|composer-submit-button|\.click\([^)]*send/i.test(source))return 'submit';
+  if(/pageAssets|\.bundle\(|\.list\(\)|download-evidence|下载原图|生成结果|停止生成|等待生成/i.test(source))return 'wait_download';
+  if(/\bupload\b|setFiles|filechooser|从电脑上传|上传文件|上传照片|attachment(?:s|Signals|Expected|Observed|Pending)|上传中|等待文件上传|remotePrompt|填入冻结|\.fill\(|\.paste\(|prompt-textarea|textbox/i.test(source))return 'upload';
+  if(/createBrowserTab|\.goto\(|waitForLoadState|getAXState|聊天模式|创建图片|composer|登录/i.test(source))return 'bootstrap';
+  return 'bootstrap';
+}
+
+function browserToolBusinessStage(source, fallback='bootstrap'){
+  const stage=browserToolStage(source);
+  return stage==='cleanup'?'bootstrap':(Object.prototype.hasOwnProperty.call(BROWSER_TOOL_STAGE_BUDGETS,stage)?stage:fallback);
 }
 
 function runtimeCandidate(event){
@@ -439,6 +456,7 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
     const capturedEvents=[];
     let runtimeError=null;
     let browserToolCalls=0,browserBusinessCalls=0,browserCleanupCalls=0,submissionIntentObserved=false,budgetFailure=null,anonymousCallSequence=0;
+    const browserBusinessStageCounts={};
     const browserToolCallIds=new Set();
     const deferredCleanupCallIds=new Set(),anonymousActiveCallIds=[];
     const persistRuntimeError=(candidate)=>{
@@ -452,7 +470,7 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
     const finish=(err,result,{responseText='',exitCode=null}={})=>{
       if(settled)return;settled=true;clearTimeout(timer);signal?.removeEventListener('abort',abort);log.end();
       try{compactResponseFile(resultPath);}catch{}
-      saveExecution({state:err?'failed':'completed',endedAt:new Date().toISOString(),exitCode,durationMs:Math.max(0,Date.now()-Date.parse(startedAt)),error:err?String(err.message||err).slice(0,500):null,browserToolCallCount:browserToolCalls,browserBusinessCallCount:browserBusinessCalls,browserCleanupCallCount:browserCleanupCalls,browserToolCallBudget:BROWSER_TOOL_BUSINESS_CALL_BUDGET,browserToolCleanupBudget:BROWSER_TOOL_CLEANUP_CALL_BUDGET,browserToolBudgetExceeded:Boolean(budgetFailure),submissionIntentObserved});
+      saveExecution({state:err?'failed':'completed',endedAt:new Date().toISOString(),exitCode,durationMs:Math.max(0,Date.now()-Date.parse(startedAt)),error:err?String(err.message||err).slice(0,500):null,browserToolCallCount:browserToolCalls,browserBusinessCallCount:browserBusinessCalls,browserCleanupCallCount:browserCleanupCalls,browserToolCallBudget:BROWSER_TOOL_BUSINESS_CALL_BUDGET,browserToolCleanupBudget:BROWSER_TOOL_CLEANUP_CALL_BUDGET,browserToolStageBudgets:BROWSER_TOOL_STAGE_BUDGETS,browserBusinessStageCounts,browserToolBudgetExceeded:Boolean(budgetFailure),submissionIntentObserved});
       // The CUA executor is the only component allowed to close its tab.  If
       // it exited before writing verified close evidence, persist an explicit
       // unconfirmed/orphaned lease instead of claiming that the tab vanished.
@@ -474,15 +492,24 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
       }
       resolve(result);
     };
-    const registerBrowserToolCall=(callKey,kind,event)=>{
+    const registerBrowserToolCall=(callKey,kind,event,stageHint=null)=>{
       if(browserToolCallIds.has(callKey))return;
       browserToolCallIds.add(callKey);browserToolCalls+=1;
-      if(kind==='cleanup')browserCleanupCalls+=1;else browserBusinessCalls+=1;
+      if(kind==='cleanup')browserCleanupCalls+=1;else {
+        browserBusinessCalls+=1;
+        const stage=stageHint||browserToolBusinessStage(event?.item?.arguments?.code||event?.item?.arguments?.command||'');
+        browserBusinessStageCounts[stage]=(browserBusinessStageCounts[stage]||0)+1;
+      }
       submissionIntentObserved=submissionIntentObserved||eventContainsSubmissionIntent(event)||manifestHasSubmissionIntent(dir);
-      if(browserBusinessCalls>BROWSER_TOOL_BUSINESS_CALL_BUDGET&&!budgetFailure){
-        const record=writeBrowserToolBudget(dir,{observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,budgetKind:'business',submissionIntentObserved});
-        budgetFailure={code:'BROWSER_TOOL_BUDGET_EXCEEDED',observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,limit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,submissionIntentObserved,message:`BROWSER_TOOL_BUDGET_EXCEEDED: 浏览器业务 CUA 调用已达到 ${BROWSER_TOOL_BUSINESS_CALL_BUDGET} 次上限；第 ${browserBusinessCalls} 个业务调用已被父进程终止。`};
+      const stage=stageHint||browserToolBusinessStage(event?.item?.arguments?.code||event?.item?.arguments?.command||'');
+      const stageCount=browserBusinessStageCounts[stage]||0;
+      const stageLimit=BROWSER_TOOL_STAGE_BUDGETS[stage]||BROWSER_TOOL_BUSINESS_CALL_BUDGET;
+      if(kind!=='cleanup'&&(browserBusinessCalls>BROWSER_TOOL_BUSINESS_CALL_BUDGET||stageCount>stageLimit)&&!budgetFailure){
+        const record=writeBrowserToolBudget(dir,{observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,budgetKind:'business',stageName:stage,stageLimit,stageCount,stageCounts:browserBusinessStageCounts,submissionIntentObserved});
+        const reason=stageCount>stageLimit?`${stage} 阶段已达到 ${stageLimit} 次上限（第 ${stageCount} 次）`:`浏览器业务 CUA 调用已达到 ${BROWSER_TOOL_BUSINESS_CALL_BUDGET} 次总上限`;
+        budgetFailure={code:'BROWSER_TOOL_BUDGET_EXCEEDED',observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,limit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,stageName:stage,stageLimit,stageCount,stageCounts:{...browserBusinessStageCounts},submissionIntentObserved,message:`BROWSER_TOOL_BUDGET_EXCEEDED: ${reason}；本次业务调用已被父进程终止。`};
         const budgetEvent={type:'browser_tool_budget_exceeded',errorCode:budgetFailure.code,observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,limit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,cleanupLimit:BROWSER_TOOL_CLEANUP_CALL_BUDGET,submissionIntentObserved,stage:record?.stage||(budgetFailure.submissionIntentObserved?'post_submission_intent':'pre_submission_intent')};
+        budgetEvent.stageName=stage;budgetEvent.stageLimit=stageLimit;budgetEvent.stageCount=stageCount;budgetEvent.stageCounts={...browserBusinessStageCounts};
         capturedEvents.push(budgetEvent);log.write(boundedEventLine(budgetEvent)+'\n');stop();
       }
     };
@@ -504,11 +531,11 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
             else if(deferredCleanupCallIds.has(callKey)){
               deferredCleanupCallIds.delete(callKey);
               const completed=browserToolCallInfo(e,{dir,cleanupCallUsed:browserCleanupCalls>=BROWSER_TOOL_CLEANUP_CALL_BUDGET});
-              registerBrowserToolCall(callKey,completed?.kind==='cleanup'?'cleanup':'business',e);
+              registerBrowserToolCall(callKey,completed?.kind==='cleanup'?'cleanup':'business',e,completed?.stage||browserCall.stage);
             } else if(browserCall.kind==='deferred_cleanup'){
               const completed=browserToolCallInfo(e,{dir,cleanupCallUsed:browserCleanupCalls>=BROWSER_TOOL_CLEANUP_CALL_BUDGET});
-              registerBrowserToolCall(callKey,completed?.kind==='cleanup'?'cleanup':'business',e);
-            } else registerBrowserToolCall(callKey,browserCall.kind,e);
+              registerBrowserToolCall(callKey,completed?.kind==='cleanup'?'cleanup':'business',e,completed?.stage||browserCall.stage);
+            } else registerBrowserToolCall(callKey,browserCall.kind,e,browserCall.stage);
           }
           const compact=boundedEvent(e);
           capturedEvents.push(compact);

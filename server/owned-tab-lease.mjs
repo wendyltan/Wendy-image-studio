@@ -35,10 +35,15 @@ export const OWNED_TAB_CLEANUP_STATUSES = Object.freeze([
   'closed',
   'close_failed',
   'not_observed',
+  'cleanup_pending',
   'orphaned',
 ]);
 
-const TERMINAL_STATES = new Set(['closed_verified', 'close_unconfirmed', 'orphaned']);
+// An orphaned tab is not a terminal fact: it means the worker lost its
+// browser handle before a same-tab close could be verified.  It must remain
+// eligible for the separate cleanup-only recovery path.  A verified close or
+// a close that actually threw is terminal for this run and cannot be rebound.
+const TERMINAL_STATES = new Set(['closed_verified', 'close_unconfirmed']);
 const CREATED_OR_LATER_STATES = new Set(['created', 'uploading', 'uploaded', 'sent', 'generating', 'downloaded', 'closing']);
 const STATE_ORDER = new Map(OWNED_TAB_STATES.map((state, index) => [state, index]));
 const ID_RE = /^[a-f0-9-]{36}$/i;
@@ -231,7 +236,15 @@ export function resetOwnedTabLeaseForResume({dir, runId, requestId, sessionName 
       return initial;
     }
     const lease = normalizeLease(current, expected);
-    if (!TERMINAL_STATES.has(lease.state) && lease.state !== 'not_created') {
+    // The reserve marker is written before the browser executor starts.  If
+    // it stops before createBrowserTab returns, the lease remains `creating`
+    // with no real handle and no cleanup observation.  That is safe to roll
+    // back for the same request: it is not evidence of an orphaned tab and
+    // must not block an accepted-before-start quota resume.
+    const preCreateReservation = lease.state === 'creating'
+      && !lease.ownedTabId
+      && lease.cleanupStatus === 'not_attempted';
+    if (!preCreateReservation && !TERMINAL_STATES.has(lease.state) && lease.state !== 'not_created') {
       const error = new Error(`本次 run 的 owned tab 仍处于 ${lease.state}，无法安全续接并再次创建。`);
       error.code = 'OWNED_TAB_RESUME_UNSAFE';
       error.lease = lease;
@@ -288,7 +301,13 @@ export function markOwnedTabStage({dir, runId, requestId, state, ownedTabId, ses
       error.code = 'OWNED_TAB_LEASE_TERMINAL';
       throw error;
     }
-    if (STATE_ORDER.get(nextState) < STATE_ORDER.get(lease.state)) {
+    const cleanupRecovery = lease.state === 'orphaned' && nextState === 'closing' && ['cleanup_pending', 'not_observed', 'orphaned'].includes(lease.cleanupStatus);
+    if (lease.state === 'orphaned' && !cleanupRecovery) {
+      const error = new Error(`owned tab lease 已标记为 orphaned，只能进入 cleanup-only closing，不能回写 ${nextState}。`);
+      error.code = 'OWNED_TAB_ORPHANED_RECOVERY_REQUIRED';
+      throw error;
+    }
+    if (!cleanupRecovery && STATE_ORDER.get(nextState) < STATE_ORDER.get(lease.state)) {
       const error = new Error(`owned tab lease 阶段不能回退：${lease.state} -> ${nextState}。`);
       error.code = 'OWNED_TAB_STAGE_REGRESSION';
       throw error;
@@ -309,7 +328,7 @@ export function markOwnedTabStage({dir, runId, requestId, state, ownedTabId, ses
       ownedTabId: text(ownedTabId) || lease.ownedTabId,
       sessionName: text(sessionName) || lease.sessionName,
       createdAt: createdAt || lease.createdAt || (nextState === 'created' ? now() : null),
-      cleanupStatus: nextState === 'created' || nextState === 'closing' ? 'open' : lease.cleanupStatus,
+      cleanupStatus: cleanupRecovery ? 'cleanup_pending' : (nextState === 'created' ? 'open' : lease.cleanupStatus),
     };
     return writeLease(file, lease, next);
   });
@@ -328,7 +347,7 @@ export function markOwnedTabCleanup({dir, runId, requestId, status, ownedTabId, 
     const lease = current || normalizeLease({runId: expected.runId, requestId: expected.requestId}, expected);
     assertOwnedTabMatch(lease, ownedTabId);
     const closed = cleanupStatus === 'closed';
-    const observed = cleanupStatus === 'not_observed' || cleanupStatus === 'orphaned';
+    const observed = cleanupStatus === 'not_observed' || cleanupStatus === 'orphaned' || cleanupStatus === 'cleanup_pending';
     if (TERMINAL_STATES.has(lease.state)) {
       const error = new Error(`owned tab lease 已进入终态 ${lease.state}，不能再次写入 cleanup。`);
       error.code = 'OWNED_TAB_LEASE_TERMINAL';
@@ -355,14 +374,56 @@ export function markOwnedTabCleanup({dir, runId, requestId, status, ownedTabId, 
   });
 }
 
+/**
+ * Mark an orphaned lease as entering the independent cleanup-only path.
+ * This transition is intentionally local and identity-bound; it does not
+ * inspect, navigate, or close a browser tab.  The cleanup executor must still
+ * use the exact persisted ownedTabId and prove that the same handle's close()
+ * returned successfully before the lease can become closed_verified.
+ */
+export function prepareOwnedTabCleanup({dir, runId, requestId, ownedTabId} = {}) {
+  const expected = {runId: text(runId) || path.basename(path.resolve(String(dir || ''))), requestId};
+  return withLease(dir, expected, (file, current) => {
+    const lease = current ? normalizeLease(current, expected) : null;
+    if (!lease || !lease.ownedTabId) {
+      const error = new Error('cleanup-only 缺少可验证的本次 ownedTabId。');
+      error.code = 'OWNED_TAB_CLEANUP_ID_MISSING';
+      throw error;
+    }
+    assertOwnedTabMatch(lease, ownedTabId);
+    if (TERMINAL_STATES.has(lease.state)) {
+      const error = new Error(`owned tab lease 已进入终态 ${lease.state}，不能启动 cleanup-only：${lease.state}。`);
+      error.code = 'OWNED_TAB_CLEANUP_TERMINAL';
+      throw error;
+    }
+    if (!['orphaned', 'closing'].includes(lease.state)) {
+      const error = new Error(`cleanup-only 只接受 orphaned/closing lease，当前为 ${lease.state}。`);
+      error.code = 'OWNED_TAB_CLEANUP_STATE_INVALID';
+      throw error;
+    }
+    return writeLease(file, lease, {
+      state: 'closing',
+      ownedTabId: lease.ownedTabId,
+      cleanupStatus: 'cleanup_pending',
+      cleanupVerifiedAt: null,
+      cleanupError: null,
+    });
+  });
+}
+
 /** Best-effort local close handshake when the child exits, aborts, or times out. */
 export function finalizeOwnedTabLease({dir, runId, requestId, reason = 'executor-exit', kernelReset = false} = {}) {
   const lease = readOwnedTabLease(dir, {runId, requestId});
-  if (!lease || lease.state === 'not_created' || TERMINAL_STATES.has(lease.state)) return lease;
-  // The Node parent cannot call CUA close.  A known handle therefore still
-  // needs an explicit not_observed result; close_failed is reserved for the
-  // executor reporting that the same handle's close() actually threw.
-  const status = 'not_observed';
+  // A quota/worker stop can happen after reserve-create but before
+  // createBrowserTab returns.  `creating` is not evidence that a tab exists;
+  // leave that lease untouched so pre-acceptance quota recovery does not
+  // manufacture an orphan or a cleanup obligation.
+  if (!lease || ['not_created', 'creating'].includes(lease.state) || TERMINAL_STATES.has(lease.state)) return lease;
+  // The Node parent cannot call CUA close.  A known handle therefore enters an
+  // explicit cleanup_pending/orphaned state; close_failed is reserved for the
+  // executor reporting that the same handle's close() actually threw.  The
+  // pending marker is what makes an unlock-time cleanup-only retry safe.
+  const status = 'cleanup_pending';
   return markOwnedTabCleanup({
     dir,
     runId: lease.runId,
