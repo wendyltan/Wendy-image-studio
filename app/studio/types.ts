@@ -71,7 +71,7 @@ export type Task = {
   providerInvocations?: number;
   errorCode?: string;
   webState?: string | null;
-  webTimings?: Record<string, string | null> | null;
+  webTimings?: Record<string, string | number | boolean | null> | null;
   ownedTabId?: string | null;
   sessionName?: string | null;
   ownedTabState?: string | null;
@@ -79,6 +79,15 @@ export type Task = {
   cleanupVerifiedAt?: string | null;
   cleanupError?: string | null;
   kernelReset?: boolean;
+  attachmentExpectedCount?: number | null;
+  attachmentObservedCount?: number | null;
+  attachmentPending?: boolean | null;
+  sendEnabled?: boolean | null;
+  failureStage?: string | null;
+  browserStage?: string | null;
+  runtimeErrorCategory?: string | null;
+  runtimeErrorMessage?: string | null;
+  runtimeErrorToolStage?: string | null;
 };
 
 export type Pending = {
@@ -102,6 +111,15 @@ export type Pending = {
   cleanupVerifiedAt?: string | null;
   cleanupError?: string | null;
   kernelReset?: boolean;
+  attachmentExpectedCount?: number | null;
+  attachmentObservedCount?: number | null;
+  attachmentPending?: boolean | null;
+  sendEnabled?: boolean | null;
+  failureStage?: string | null;
+  browserStage?: string | null;
+  runtimeErrorCategory?: string | null;
+  runtimeErrorMessage?: string | null;
+  runtimeErrorToolStage?: string | null;
 };
 
 export type FailureClassification = {

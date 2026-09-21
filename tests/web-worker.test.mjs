@@ -5,6 +5,7 @@ import path from 'node:path';
 import {test} from 'node:test';
 import {dispatchChatGptWebJob,resumeChatGptWebJob,readWebManifest,WEB_IMAGE_PROVIDER} from '../server/chatgpt-web-provider.mjs';
 import {patchManifest} from '../server/run-manifest.mjs';
+import {readExecutorRuntimeError} from '../server/bridge.mjs';
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'wendi-direct-worker-'));
 const latest61RemotePrompt=fs.readFileSync(new URL('./fixtures/latest-6-1-remote-prompt.txt',import.meta.url),'utf8').replace(/\n$/,'');
 function setup(mode){
@@ -27,6 +28,7 @@ let input='';process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>{
  if(mode==='home-confirmed-unsent-once'){const marker=path.join(dir,'home-confirmed-unsent-once');if(!fs.existsSync(marker)){fs.writeFileSync(marker,'1');write({...base,state:'failed',submitted:false,submissionIntent:false,referenceCount:0,conversationUrl:'https://chatgpt.com/',errorCode:'FILE_UPLOAD_CHROME_UNAVAILABLE',error:'chooser failed before submission; no user message appeared'});process.exitCode=1;return;}}
  if(mode==='owned-tab-handle-loss-once'){const marker=path.join(dir,'owned-tab-handle-loss-once');if(!fs.existsSync(marker)){fs.writeFileSync(marker,'1');write({...base,state:'failed',submitted:false,submissionIntent:false,referenceCount:0,errorCode:'BROWSER_CHROME_UNAVAILABLE',error:'owned tab handle was lost before navigation'});process.exitCode=1;return;}}
  if(mode==='worker-runtime'){console.log(JSON.stringify({type:'item.completed',item:{type:'command_execution',command:'cua_repl.js',aggregated_output:'ReferenceError: require is not defined'}}));write({...base,state:'accepted',accepted:true,submitted:false,referenceCount:0});process.exitCode=1;return;}
+ if(mode==='event-with-image-data'){console.log(JSON.stringify({type:'item.completed',item:{type:'mcp_tool_call',server:'cua_repl',tool:'js',result:{content:[{type:'image',data:'data:image/png;base64,${'A'.repeat(4096)}'}],screenshot:{url:'data:image/png;base64,${'B'.repeat(4096)}'}}}}));}
  if(mode==='focus-unavailable'){process.stderr.write('BROWSER_FOCUS_UNAVAILABLE: Chrome management capability is not advertised');process.exitCode=1;return;}
  if(mode==='origin-permission-denied'){console.log(JSON.stringify({type:'item.completed',item:{type:'mcp_tool_call',server:'cua_repl',tool:'js',result:{content:[{type:'text',text:'The user declined permission for this action. Browser use cannot access https://chatgpt.com because the user denied permission for this request.'}]}}}));write({...base,state:'accepted'});process.stderr.write('The user declined permission for this action. Browser use cannot access https://chatgpt.com because the user denied permission for this request.');process.exitCode=1;return;}
  if(mode==='origin-permission-denied-exit0'){write({...base,state:'failed',errorCode:'BROWSER_CHROME_UNAVAILABLE',error:'Chrome extension unavailable'});process.stderr.write('The user declined permission for this action. Browser use cannot access https://chatgpt.com because the user denied permission for this request.');return;}
@@ -149,6 +151,11 @@ test('explicit file-upload failure wins over permission words in prompt and comm
 test('cua require runtime failure is classified before upload and never as chooser failure',async()=>{
  const args=setup('worker-runtime');await assert.rejects(dispatchChatGptWebJob(args),error=>error.code==='WORKER_SCRIPT_RUNTIME_ERROR'&&error.webManifest?.submitted===false);
  const manifest=readWebManifest(path.join(args.dir,'web-generation.json'));assert.equal(manifest.errorCode,'WORKER_SCRIPT_RUNTIME_ERROR');assert.equal(manifest.submitted,false);assert.equal(manifest.referenceCount,0);assert.equal(manifest.preSubmissionFailure,true);assert.match(manifest.error,/浏览器执行脚本发生运行时错误/);assert.doesNotMatch(manifest.error,/chooser|文件选择器|附件入口/i);
+ const runtime=readExecutorRuntimeError(args.dir);assert.equal(runtime.category,'javascript_runtime');assert.match(runtime.message,/ReferenceError/);assert.match(runtime.stack,/require is not defined/);assert.equal(runtime.toolStage,'executor');assert.equal(manifest.runtimeErrorCategory,'javascript_runtime');assert.match(manifest.runtimeErrorMessage,/ReferenceError/);
+});
+test('executor event logs redact image payloads while retaining compact evidence',async()=>{
+ const args=setup('event-with-image-data');await dispatchChatGptWebJob(args);
+ const events=fs.readFileSync(path.join(args.dir,'events.jsonl'),'utf8');assert.doesNotMatch(events,/A{100}|B{100}/);assert.match(events,/image-data-redacted/);assert.ok(fs.statSync(path.join(args.dir,'events.jsonl')).size<10000);
 });
 test('exit-zero origin evidence from another project cannot be normalized',async()=>{
  const args=setup('origin-permission-denied-exit0-mismatch');fs.writeFileSync(path.join(args.dir,'request.json'),JSON.stringify({provider:'chatgpt-web-iab',projectId:'current-project',projectVersion:3,taskId:'current-task',target:'第1页-第1格'}));

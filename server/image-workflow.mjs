@@ -18,6 +18,15 @@ function ownedTabLifecycle(manifest) {
     cleanupVerifiedAt: manifest.cleanupVerifiedAt || null,
     cleanupError: manifest.cleanupError || null,
     kernelReset: manifest.kernelReset === true,
+    attachmentExpectedCount: Number.isInteger(Number(manifest.attachmentExpectedCount)) ? Number(manifest.attachmentExpectedCount) : null,
+    attachmentObservedCount: Number.isInteger(Number(manifest.attachmentObservedCount)) ? Number(manifest.attachmentObservedCount) : null,
+    attachmentPending: manifest.attachmentPending === true ? true : manifest.attachmentPending === false ? false : null,
+    sendEnabled: manifest.sendEnabled === true,
+    failureStage: manifest.failureStage || null,
+    browserStage: manifest.browserStage || null,
+    runtimeErrorCategory: manifest.runtimeErrorCategory || null,
+    runtimeErrorMessage: manifest.runtimeErrorMessage || null,
+    runtimeErrorToolStage: manifest.runtimeErrorToolStage || null,
   };
 }
 

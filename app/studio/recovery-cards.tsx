@@ -43,16 +43,28 @@ export function NoOutputCard({
   const uploadUnavailable =
     project.lastFailure?.kind === 'browser-upload-unavailable' ||
     project.currentTask?.errorCode === 'browser-upload-unavailable';
+  const attachmentExpected = project.currentTask?.attachmentExpectedCount ?? null;
+  const attachmentObserved = project.currentTask?.attachmentObservedCount ?? null;
+  const postUploadPreSubmit =
+    attachmentExpected !== null &&
+    attachmentObserved === attachmentExpected &&
+    project.currentTask?.attachmentPending === false &&
+    project.currentTask?.sendEnabled === true &&
+    project.currentTask?.status === 'failed_no_output';
   return (
     <div className="recovery-card">
       <div>
         <h3>
-          {uploadUnavailable
+          {postUploadPreSubmit
+            ? '附件已核实，但发送前失败，上一版原图仍保留'
+            : uploadUnavailable
             ? '附件上传未完成，上一版原图仍保留'
             : '本次没有取得图片，可重试这一张'}
         </h3>
         <p>
-          {uploadUnavailable
+          {postUploadPreSubmit
+            ? `${target} 已观察到 ${attachmentObserved}/${attachmentExpected} 个附件，发送前失败，未发送消息，也未生成新图。系统不会自行重发；修复发送阶段后可只重试这一张。`
+            : uploadUnavailable
             ? `${target} 的附件入口没有打开浏览器文件选择器；本次未上传附件、未发送消息，也未生成新图。系统不会自行重试，修复附件入口后可只重试这一张。`
             : `${target} 没有保存到本地，也没有可找回的原图。系统不会自行重试；重新生成会发起一次新的生图并消耗创作额度。`}
         </p>

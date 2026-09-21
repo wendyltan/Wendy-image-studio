@@ -8,7 +8,7 @@ import {inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence} f
 
 const MANIFEST_STATES=new Set(['queued','accepted','ready','submitted','downloaded','failed']);
 const URL_RE=/^https:\/\/chatgpt\.com\/(?:c\/[^\s?#]+)?(?:[?#][^\s]*)?$/;
-const VALUE_KEYS=new Set(['conversationUrl','referenceCount','errorCode','error','submissionConfirmedBy','artifactPath','accepted','submitted','submissionIntent','submissionUncertain','preSubmissionFailure','resumeCount','resumedAt','lastPreAcceptanceAttempt','lastConfirmedUnsentAttempt','confirmedUnsentAudit','role','executorModel','executorReasoningEffort','focusPolicy','ownedTabId','ownedTabCleanupStatus','ownedTabState','sessionName','ownedTabCreatedAt','cleanupStatus','cleanupVerifiedAt','cleanupError','kernelReset']);
+const VALUE_KEYS=new Set(['conversationUrl','referenceCount','attachmentExpectedCount','attachmentObservedCount','attachmentPending','sendEnabled','failureStage','browserStage','runtimeErrorCategory','runtimeErrorMessage','runtimeErrorStack','runtimeErrorToolStage','errorCode','error','submissionConfirmedBy','artifactPath','accepted','submitted','submissionIntent','submissionUncertain','preSubmissionFailure','resumeCount','resumedAt','lastPreAcceptanceAttempt','lastConfirmedUnsentAttempt','confirmedUnsentAudit','role','executorModel','executorReasoningEffort','focusPolicy','ownedTabId','ownedTabCleanupStatus','ownedTabState','sessionName','ownedTabCreatedAt','cleanupStatus','cleanupVerifiedAt','cleanupError','kernelReset']);
 
 function now(){return new Date().toISOString();}
 function usageError(message){const error=new Error(message);error.code='MANIFEST_PATCH_REJECTED';return error;}
@@ -51,6 +51,23 @@ function optionalText(value,max=1000){
   if(value===undefined)return undefined;
   if(value===null||String(value).trim()==='')return null;
   return String(value).trim().slice(0,max);
+}
+function optionalInteger(value,key){
+  if(value===undefined)return undefined;
+  return integer(value,key);
+}
+function optionalBoolean(value,key){
+  if(value===undefined)return undefined;
+  return bool(value,key);
+}
+function applyAttachmentPatch(patch,args){
+  const integerFields=[['attachmentExpectedCount','attachmentExpectedCount'],['attachmentObservedCount','attachmentObservedCount']];
+  for(const [field,key] of integerFields){const value=optionalInteger(args[key],key);if(value!==undefined)patch[field]=value;}
+  const pending=optionalBoolean(args.attachmentPending,'attachmentPending');if(pending!==undefined)patch.attachmentPending=pending;
+  const enabled=optionalBoolean(args.sendEnabled,'sendEnabled');if(enabled!==undefined)patch.sendEnabled=enabled;
+  for(const [field,max] of [['failureStage',100],['browserStage',100],['runtimeErrorCategory',120],['runtimeErrorMessage',1200],['runtimeErrorStack',2400],['runtimeErrorToolStage',120]]){
+    if(args[field]!==undefined)patch[field]=optionalText(args[field],max);
+  }
 }
 function ownedTabState(value){
   const normalized=String(value??'').trim();
@@ -135,14 +152,19 @@ function stagePatch(stage,args,record){
     patch.state='accepted';patch.accepted=true;patch.acceptedAt=now();
   }else if(stage==='ready'){
     if(!['accepted','ready'].includes(current.state)||current.accepted!==true)throw usageError('ready 前必须已经 accepted。');
-    patch.state='ready';patch.accepted=true;patch.submitted=false;patch.conversationUrl=validateUrl(args.conversationUrl);patch.referenceCount=integer(args.referenceCount,'referenceCount');patch.readyAt=now();
+    patch.state='ready';patch.accepted=true;patch.submitted=false;patch.conversationUrl=validateUrl(args.conversationUrl);patch.referenceCount=integer(args.referenceCount,'referenceCount');patch.readyAt=now();applyAttachmentPatch(patch,args);
+    if(patch.attachmentExpectedCount===undefined)patch.attachmentExpectedCount=patch.referenceCount;
+    if(patch.attachmentObservedCount===undefined)patch.attachmentObservedCount=patch.referenceCount;
+    if(patch.attachmentPending===undefined)patch.attachmentPending=false;
+    if(patch.sendEnabled===undefined)patch.sendEnabled=true;
+    if(patch.browserStage===undefined)patch.browserStage='ready_to_send';
   }else if(stage==='submission-intent'){
     if(!['ready','submitted'].includes(current.state)||current.accepted!==true)throw usageError('submission-intent 前必须已经 ready。');
     if(current.submitted===true)throw usageError('已提交的请求不能再次写入 submission-intent。');
-    patch.state='ready';patch.submissionIntent=true;patch.submitted=false;patch.submissionAttemptAt=now();
+    patch.state='ready';patch.submissionIntent=true;patch.submitted=false;patch.submissionAttemptAt=now();patch.browserStage='submission_intent_recorded';
   }else if(stage==='submitted'){
     if(current.accepted!==true||current.submissionIntent!==true)throw usageError('submitted 前必须先写入 submission-intent。');
-    patch.state='submitted';patch.accepted=true;patch.submitted=true;patch.submittedAt=now();patch.submissionConfirmedBy=String(args.submissionConfirmedBy||'positive_browser_evidence');
+    patch.state='submitted';patch.accepted=true;patch.submitted=true;patch.submittedAt=now();patch.submissionConfirmedBy=String(args.submissionConfirmedBy||'positive_browser_evidence');patch.browserStage='submitted';
     if(args.conversationUrl)patch.conversationUrl=validateUrl(args.conversationUrl);
   }else if(stage==='downloaded'){
     if(current.submitted!==true)throw usageError('downloaded 前必须已经 submitted。');
@@ -163,12 +185,13 @@ function stagePatch(stage,args,record){
     patch.submissionIntent=submissionIntent;
     patch.submissionUncertain=submissionUncertain;
     patch.preSubmissionFailure=preSubmissionFailure;
+    applyAttachmentPatch(patch,args);
     applyOwnedTabPatch(patch,args);
     if(args.conversationUrl)patch.conversationUrl=validateUrl(args.conversationUrl);
   }else if(stage==='resume'){
     const confirmedUnsent=Boolean(args.confirmedUnsentAudit);
     if(!['queued','failed'].includes(current.state)||current.submitted===true&&!confirmedUnsent)throw usageError('只有未提交或确认未发送的请求可以续接。');
-    patch.state='queued';patch.accepted=false;patch.submitted=false;patch.submissionIntent=false;patch.submissionUncertain=false;patch.preSubmissionFailure=false;patch.referenceCount=0;patch.acceptedAt=null;patch.readyAt=null;patch.submissionAttemptAt=null;patch.submittedAt=null;patch.downloadedAt=null;patch.artifactPath=null;patch.errorCode=null;patch.error=null;
+    patch.state='queued';patch.accepted=false;patch.submitted=false;patch.submissionIntent=false;patch.submissionUncertain=false;patch.preSubmissionFailure=false;patch.referenceCount=0;patch.attachmentExpectedCount=0;patch.attachmentObservedCount=0;patch.attachmentPending=null;patch.sendEnabled=false;patch.failureStage=null;patch.browserStage='queued';patch.runtimeErrorCategory=null;patch.runtimeErrorMessage=null;patch.runtimeErrorStack=null;patch.runtimeErrorToolStage=null;patch.acceptedAt=null;patch.readyAt=null;patch.submissionAttemptAt=null;patch.submittedAt=null;patch.downloadedAt=null;patch.artifactPath=null;patch.errorCode=null;patch.error=null;
     if(args.resumeCount!==undefined)patch.resumeCount=integer(args.resumeCount,'resumeCount');
     if(args.resumedAt!==undefined)patch.resumedAt=String(args.resumedAt);
     if(args.lastPreAcceptanceAttempt!==undefined)patch.lastPreAcceptanceAttempt=String(args.lastPreAcceptanceAttempt);
@@ -180,6 +203,7 @@ function stagePatch(stage,args,record){
       if(args[key]!==undefined)patch[key]=args[key]===null?null:String(args[key]);
     }
     if(args.resumeCount!==undefined)patch.resumeCount=integer(args.resumeCount,'resumeCount');
+    applyAttachmentPatch(patch,args);
     applyOwnedTabPatch(patch,args);
   }else if(stage==='cleanup'){
     patch.state=current.state;

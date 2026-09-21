@@ -168,8 +168,31 @@ export function WorkflowStatus({
       '这是旧请求记录中的后台浏览器能力失败；没有上传附件或发送消息。当前生产链路不会使用隐藏 IAB，请确认 Chrome 焦点管理能力后再重试。',
   };
   const webFailureCode = String(project.pending?.errorCode || '');
+  const attachmentExpected =
+    project.pending?.attachmentExpectedCount ??
+    task?.attachmentExpectedCount ??
+    (typeof task?.webTimings?.attachmentExpectedCount === 'number'
+      ? task.webTimings.attachmentExpectedCount
+      : null);
+  const attachmentObserved =
+    project.pending?.attachmentObservedCount ??
+    task?.attachmentObservedCount ??
+    (typeof task?.webTimings?.attachmentObservedCount === 'number'
+      ? task.webTimings.attachmentObservedCount
+      : null);
+  const attachmentComplete =
+    attachmentExpected !== null &&
+    attachmentObserved === attachmentExpected &&
+    project.pending?.attachmentPending === false &&
+    project.pending?.sendEnabled === true;
+  const postUploadPreSubmit =
+    project.pending?.webState === 'failed' &&
+    project.pending?.submitted !== true &&
+    attachmentComplete;
   const webFailureText =
-    project.pending?.webState === 'failed'
+    postUploadPreSubmit
+      ? `已观察到 ${attachmentObserved}/${attachmentExpected} 个附件，发送前失败，未发送消息；上一版原图仍保留。`
+      : project.pending?.webState === 'failed'
       ? webFailureMessages[webFailureCode] ||
         (project.pending.accepted
           ? '后台已接单，但当前网页生图请求已失败；请求记录和原图找回入口仍保留。'
@@ -205,7 +228,8 @@ export function WorkflowStatus({
   const uploadUnavailable =
     project.lastFailure?.kind === 'browser-upload-unavailable' ||
     task?.errorCode === 'browser-upload-unavailable' ||
-    project.pending?.errorCode === 'FILE_UPLOAD_CHROME_UNAVAILABLE';
+    project.pending?.errorCode === 'FILE_UPLOAD_CHROME_UNAVAILABLE' ||
+    postUploadPreSubmit;
   const layoutPage = project.pages.find(
     (page) =>
       !page.qa.pass &&
@@ -239,6 +263,10 @@ export function WorkflowStatus({
         : project.pending?.webState === 'ready'
           ? 'composing'
           : progress?.activeStage?.tone || (project.busy ? 'working' : 'complete');
+  const taskTiming = (key: string): string | null => {
+    const value = task?.webTimings?.[key];
+    return typeof value === 'string' ? value : null;
+  };
   const browserClock = project.pending
     ? {
         createdAt: project.pending.at,
@@ -249,11 +277,11 @@ export function WorkflowStatus({
       }
     : task?.webTimings
       ? {
-          createdAt: task.webTimings.createdAt || task.startedAt,
-          acceptedAt: task.webTimings.acceptedAt,
-          readyAt: task.webTimings.readyAt,
-          submittedAt: task.webTimings.submittedAt,
-          downloadedAt: task.webTimings.downloadedAt,
+          createdAt: taskTiming('createdAt') || task.startedAt,
+          acceptedAt: taskTiming('acceptedAt'),
+          readyAt: taskTiming('readyAt'),
+          submittedAt: taskTiming('submittedAt'),
+          downloadedAt: taskTiming('downloadedAt'),
         }
       : null;
   const browserStages: ProgressStage[] = [];
@@ -350,7 +378,9 @@ export function WorkflowStatus({
             {noOutput
               ? panelDecisionPrimary
                 ? '本次修改未取得新图，上一版原图仍保留。'
-                : uploadUnavailable
+                : postUploadPreSubmit
+                  ? `已观察到 ${attachmentObserved}/${attachmentExpected} 个附件，发送前失败，未发送消息；上一版原图仍保留。`
+                  : uploadUnavailable
                   ? '附件上传没有完成，未上传附件、未发送消息；上一版原图仍保留。'
                   : '本次没有取得图片，可重试这一张。'
               : statusMessage}

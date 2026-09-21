@@ -45,7 +45,7 @@ export function buildManifestCommands(manifestFile,{helperFile=DEFAULT_HELPER,re
   const runId=path.basename(dir);
   return Object.freeze({
     accepted:command('accepted'),
-    ready:command('ready',' --conversation-url "<当前会话地址>" --reference-count <已确认附件数>'),
+    ready:command('ready',' --conversation-url "<当前会话地址>" --reference-count <已确认附件数> --attachment-expected-count <冻结附件数> --attachment-observed-count <实际附件数> --attachment-pending false --send-enabled true --browser-stage "ready_to_send"'),
     submissionIntent:command('submission-intent'),
     submitted:command('submitted',' --conversation-url "<当前会话地址>" --submission-confirmed-by "new_user_message_and_stop_generation_control"'),
     downloaded:command('downloaded',' --conversation-url "<当前会话地址>"'),

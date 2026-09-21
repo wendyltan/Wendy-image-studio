@@ -61,6 +61,24 @@ test('menu fallback waits for the chooser only after clicking 从电脑上传',(
   assert.match(route,/禁止第二个 tab/);
 });
 
+test('chooser timeout on route A is recoverable when route B completes the attachment gate',()=>{
+  const instruction=chatGptWebImagePrompt({
+    outputFile:'/tmp/result.png',
+    manifestFile:'/tmp/web-generation.json',
+    prompt:'fixture',
+    referenceFiles:['/tmp/01.png','/tmp/02.png'],
+  });
+  const route=instruction.slice(instruction.indexOf('路径 A：'),instruction.indexOf('setFiles 后'));
+  assert.match(route,/A 没有 chooser 是允许的、可恢复的分支/);
+  assert.match(route,/不能因为 A 超时就写任何失败命令、WORKER_SCRIPT_RUNTIME_ERROR 或结束本次执行/);
+  assert.match(route,/B 的 setFiles 成功.*完整附件.*不能阻断 uploaded→ready→submission-intent→一次发送/);
+  const expectedNames=['01.png','02.png'];
+  const recovered={schemaVersion:1,source:'browser-upload',uploadMethod:'menu-fallback',chooserEventObserved:true,chooserAttachedBeforeClick:true,attachmentExpected:2,attachmentObserved:2,attachmentNames:expectedNames,attachmentPending:false,sendEnabled:true,alternateRouteUsed:true,alternateRouteCount:1,failureStage:null};
+  const gate=validateUploadEvidence(recovered,{expectedCount:2,expectedNames,requireComplete:true});
+  assert.equal(gate.ok,true);
+  assert.equal(gate.evidence.failureStage,null);
+});
+
 test('zero of five attachments cannot pass the send gate',()=>{
   const result=validateUploadEvidence({
     schemaVersion:1,

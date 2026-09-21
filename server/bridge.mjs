@@ -1,11 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import {spawn, execFileSync} from 'node:child_process';
 import readline from 'node:readline';
 import {APP} from './workflow.mjs';
 import {finalizeOwnedTabLease,readOwnedTabLease,syncOwnedTabLeaseToManifest} from './owned-tab-lease.mjs';
 
 const IMAGE_PATH = /(?:^|[\s"'`(])((?:\/[^\n<>"'`]+?)\.(?:png|webp|jpe?g))(?:$|[\s"'`,)])/gi;
+const EXECUTOR_RUNTIME_ERROR_FILE = 'executor-runtime-error.json';
+const MAX_EVENT_TEXT = 24000;
+const MAX_ERROR_TEXT = 1200;
 const CLEAR_NO_IMAGE = /(?:未产生(?:任何)?图片|未产出(?:任何)?图片|未能生成(?:图片)?|没有生成(?:替代品|图片)|没有(?:任何)?图片(?:产出|生成)?|目标路径尚不存在|未写入目标路径|Browser is not available:\s*(?:iab|chrome)|隐藏\s*IAB.*不可用|BROWSER_(?:FOCUS|TAB_BACKGROUND|CHROME)_(?:UNAVAILABLE|RESTORE_FAILED)|BROWSER_ORIGIN_PERMISSION_DENIED|The user declined permission(?: for this action)?|Browser use cannot access\s+https?:\/\/chatgpt\.com\b[^\n]*(?:denied permission|permission denied)|https?:\/\/chatgpt\.com\b[^\n]*browser security policy|browser security policy[^\n]*https?:\/\/chatgpt\.com\b|browser security policy|Chrome management capability is not advertised|焦点(?:恢复|管理)能力(?:不可用|未提供|未广告)|无法恢复创作室焦点|no image (?:was )?(?:generated|produced|created)|image generation (?:did not|failed to) (?:produce|create))/i;
 const NETWORK_INTERRUPTION = /(?:network|connection|connect(?:ion)? (?:reset|refused|failed|closed)|websocket|tls|ssl|tunnel|econn(?:reset|refused|timeout)|enotfound|连接(?:错误|中断|失败|超时)?|网络(?:错误|中断|失败|超时)?|代理|隧道)/i;
 
@@ -41,6 +45,96 @@ function identifier(events, keys){
     }
   }
   return null;
+}
+
+function redactRuntimeText(value, max=MAX_ERROR_TEXT){
+  return String(value ?? '')
+    .replace(/[\r\n\t]+/g,' ')
+    .replace(/data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+/gi,'[image-data-redacted]')
+    .replace(/(?:file:\/\/|https?:\/\/|\/Volumes\/|\/Users\/|\/private\/|[A-Za-z]:[\\/])[^\s"'<>]+/g,'[path-redacted]')
+    .replace(/[a-f0-9]{8}-[a-f0-9-]{27,}/gi,'[id-redacted]')
+    .replace(/\s{2,}/g,' ')
+    .trim()
+    .slice(0,max);
+}
+
+function compactEvent(value){
+  if(typeof value==='string'){
+    if(/data:image\/[a-z0-9.+-]+;base64,/i.test(value))return redactRuntimeText(value,MAX_EVENT_TEXT).replace(/data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+/gi,'[image-data-redacted]');
+    if(value.length>MAX_EVENT_TEXT)return `${value.slice(0,MAX_EVENT_TEXT)}…[truncated ${value.length-MAX_EVENT_TEXT} chars]`;
+    return value;
+  }
+  if(Array.isArray(value))return value.map(item=>compactEvent(item));
+  if(!value||typeof value!=='object')return value;
+  const output={};
+  for(const [name,item] of Object.entries(value)){
+    if(name==='screenshot'&&item&&typeof item==='object'){
+      const pageUrl=item.pageUrl||item.url||null;
+      output[name]={pageUrl:typeof pageUrl==='string'&&/^data:image\//i.test(pageUrl)?`[image-data-redacted:${pageUrl.length} chars]`:pageUrl,tabId:item.tabId||null,omitted:true};
+      continue;
+    }
+    if(name==='url'&&typeof item==='string'&&/^data:image\//i.test(item)){
+      output[name]=`[image-data-redacted:${item.length} chars]`;
+      continue;
+    }
+    output[name]=compactEvent(item);
+  }
+  return output;
+}
+
+function compactResponseFile(file){
+  if(!file||!fs.existsSync(file))return '';
+  const original=fs.readFileSync(file,'utf8');
+  const compact=original
+    .replace(/data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+/gi,match=>`[image-data-redacted:${match.length} chars]`)
+    .replace(/[A-Za-z0-9+/=]{1024,}/g,match=>`[binary-data-redacted:${match.length} chars]`);
+  if(compact!==original)fs.writeFileSync(file,compact,{mode:0o600});
+  return compact;
+}
+
+function browserToolStage(value){
+  const source=typeof value==='string'?value:JSON.stringify(value||{});
+  if(/setFiles|filechooser|从电脑上传|上传文件|上传照片/i.test(source))return 'upload';
+  if(/发送提示词|pressKey\([^)]*(?:Enter|Return)|submission-intent|submitted/i.test(source))return 'submit';
+  if(/填入冻结|\.fill\(|\.paste\(|textbox/i.test(source))return 'prompt_fill';
+  if(/domSnapshot|getAXState|waitForLoadState|goto\(/i.test(source))return 'browser_observe';
+  if(/close\(\)/i.test(source))return 'cleanup';
+  return 'executor';
+}
+
+function runtimeCandidate(event){
+  const item=event?.item||{};
+  const rawError=item.error||event.error||event.message||event.error?.message;
+  const textCandidates=[];
+  if(rawError)textCandidates.push(typeof rawError==='string'?rawError:rawError.message||rawError.stack||JSON.stringify(rawError));
+  for(const key of ['aggregated_output','output','stdout','stderr'])if(typeof item[key]==='string')textCandidates.push(item[key]);
+  for(const block of item.result?.content||[])if(block?.type==='text'&&typeof block.text==='string')textCandidates.push(block.text);
+  const raw=textCandidates.find(value=>/(?:ReferenceError|TypeError|SyntaxError|RangeError|is not defined|not a function|WORKER_SCRIPT_RUNTIME_ERROR|EXECUTOR_RUNTIME_ERROR|BROWSER_HANDLE_LOST)/i.test(String(value)))||'';
+  if(!raw)return null;
+  const source=String(raw);
+  const match=source.match(/(ReferenceError|TypeError|SyntaxError|RangeError|Error)\s*:\s*([^\n]+)/i);
+  const category=match?.[1] ? 'javascript_runtime' : 'executor_error';
+  return {
+    schemaVersion:1,
+    category,
+    message:redactRuntimeText(match?`${match[1]}: ${match[2]}`:source),
+    stack:redactRuntimeText(raw,2400),
+    toolStage:browserToolStage(item.arguments?.code||item.command||source),
+    source:item.server||item.type||event.type||'executor',
+  };
+}
+
+export function writeExecutorRuntimeError(dir,value={}){
+  if(!dir||!value)return null;
+  const record={schemaVersion:1,category:redactRuntimeText(value.category,120),message:redactRuntimeText(value.message),stack:redactRuntimeText(value.stack,2400),toolStage:redactRuntimeText(value.toolStage,120),source:redactRuntimeText(value.source,120),capturedAt:new Date().toISOString()};
+  try{
+    const file=path.join(dir,EXECUTOR_RUNTIME_ERROR_FILE),temp=`${file}.tmp-${crypto.randomUUID()}`;
+    fs.writeFileSync(temp,JSON.stringify(record,null,2)+'\n',{mode:0o600});fs.renameSync(temp,file);return record;
+  }catch{return null;}
+}
+
+export function readExecutorRuntimeError(dir){
+  try{return JSON.parse(fs.readFileSync(path.join(dir,EXECUTOR_RUNTIME_ERROR_FILE),'utf8'));}catch{return null;}
 }
 
 /**
@@ -254,12 +348,18 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
     const log=fs.createWriteStream(path.join(dir,'events.jsonl'),{mode:0o600});
     let buf='',last='',error='',settled=false,timedOut=false,usage=null;
     const capturedEvents=[];
+    let runtimeError=null;
+    const persistRuntimeError=(candidate)=>{
+      if(!candidate||runtimeError)return;
+      runtimeError=writeExecutorRuntimeError(dir,candidate);
+    };
     const evidence=(responseText='',exitCode=null)=>classifyGenerationEvidence({events:capturedEvents,responseText,runId,startedAt,endedAt:new Date().toISOString(),exitCode});
     const stop=()=>{try{process.kill(-child.pid,'SIGTERM');}catch{} setTimeout(()=>{try{process.kill(-child.pid,'SIGKILL');}catch{}},1500).unref();};
     const abort=()=>stop(); signal?.addEventListener('abort',abort,{once:true});
     const timer=setTimeout(()=>{timedOut=true;stop();},timeoutMs);
     const finish=(err,result,{responseText='',exitCode=null}={})=>{
       if(settled)return;settled=true;clearTimeout(timer);signal?.removeEventListener('abort',abort);log.end();
+      try{compactResponseFile(resultPath);}catch{}
       saveExecution({state:err?'failed':'completed',endedAt:new Date().toISOString(),exitCode,durationMs:Math.max(0,Date.now()-Date.parse(startedAt)),error:err?String(err.message||err).slice(0,500):null});
       // The CUA executor is the only component allowed to close its tab.  If
       // it exited before writing verified close evidence, persist an explicit
@@ -283,17 +383,38 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
       resolve(result);
     };
     child.stdout.on('data',c=>{
-      log.write(c);buf+=c;
+      buf+=c;
       const lines=buf.split('\n');buf=lines.pop();
-      for(const line of lines){try{const e=JSON.parse(line);capturedEvents.push(e);if(e.type==='item.completed'&&e.item?.type==='agent_message')last=e.item.text;if(e.type==='turn.completed'&&e.usage)usage=e.usage;if(e.type==='error'||e.type==='turn.failed')error=e.message||e.error?.message||'创作连接中断';onEvent(e);}catch{}}
+      for(const line of lines){
+        if(!line.trim())continue;
+        try{
+          const e=JSON.parse(line),compact=compactEvent(e);
+          capturedEvents.push(compact);
+          const candidate=runtimeCandidate(e);if(candidate)persistRuntimeError(candidate);
+          if(e.type==='item.completed'&&e.item?.type==='agent_message')last=e.item.text;
+          if(e.type==='turn.completed'&&e.usage)usage=e.usage;
+          if(e.type==='error'||e.type==='turn.failed')error=e.message||e.error?.message||'创作连接中断';
+          log.write(JSON.stringify(compact)+'\n');onEvent(e);
+        }catch{
+          log.write(JSON.stringify({type:'unparsed',text:redactRuntimeText(line,MAX_EVENT_TEXT)})+'\n');
+        }
+      }
     });
-    child.stderr.on('data',c=>{const event={stderr:String(c)};capturedEvents.push(event);log.write(JSON.stringify(event)+'\n');});
-    child.on('error',err=>finish(new Error('无法启动创作连接：'+err.message)));
+    child.stderr.on('data',c=>{
+      const text=String(c),event={stderr:redactRuntimeText(text,MAX_EVENT_TEXT)};
+      capturedEvents.push(event);log.write(JSON.stringify(event)+'\n');
+      if(/(?:ReferenceError|TypeError|SyntaxError|RangeError|runtime|运行时|WORKER_SCRIPT|EXECUTOR_RUNTIME)/i.test(text))persistRuntimeError({category:'executor_stderr',message:text,stack:text,toolStage:'executor',source:'stderr'});
+    });
+    child.on('error',err=>{persistRuntimeError({category:'process',message:err.message,stack:err.stack,toolStage:'executor',source:'child'});finish(new Error('无法启动创作连接：'+err.message));});
     child.stdin.on('error',()=>{});
     child.on('close',code=>{
       if(signal?.aborted)return finish(new Error('已暂停，已保存完成部分。'),null,{exitCode:code});
       if(timedOut)return finish(new Error('本次等待时间较长，已暂停。已收到的图片保留在本地，可检查后继续。'),null,{exitCode:code});
-      if(code!==0)return finish(new Error(error||'创作连接中断，请确认账号可用后继续。'),null,{exitCode:code});
+      if(code!==0){
+        const message=error||'创作连接中断，请确认账号可用后继续。';
+        persistRuntimeError({category:'executor_exit',message,stack:'',toolStage:'executor',source:'process'});
+        return finish(new Error(message),null,{exitCode:code});
+      }
       const text=fs.existsSync(resultPath)?fs.readFileSync(resultPath,'utf8'):last;
       if(schema){try{const parsed=JSON.parse(text);Object.defineProperty(parsed,'__usage',{value:usage,enumerable:false});return finish(null,parsed,{responseText:text,exitCode:code});}catch{return finish(new Error('未收到完整方案，需求已保留，请重新整理。'),null,{responseText:text,exitCode:code});}}
       finish(null,{text,usage},{responseText:text,exitCode:code});

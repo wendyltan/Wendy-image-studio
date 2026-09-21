@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import {runCodex,findCodex} from './bridge.mjs';
+import {runCodex,findCodex,writeExecutorRuntimeError,readExecutorRuntimeError} from './bridge.mjs';
 import {identityFields,sameIdentityValue,readJsonObject as readRunJson,readRunIdentity,compareRunIdentity} from './run-identity.mjs';
 import {patchManifest} from './run-manifest.mjs';
 import {chatGptWebImagePrompt} from './web-executor-instructions.mjs';
@@ -159,6 +159,23 @@ function explicitManifestErrorCode(manifest){
   return code||null;
 }
 
+function uploadProjection(dir,worker){
+  const evidence=uploadEvidenceFromRun(dir);
+  if(!evidence)return {};
+  const expected=Number.isInteger(Number(evidence.attachmentExpected))?Number(evidence.attachmentExpected):Array.isArray(worker?.referenceEntries)?worker.referenceEntries.length:null;
+  const observed=Number.isInteger(Number(evidence.attachmentObserved))?Number(evidence.attachmentObserved):null;
+  const pending=evidence.attachmentPending===true||Array.isArray(evidence.attachmentPending)&&evidence.attachmentPending.length>0;
+  return {attachmentExpectedCount:expected,attachmentObservedCount:observed,attachmentPending:pending,sendEnabled:evidence.sendEnabled===true,failureStage:evidence.failureStage||null,browserStage:observed!==null&&expected!==null&&observed===expected&&!pending&&evidence.sendEnabled===true&&evidence.failureStage===null?'ready_to_send':'uploading'};
+}
+
+function runtimeProjection(dir,manifest,failure){
+  const stored=readExecutorRuntimeError(dir);
+  if(stored)return stored;
+  const message=String(failure?.message||manifest?.error||'').trim();
+  if(!message)return null;
+  return {schemaVersion:1,category:'control_flow',message:message.slice(0,1200),stack:'',toolStage:manifest?.browserStage||'post_upload_pre_submit',source:'manifest',capturedAt:new Date().toISOString()};
+}
+
 function originPermissionDeniedForRun({dir,manifestFile,outputFile,requestId,manifest}={}){
   if(!manifest||manifest.state!=='failed'||!Object.prototype.hasOwnProperty.call(manifest,'submitted')||manifest.submitted!==false)return false;
   if(!browserRunIdentityMatches({dir,manifestFile,outputFile,requestId,manifest}))return false;
@@ -233,7 +250,11 @@ function recordBrowserPreSubmissionFailure(manifestFile,requestId,failure,dir){
   const errorCode=explicit|| (inferredCode|| (uploadUnavailable?'FILE_UPLOAD_CHROME_UNAVAILABLE':originPermissionDenied?'BROWSER_ORIGIN_PERMISSION_DENIED':historicalIab?'IAB_UNAVAILABLE':browserTabBackgroundEvidence(detail)?'BROWSER_TAB_BACKGROUND_UNAVAILABLE':chromeUnavailableEvidence(detail)?'BROWSER_CHROME_UNAVAILABLE':browserFocusEvidence(detail)&&/RESTORE_FAILED_AFTER_CLOSE/i.test(detail)?'BROWSER_FOCUS_RESTORE_FAILED_AFTER_CLOSE':browserFocusEvidence(detail)&&/RESTORE_FAILED/i.test(detail)?'BROWSER_FOCUS_RESTORE_FAILED':'BROWSER_FOCUS_UNAVAILABLE'));
   const prefix=browserFailurePrefix(errorCode);
   try{
-    patchManifestState(manifestFile,'failed',{submitted:'false',submissionIntent:manifest.submissionIntent===true?'true':'false',preSubmissionFailure:'true',errorCode,error:`${prefix}；未上传附件或发送消息。原始错误：${detail}`});
+    const projection=uploadProjection(dir,worker),runtime=errorCode==='WORKER_SCRIPT_RUNTIME_ERROR'||errorCode==='EXECUTOR_RUNTIME_ERROR'?runtimeProjection(dir,manifest,failure):null;
+    const complete=projection.attachmentObservedCount!==null&&projection.attachmentExpectedCount!==null&&projection.attachmentObservedCount===projection.attachmentExpectedCount&&projection.attachmentPending===false&&projection.sendEnabled===true;
+    const failureStage=complete?'post_upload_pre_submit':(projection.failureStage||null);
+    patchManifestState(manifestFile,'failed',{submitted:'false',submissionIntent:manifest.submissionIntent===true?'true':'false',preSubmissionFailure:'true',errorCode,...projection,failureStage,browserStage:projection.browserStage||null,...(runtime?{runtimeErrorCategory:runtime.category,runtimeErrorMessage:runtime.message,runtimeErrorStack:runtime.stack,runtimeErrorToolStage:runtime.toolStage}:{}),error:`${prefix}；${projection.attachmentObservedCount!==null&&projection.attachmentExpectedCount!==null?`已观察到 ${projection.attachmentObservedCount}/${projection.attachmentExpectedCount} 个附件，发送前失败，未发送消息`:'未上传附件或发送消息'}。原始错误：${detail}`});
+    if(runtime&&!readExecutorRuntimeError(dir))writeExecutorRuntimeError(dir,runtime);
     return readWebManifest(manifestFile);
   }catch{return manifest;}
 }
@@ -401,7 +422,7 @@ export async function dispatchChatGptWebJob({codexBin,dir,outputFile,prompt,refe
     error.referenceValidation=referenceValidation;
     throw error;
   }
-  writeJson(manifestFile,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,transport:WEB_IMAGE_TRANSPORT,browser:WEB_IMAGE_BROWSER,focusPolicy:WEB_IMAGE_FOCUS_POLICY,role,executorModel:model||null,executorReasoningEffort:reasoningEffort,sessionName,ownedTabId:null,ownedTabState:'not_created',ownedTabCleanupStatus:'not_attempted',cleanupStatus:'not_attempted',cleanupVerifiedAt:null,cleanupError:null,kernelReset:false,...commonIdentity,state:'queued',accepted:false,submitted:false,referenceCount:0,createdAt});
+  writeJson(manifestFile,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,transport:WEB_IMAGE_TRANSPORT,browser:WEB_IMAGE_BROWSER,focusPolicy:WEB_IMAGE_FOCUS_POLICY,role,executorModel:model||null,executorReasoningEffort:reasoningEffort,sessionName,ownedTabId:null,ownedTabState:'not_created',ownedTabCleanupStatus:'not_attempted',cleanupStatus:'not_attempted',cleanupVerifiedAt:null,cleanupError:null,kernelReset:false,...commonIdentity,state:'queued',accepted:false,submitted:false,referenceCount:0,attachmentExpectedCount:referenceValidation.files.length,attachmentObservedCount:0,attachmentPending:null,sendEnabled:false,failureStage:null,browserStage:'queued',runtimeErrorCategory:null,runtimeErrorMessage:null,runtimeErrorStack:null,runtimeErrorToolStage:null,createdAt});
   writeRemotePrompt(path.join(dir, REMOTE_PROMPT_FILE), remotePrompt);
   writeJson(requestMetadataFile,{...previousRequest,schemaVersion:Number(previousRequest.schemaVersion||2),provider:previousRequest.provider||WEB_IMAGE_PROVIDER,identitySchemaVersion:2,identityLocked:true,...lockedIdentity,expectedOutput:previousRequest.expectedOutput||path.relative(path.resolve(dir,'..','..'),absoluteOutput),remotePromptLength:remotePromptInfo.remotePromptLength,remotePromptSha256:remotePromptInfo.remotePromptSha256});
   writeJson(requestFile,{schemaVersion:2,provider:WEB_IMAGE_PROVIDER,transport:WEB_IMAGE_TRANSPORT,browser:WEB_IMAGE_BROWSER,focusPolicy:WEB_IMAGE_FOCUS_POLICY,role,executorModel:model||null,executorReasoningEffort:reasoningEffort,sessionName,...commonIdentity,expectedOutput:path.relative(path.resolve(dir,'..','..'),absoluteOutput),authorization:{confirmed:true,scope:'one_chatgpt_web_image_submission',confirmedAt:createdAt},instructionFile,remotePromptFile:path.join(dir, REMOTE_PROMPT_FILE),remotePromptLength:remotePromptInfo.remotePromptLength,remotePromptSha256:remotePromptInfo.remotePromptSha256,manifestFile,referenceFiles:referenceValidation.files.map(item=>item.path),referenceEntries:referenceValidation.files.map(({name,sizeBytes,sha256})=>({name,sizeBytes,sha256})),createdAt});
