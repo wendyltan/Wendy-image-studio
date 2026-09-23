@@ -66,11 +66,15 @@ function pendingWebEvidence(p,pending){
   const uploadEvidence=readUploadEvidence(pending.dir);
   return {manifest,uploadEvidence,identityMatches};
 }
-function terminalTaskWebManifest(p,task){
+function terminalTaskWebManifest(p,task,lastFailure){
   if(!task?.id)return null;
   const records=path.join(projectDir(p.id),'.制作记录');
   if(!fs.existsSync(records))return null;
-  for(const name of fs.readdirSync(records).sort().reverse()){
+  const requestedRunId=String(lastFailure?.diagnostics?.runId||'');
+  const names=requestedRunId&&path.basename(requestedRunId)===requestedRunId
+    ? [requestedRunId]
+    : fs.readdirSync(records).sort().reverse().slice(0,8);
+  for(const name of names){
     const dir=path.join(records,name),request=readJson(path.join(dir,'request.json')),worker=readJson(path.join(dir,'worker-request.json')),manifest=readWebManifest(path.join(dir,'web-generation.json'));
     if(!request||!worker||!manifest||request.provider!==WEB_IMAGE_PROVIDER||worker.provider!==WEB_IMAGE_PROVIDER)continue;
     const requestId=String(manifest.requestId||'');
@@ -110,7 +114,7 @@ function publicProject(p){
   const webEvidence=pendingWebEvidence(p,pending),webManifest=webEvidence?.identityMatches?webEvidence.manifest:null,uploadEvidence=webEvidence?.identityMatches?webEvidence.uploadEvidence:null;
   const publicPending=pending?{key:pending.key,at:pending.at,taskId:pending.taskId,provider:pending.provider||null,webState:webManifest?.state||null,requestId:webManifest?.requestId||null,accepted:webManifest?.accepted===true,acceptedAt:webManifest?.acceptedAt||null,readyAt:webManifest?.readyAt||null,submitted:webManifest?.submitted===true,submittedAt:webManifest?.submittedAt||null,downloadedAt:webManifest?.downloadedAt||null,errorCode:webManifest?.errorCode||null,executorExecutionState:webManifest?.executorExecutionState||null,artifactAcceptanceState:webManifest?.artifactAcceptanceState||null,recoveryNotice:webManifest?.recoveryNotice||null,attachmentExpectedCount:Number.isInteger(Number(webManifest?.attachmentExpectedCount))?Number(webManifest.attachmentExpectedCount):uploadEvidence?.attachmentExpected??null,attachmentObservedCount:Number.isInteger(Number(webManifest?.attachmentObservedCount))?Number(webManifest.attachmentObservedCount):uploadEvidence?.attachmentObserved??null,attachmentPending:webManifest?.attachmentPending??uploadEvidence?.attachmentPending??null,sendEnabled:webManifest?.sendEnabled??uploadEvidence?.sendEnabled??null,failureStage:webManifest?.failureStage||null,browserStage:webManifest?.browserStage||null,runtimeErrorCategory:webManifest?.runtimeErrorCategory||null,runtimeErrorMessage:webManifest?.runtimeErrorMessage||null,runtimeErrorToolStage:webManifest?.runtimeErrorToolStage||null,ownedTabId:webManifest?.ownedTabId||null,sessionName:webManifest?.sessionName||null,ownedTabState:webManifest?.ownedTabState||null,cleanupStatus:webManifest?.cleanupStatus||webManifest?.ownedTabCleanupStatus||null,cleanupVerifiedAt:webManifest?.cleanupVerifiedAt||null,cleanupError:webManifest?.cleanupError||null,kernelReset:webManifest?.kernelReset===true}:null;
   const baseTask=publicTask(currentTask),lateTerminal=Boolean(baseTask&&webEvidence?.identityMatches&&currentTask.id===pending?.taskId&&['failed','downloaded'].includes(webManifest?.state));
-  const terminalManifest=!pending?terminalTaskWebManifest(p,currentTask):null;
+  const terminalManifest=!pending?terminalTaskWebManifest(p,currentTask,safe.lastFailure):null;
   const terminalManifestMatchesFailure=Boolean(terminalManifest?.state==='failed'&&terminalManifest.submitted===false&&currentTask?.status==='failed_no_output'&&safe.lastFailure?.key===currentTask.target&&(!safe.lastFailure?.taskId||safe.lastFailure.taskId===currentTask.id));
   const terminalLifecycle=terminalManifest?{ownedTabId:terminalManifest.ownedTabId||null,sessionName:terminalManifest.sessionName||null,ownedTabState:terminalManifest.ownedTabState||null,cleanupStatus:terminalManifest.cleanupStatus||terminalManifest.ownedTabCleanupStatus||null,cleanupVerifiedAt:terminalManifest.cleanupVerifiedAt||null,cleanupError:terminalManifest.cleanupError||null,kernelReset:terminalManifest.kernelReset===true}:{};
   const terminalCode=terminalManifest?.errorCode==='CHATGPT_LOGIN_REQUIRED'?'chatgpt-login-required':terminalManifest?.errorCode==='BROWSER_HANDLE_LOST'?'browser-handle-lost':terminalManifest?.errorCode==='OWNED_TAB_STAGE_WRITE_FAILED'?'owned-tab-stage-write-failed':null;

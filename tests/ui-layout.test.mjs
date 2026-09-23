@@ -138,7 +138,7 @@ test('completed browser lease does not become the current global warning', () =>
   const server = fs.readFileSync(path.join(appRoot, 'server/server.mjs'), 'utf8');
   assert.match(status, /project\.pending\?\.ownedTabState/);
   assert.match(status, /const taskLeaseRelevant = \[/);
-  assert.match(server,/function terminalTaskWebManifest\(p,task\)/);
+  assert.match(server,/function terminalTaskWebManifest\(p,task,lastFailure\)/);
   assert.match(server,/request\.taskId!==task\.id\|\|request\.projectId!==p\.id/);
   assert.match(server,/terminalManifest\.ownedTabState==='closed_verified'\|\|terminalManifest\.cleanupStatus==='closed'/);
 });
