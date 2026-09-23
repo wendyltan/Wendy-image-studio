@@ -21,9 +21,12 @@ export function manifestCommand(stage,{manifestFile,helperFile=DEFAULT_HELPER,ar
 
 function leaseCommand(stage,{manifestFile,runId,requestId,sessionName,ownedTabId,state,status,error,verification,helperFile}={}){
   if(!manifestFile)throw new Error('manifestFile is required');
-  const dir=path.dirname(path.resolve(manifestFile));
   const helper=path.resolve(helperFile||path.resolve(path.dirname(fileURLToPath(import.meta.url)),'owned-tab-lease.mjs'));
-  const args=[stage,'--run-dir',dir,'--lease-file',path.join(dir,OWNED_TAB_LEASE_FILE),'--manifest-file',path.resolve(manifestFile),'--run-id',runId||path.basename(dir),...(requestId?['--request-id',requestId]:[]),...(sessionName?['--session-name',sessionName]:[]),...(ownedTabId?['--owned-tab-id',ownedTabId]:[]),...(state?['--state',state]:[]),...(status?['--status',status]:[]),...(error?['--error',error]:[]),...(verification?['--verification',verification]:[])];
+  // The helper resolves its lease directory from this manifest and obtains
+  // run/request identity from the durable lease itself.  Passing a second
+  // hand-copied absolute lease path was redundant and made the worker's
+  // critical created-stage command unnecessarily fragile.
+  const args=[stage,'--manifest-file',path.resolve(manifestFile),...(runId?['--run-id',runId]:[]),...(requestId?['--request-id',requestId]:[]),...(sessionName?['--session-name',sessionName]:[]),...(ownedTabId?['--owned-tab-id',ownedTabId]:[]),...(state?['--state',state]:[]),...(status?['--status',status]:[]),...(error?['--error',error]:[]),...(verification?['--verification',verification]:[])];
   return `node ${quote(helper)} ${args.map(quote).join(' ')}`;
 }
 
@@ -67,11 +70,12 @@ export function buildManifestCommands(manifestFile,{helperFile=DEFAULT_HELPER,re
     originPermissionDenied:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'BROWSER_ORIGIN_PERMISSION_DENIED',error:'chatgpt.com 站点源访问权限被拒绝'}),
     chromeUnavailable:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'BROWSER_CHROME_UNAVAILABLE',error:'Chrome extension 不可用'}),
     browserHandleLost:browserHandleLostCommand(manifestFile),
+    ownedTabStageWriteFailed:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'OWNED_TAB_STAGE_WRITE_FAILED',error:'本地 owned tab lease 阶段记录命令失败；已停止网页动作'}),
     ownedTabEnsure:leaseCommand('ensure',{manifestFile,runId,requestId,sessionName}),
     ownedTabReserveCreate:leaseCommand('reserve-create',{manifestFile,runId,requestId,sessionName}),
-    ownedTabCreated:(ownedTabId,tabSessionName=sessionName)=>leaseCommand('stage',{manifestFile,runId,requestId,state:'created',ownedTabId,sessionName:tabSessionName}),
-    ownedTabStage:(state,ownedTabId)=>leaseCommand('stage',{manifestFile,runId,requestId,state,ownedTabId}),
-    ownedTabCleanup:(status,ownedTabId,error,verification)=>leaseCommand('cleanup',{manifestFile,runId,requestId,status,ownedTabId,error,verification:verification??(status==='closed'?'exact-owned-tab-close-returned':'')}),
+    ownedTabCreated:(ownedTabId,tabSessionName=sessionName)=>leaseCommand('stage',{manifestFile,state:'created',ownedTabId,sessionName:tabSessionName}),
+    ownedTabStage:(state,ownedTabId)=>leaseCommand('stage',{manifestFile,state,ownedTabId}),
+    ownedTabCleanup:(status,ownedTabId,error,verification)=>leaseCommand('cleanup',{manifestFile,status,ownedTabId,error,verification:verification??(status==='closed'?'exact-owned-tab-close-returned':'')}),
     focusUnavailable:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.preSubmission,errorCode:'BROWSER_FOCUS_UNAVAILABLE',error:'Chrome 专用标签页焦点能力不可用'}),
     confirmedUnsentUploadFailed:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.confirmedUnsent,errorCode:'ATTACHMENT_VERIFICATION_TIMEOUT',error:'已记录发送意图但页面确认未发送'}),
     submissionUncertain:failureCommand(manifestFile,{...SUBMISSION_FAILURE_MATRIX.uncertain,errorCode:'SUBMISSION_UNCERTAIN',error:'点击发送后无法确认是否送达'}),

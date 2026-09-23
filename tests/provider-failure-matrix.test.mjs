@@ -3,10 +3,12 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import {spawnSync} from 'node:child_process';
 import {test} from 'node:test';
 import {chatGptWebImagePrompt,validateFrozenReferenceFiles} from '../server/chatgpt-web-provider.mjs';
 import {patchManifest} from '../server/run-manifest.mjs';
 import {buildManifestCommands} from '../server/web-manifest-commands.mjs';
+import {ensureOwnedTabLease,readOwnedTabLease,reserveOwnedTabCreate} from '../server/owned-tab-lease.mjs';
 
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'wendi-provider-failure-matrix-'));
 function write(file,value){fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(file,JSON.stringify(value,null,2)+'\n');}
@@ -125,6 +127,30 @@ test('executor instructions carry explicit stage flags and only remote_prompt is
   assert.match(instruction,/globalThis\.__wendiOwnedTabId/);
   assert.match(instruction,/owned-tab-cleanup-status/);
   assert.match(instruction,/kernel-reset/);
+  assert.match(instruction,/此类本地命令失败不得报告为 Chrome 扩展故障或句柄丢失/);
+  assert.match(instruction,/OWNED_TAB_STAGE_WRITE_FAILED/);
+});
+
+test('created-stage command derives its lease identity from the manifest and can close from creating',()=>{
+  const run=fixture(),requestId=manifest(run).requestId,runId=path.basename(run.dir);
+  ensureOwnedTabLease({dir:run.dir,runId,requestId,sessionName:'fixture-session'});
+  reserveOwnedTabCreate({dir:run.dir,runId,requestId,sessionName:'fixture-session'});
+  const commands=buildManifestCommands(run.manifestFile,{requestId,sessionName:'fixture-session'});
+  const created=commands.ownedTabCreated('owned-tab-fixture','fixture-session');
+  assert.ok(created.length<400,`created-stage helper command should stay compact (${created.length})`);
+  assert.doesNotMatch(created,/--lease-file|--run-dir|--request-id/);
+  const helper=path.resolve('server/owned-tab-lease.mjs');
+  const result=spawnSync(process.execPath,[helper,'stage','--manifest-file',run.manifestFile,'--state','created','--owned-tab-id','owned-tab-fixture','--session-name','fixture-session'],{encoding:'utf8'});
+  assert.equal(result.status,0,result.stderr);
+  assert.equal(readOwnedTabLease(run.dir,{runId,requestId}).state,'created');
+
+  const unrecorded=fixture(),unrecordedId=manifest(unrecorded).requestId,unrecordedRun=path.basename(unrecorded.dir);
+  ensureOwnedTabLease({dir:unrecorded.dir,runId:unrecordedRun,requestId:unrecordedId});
+  reserveOwnedTabCreate({dir:unrecorded.dir,runId:unrecordedRun,requestId:unrecordedId});
+  const close=spawnSync(process.execPath,[helper,'cleanup','--manifest-file',unrecorded.manifestFile,'--status','closed','--owned-tab-id','observed-tab','--verification','exact-owned-tab-close-returned'],{encoding:'utf8'});
+  assert.equal(close.status,0,close.stderr);
+  assert.equal(readOwnedTabLease(unrecorded.dir,{runId:unrecordedRun,requestId:unrecordedId}).state,'closed_verified');
+  assert.equal(manifest(unrecorded).cleanupStatus,'closed');
 });
 
 test('frozen reference validation rejects missing, unreadable, reordered, or tampered attachments before Chrome',()=>{

@@ -83,6 +83,9 @@ test('page and storyboard cards expose one clear action hierarchy with accessibl
   assert.match(css, /\.tertiary-action:focus-visible/);
   assert.match(css, /\.source-grid>div>\.panel-card-meta\{display:flex;flex-direction:column/);
   assert.match(css, /\.source-grid \.panel-review-row\{display:grid;grid-template-columns:minmax\(0,1fr\) auto/);
+  assert.match(css, /\.page-issue-route\{display:grid;gap:10px;margin:14px 0 16px/);
+  assert.match(css, /\.page-card-actions\{display:grid;grid-template-columns:minmax\(0,1fr\)/);
+  assert.match(css, /@media\(max-width:760px\)\{\.page-issue-route/);
 });
 
 test('pre-submission quota pause explains the zero-upload state and does not retry automatically', () => {
@@ -93,6 +96,16 @@ test('pre-submission quota pause explains the zero-upload state and does not ret
   assert.match(cards, /系统不会自动重试/);
   assert.match(cards, /只有在额度已刷新后确认/);
   assert.match(status, /5\\s\*小时创作额度\.\*旧快照/);
+});
+
+test('login failures tell the user to log in manually and retry only the existing image',()=>{
+  const engine=fs.readFileSync(path.join(appRoot,'server/engine.mjs'),'utf8');
+  const status=fs.readFileSync(path.join(appRoot,'app/studio/workflow-status.tsx'),'utf8');
+  assert.match(engine,/CHATGPT_LOGIN_REQUIRED.{0,70}chatgpt-login-required/);
+  assert.match(status,/请在 Chrome 登录 ChatGPT/);
+  assert.match(status,/附件上传 0、发送 0/);
+  assert.match(status,/不会自动登录、自动重试或创建新请求/);
+  assert.match(status,/webFailureMessages\[String\(task\?\.errorCode \|\| project\.lastFailure\?\.kind/);
 });
 
 test('public panel media URL enables review and page review is a separate action', () => {
@@ -122,8 +135,12 @@ test('local page preflight remains pending manual review until page QA runs', ()
 
 test('completed browser lease does not become the current global warning', () => {
   const status = fs.readFileSync(path.join(appRoot, 'app/studio/workflow-status.tsx'), 'utf8');
+  const server = fs.readFileSync(path.join(appRoot, 'server/server.mjs'), 'utf8');
   assert.match(status, /project\.pending\?\.ownedTabState/);
   assert.match(status, /const taskLeaseRelevant = \[/);
+  assert.match(server,/function terminalTaskWebManifest\(p,task\)/);
+  assert.match(server,/request\.taskId!==task\.id\|\|request\.projectId!==p\.id/);
+  assert.match(server,/terminalManifest\.ownedTabState==='closed_verified'\|\|terminalManifest\.cleanupStatus==='closed'/);
 });
 
 test('formal panel decision keeps its explanation separated from high-contrast actions', () => {

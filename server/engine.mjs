@@ -49,6 +49,9 @@ const CONFIRMED_PRE_SUBMISSION_KINDS=new Set(['no-output','browser-unavailable',
 function browserFailureKindFromCode(value){
   const text=String(value||'').trim();
   if(BROWSER_STAGE_FAILURE_KIND[text])return BROWSER_STAGE_FAILURE_KIND[text];
+  if(text==='CHATGPT_LOGIN_REQUIRED')return 'chatgpt-login-required';
+  if(text==='OWNED_TAB_STAGE_WRITE_FAILED')return 'owned-tab-stage-write-failed';
+  if(text==='BROWSER_HANDLE_LOST')return 'browser-handle-lost';
   if(text==='FILE_UPLOAD_CHROME_UNAVAILABLE')return 'browser-upload-unavailable';
   if(text==='BROWSER_ORIGIN_PERMISSION_DENIED')return 'browser-origin-permission-denied';
   if(text==='BROWSER_CHROME_UNAVAILABLE'||text==='BROWSER_FOCUS_UNAVAILABLE'||text==='BROWSER_TAB_BACKGROUND_UNAVAILABLE')return 'browser-unavailable';
@@ -56,6 +59,8 @@ function browserFailureKindFromCode(value){
 }
 function browserFailureKindFromText(value){
   const text=String(value||'');
+  if(/CHATGPT_LOGIN_REQUIRED|请在.{0,8}Chrome.{0,10}登录.{0,12}ChatGPT|ChatGPT 登录状态不可用/i.test(text))return 'chatgpt-login-required';
+  if(/OWNED_TAB_STAGE_WRITE_FAILED/.test(text))return 'owned-tab-stage-write-failed';
   for(const [code,kind] of Object.entries(BROWSER_STAGE_FAILURE_KIND))if(text.includes(code))return kind;
   if(FILE_UPLOAD_CHROME_UNAVAILABLE.test(text))return 'browser-upload-unavailable';
   if(BROWSER_ORIGIN_PERMISSION_DENIED.test(text))return 'browser-origin-permission-denied';
@@ -359,7 +364,7 @@ function definiteImageFailure(pending,extra=''){
   if(manifest?.submitted)return null;
   if(manifest?.state==='failed'){
     const kind=manifestBrowserFailureKind(manifest)||'no-output';
-    return {kind,definiteNoOutput:true,key:pending.key,attempts:0,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString(),...(manifest.error?{message:manifest.error}: {})};
+    return {kind,definiteNoOutput:true,key:pending.key,attempts:0,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString(),...(manifest.error?{message:manifest.error}: {}),ownedTabState:manifest.ownedTabState||null,cleanupStatus:manifest.cleanupStatus||manifest.ownedTabCleanupStatus||null,cleanupVerifiedAt:manifest.cleanupVerifiedAt||null};
   }
   if(NETWORK_FAILURE.test(combined)||classified.connectionRelated)return null;
   const manifestError=[manifest?.errorCode,manifest?.error].filter(Boolean).join(' ');
@@ -377,7 +382,8 @@ function failureMessage(failure){
   const action=String(failure.key||'').includes('样张')?'重试当前样张':'重试当前图片';
   const stageMessages={
     'browser-create-unavailable':'Chrome 专用标签页创建能力不可用；本次未上传附件或发送消息。',
-    'browser-handle-lost':'Chrome 专用标签页句柄在提交前丢失，关闭状态未确认；本次未上传附件或发送消息。',
+    'browser-handle-lost':`专用标签页创建后，执行流程未能继续；本次附件上传 0、发送 0。${failure.cleanupStatus==='closed'||failure.ownedTabState==='closed_verified'?'已确认关闭本次专用标签页。':'专用标签页关闭状态尚未确认。'}`,
+    'owned-tab-stage-write-failed':`专用标签页已创建，但本地阶段记录失败，网页操作已停止；本次附件上传 0、发送 0。${failure.cleanupStatus==='closed'||failure.ownedTabState==='closed_verified'?'已确认关闭本次专用标签页。':'专用标签页关闭状态尚未确认。'}`,
     'browser-mode-entry-unavailable':'ChatGPT 聊天或创建图片入口不可用；本次未上传附件或发送消息。',
     'file-chooser-event-timeout':'附件入口已定位，但 filechooser 事件未在有界时间内出现；本次未上传附件或发送消息。',
     'file-chooser-route-unavailable':'附件按钮及同一标签页菜单 fallback 均不可用；本次未上传附件或发送消息。',
@@ -387,6 +393,7 @@ function failureMessage(failure){
     'reference-files-invalid':'服务端冻结附件台账无效；本次未打开浏览器、上传附件或发送消息。',
   };
   if(stageMessages[failure.kind])return `${stageMessages[failure.kind]}${usage}上一版原图仍保留；修复对应阶段后点击“${action}”，只会重试这一张。`;
+  if(failure.kind==='chatgpt-login-required')return `请先在 Chrome 登录 ChatGPT，再点击“${action}”只重试这一张。本次附件上传 0、发送 0；系统不会自动登录、自动重试或创建新的请求，上一版原图仍保留。`;
   if(failure.kind==='browser-upload-unavailable')return `专用 Chrome 标签页的附件入口未能打开浏览器文件选择器；本次未上传附件或发送消息，${usage}上一版原图仍保留。修复浏览器附件入口后点击“${action}”，只会重试这一张。`;
   if(failure.kind==='browser-origin-permission-denied')return `Chrome 已连接，但 chatgpt.com 访问权限被拒绝；下次重试出现浏览器访问询问时请选择“允许”。本次未上传附件或发送消息，${usage}当前节点已经保存；处理权限后点击“${action}”，只会重试这一张。`;
   if(failure.kind==='browser-unavailable'){const historical=IAB_UNAVAILABLE.test(String(failure.message||''));return `${historical?'历史 Codex 内嵌浏览器 IAB':'专用 Chrome 标签页的公开焦点恢复能力'}暂不可用，本次未提交图片请求。${usage}当前节点已经保存；${historical?'当前生产链路不会退回 IAB，请确认 Chrome Computer Use 与焦点安全能力':'当前公开 CUA 无法保证零焦点切换，请等待支持焦点恢复的能力'}后点击“${action}”，只会重试这一张。`;}

@@ -66,6 +66,24 @@ function pendingWebEvidence(p,pending){
   const uploadEvidence=readUploadEvidence(pending.dir);
   return {manifest,uploadEvidence,identityMatches};
 }
+function terminalTaskWebManifest(p,task){
+  if(!task?.id)return null;
+  const records=path.join(projectDir(p.id),'.制作记录');
+  if(!fs.existsSync(records))return null;
+  for(const name of fs.readdirSync(records).sort().reverse()){
+    const dir=path.join(records,name),request=readJson(path.join(dir,'request.json')),worker=readJson(path.join(dir,'worker-request.json')),manifest=readWebManifest(path.join(dir,'web-generation.json'));
+    if(!request||!worker||!manifest||request.provider!==WEB_IMAGE_PROVIDER||worker.provider!==WEB_IMAGE_PROVIDER)continue;
+    const requestId=String(manifest.requestId||'');
+    if(!requestId||request.requestId!==requestId||worker.requestId!==requestId)continue;
+    if(request.taskId!==task.id||request.projectId!==p.id||Number(request.projectVersion)!==Number(task.projectVersion??p.version)||request.target!==task.target)continue;
+    if(worker.projectId!==p.id||worker.taskId!==task.id||Number(worker.projectVersion)!==Number(task.projectVersion??p.version)||worker.target!==task.target)continue;
+    if(request.runId!==path.basename(dir)||worker.runId!==path.basename(dir)||manifest.runId!==path.basename(dir))continue;
+    if(path.resolve(String(request.outputFile||''))!==path.resolve(String(worker.outputFile||''))||path.resolve(String(worker.manifestFile||''))!==path.join(dir,'web-generation.json'))continue;
+    if(manifest.projectId!==p.id||manifest.taskId!==task.id||Number(manifest.projectVersion)!==Number(task.projectVersion??p.version)||manifest.target!==task.target)continue;
+    return manifest;
+  }
+  return null;
+}
 function file(res,file,download=false){
   if(!fs.existsSync(file)||!fs.statSync(file).isFile())return send(res,{error:'文件不存在'},404);
   const headers={'Content-Type':mime[path.extname(file).toLowerCase()]||'application/octet-stream','Content-Length':fs.statSync(file).size,'Cache-Control':'no-cache'};
@@ -92,8 +110,14 @@ function publicProject(p){
   const webEvidence=pendingWebEvidence(p,pending),webManifest=webEvidence?.identityMatches?webEvidence.manifest:null,uploadEvidence=webEvidence?.identityMatches?webEvidence.uploadEvidence:null;
   const publicPending=pending?{key:pending.key,at:pending.at,taskId:pending.taskId,provider:pending.provider||null,webState:webManifest?.state||null,requestId:webManifest?.requestId||null,accepted:webManifest?.accepted===true,acceptedAt:webManifest?.acceptedAt||null,readyAt:webManifest?.readyAt||null,submitted:webManifest?.submitted===true,submittedAt:webManifest?.submittedAt||null,downloadedAt:webManifest?.downloadedAt||null,errorCode:webManifest?.errorCode||null,executorExecutionState:webManifest?.executorExecutionState||null,artifactAcceptanceState:webManifest?.artifactAcceptanceState||null,recoveryNotice:webManifest?.recoveryNotice||null,attachmentExpectedCount:Number.isInteger(Number(webManifest?.attachmentExpectedCount))?Number(webManifest.attachmentExpectedCount):uploadEvidence?.attachmentExpected??null,attachmentObservedCount:Number.isInteger(Number(webManifest?.attachmentObservedCount))?Number(webManifest.attachmentObservedCount):uploadEvidence?.attachmentObserved??null,attachmentPending:webManifest?.attachmentPending??uploadEvidence?.attachmentPending??null,sendEnabled:webManifest?.sendEnabled??uploadEvidence?.sendEnabled??null,failureStage:webManifest?.failureStage||null,browserStage:webManifest?.browserStage||null,runtimeErrorCategory:webManifest?.runtimeErrorCategory||null,runtimeErrorMessage:webManifest?.runtimeErrorMessage||null,runtimeErrorToolStage:webManifest?.runtimeErrorToolStage||null,ownedTabId:webManifest?.ownedTabId||null,sessionName:webManifest?.sessionName||null,ownedTabState:webManifest?.ownedTabState||null,cleanupStatus:webManifest?.cleanupStatus||webManifest?.ownedTabCleanupStatus||null,cleanupVerifiedAt:webManifest?.cleanupVerifiedAt||null,cleanupError:webManifest?.cleanupError||null,kernelReset:webManifest?.kernelReset===true}:null;
   const baseTask=publicTask(currentTask),lateTerminal=Boolean(baseTask&&webEvidence?.identityMatches&&currentTask.id===pending?.taskId&&['failed','downloaded'].includes(webManifest?.state));
-  const effectiveTask=lateTerminal?{...baseTask,status:webManifest.state==='failed'?'failed':'artifact_saved',errorCode:webManifest.errorCode||baseTask.errorCode,webState:webManifest.state}:baseTask;
-  return {...safe,pending:publicPending,currentTask:effectiveTask,imageRetry:retryState?{certainty:retryState.certainty,target:retryState.target}:null,history:history.map(h=>({version:h.version,title:h.plan.title,at:h.approved?.at,plan:h.plan,pages:(h.pages||[]).map(q=>publicImage(q,`page:${q.number}`))})),
+  const terminalManifest=!pending?terminalTaskWebManifest(p,currentTask):null;
+  const terminalManifestMatchesFailure=Boolean(terminalManifest?.state==='failed'&&terminalManifest.submitted===false&&currentTask?.status==='failed_no_output'&&safe.lastFailure?.key===currentTask.target&&(!safe.lastFailure?.taskId||safe.lastFailure.taskId===currentTask.id));
+  const terminalLifecycle=terminalManifest?{ownedTabId:terminalManifest.ownedTabId||null,sessionName:terminalManifest.sessionName||null,ownedTabState:terminalManifest.ownedTabState||null,cleanupStatus:terminalManifest.cleanupStatus||terminalManifest.ownedTabCleanupStatus||null,cleanupVerifiedAt:terminalManifest.cleanupVerifiedAt||null,cleanupError:terminalManifest.cleanupError||null,kernelReset:terminalManifest.kernelReset===true}:{};
+  const terminalCode=terminalManifest?.errorCode==='CHATGPT_LOGIN_REQUIRED'?'chatgpt-login-required':terminalManifest?.errorCode==='BROWSER_HANDLE_LOST'?'browser-handle-lost':terminalManifest?.errorCode==='OWNED_TAB_STAGE_WRITE_FAILED'?'owned-tab-stage-write-failed':null;
+  const effectiveTask=lateTerminal?{...baseTask,status:webManifest.state==='failed'?'failed':'artifact_saved',errorCode:webManifest.errorCode||baseTask.errorCode,webState:webManifest.state}:baseTask&&terminalManifest?{...baseTask,...terminalLifecycle,...(terminalCode?{errorCode:terminalCode}:{}),webState:terminalManifest.state}:baseTask;
+  const terminalFailureText=terminalManifestMatchesFailure&&terminalCode==='chatgpt-login-required'?'请在 Chrome 登录 ChatGPT。登录后可手动只重试这一张；本次附件上传 0、发送 0。系统不会自动登录、自动重试或创建新请求，上一版原图仍保留。':terminalManifestMatchesFailure&&['browser-handle-lost','owned-tab-stage-write-failed'].includes(terminalCode)?`专用标签页创建后，本地执行流程未能继续；本次附件上传 0、发送 0。${terminalManifest.ownedTabState==='closed_verified'||terminalManifest.cleanupStatus==='closed'?'本次专用标签页已确认关闭。':'专用标签页关闭状态尚未确认。'}`:null;
+  const effectiveLastFailure=terminalManifestMatchesFailure?{...safe.lastFailure,...terminalLifecycle,...(terminalFailureText?{message:terminalFailureText}:{})}:safe.lastFailure;
+  return {...safe,...(terminalManifestMatchesFailure?{message:terminalFailureText||safe.message,error:terminalFailureText||safe.error,lastFailure:effectiveLastFailure}:{}),pending:publicPending,currentTask:effectiveTask,imageRetry:retryState?{certainty:retryState.certainty,target:retryState.target}:null,history:history.map(h=>({version:h.version,title:h.plan.title,at:h.approved?.at,plan:h.plan,pages:(h.pages||[]).map(q=>publicImage(q,`page:${q.number}`))})),
     planHash:p.plan?digest(p.plan):null,busy:active.has(p.id),
     samples:samples.map((sample,index)=>publicImage(sample,`image:样张-${index+1}`)),
     panels:Object.fromEntries(Object.entries(panels).map(([key,panel])=>[key,publicImage(panel,`image:第${key.split('-')[0]}页-第${key.split('-')[1]}格`)])),

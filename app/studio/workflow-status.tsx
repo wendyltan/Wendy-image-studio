@@ -174,10 +174,22 @@ export function WorkflowStatus({
       '专用 Chrome 标签页的附件入口未能打开浏览器文件选择器；本次未上传附件或发送消息，上一版原图仍保留。修复附件入口后只重试这一张。',
     BROWSER_ORIGIN_PERMISSION_DENIED:
       'Chrome 已连接，但 chatgpt.com 访问权限被拒绝；下次重试出现浏览器访问询问时请选择“允许”。本次没有上传附件或发送消息，当前请求已失败，记录仍保留。',
+    CHATGPT_LOGIN_REQUIRED:
+      '请在 Chrome 登录 ChatGPT。登录后点击“重试当前图片”只重试这一张；本次附件上传 0、发送 0。系统不会自动登录、自动重试或创建新请求，上一版原图仍保留。',
+    'chatgpt-login-required':
+      '请在 Chrome 登录 ChatGPT。登录后点击“重试当前图片”只重试这一张；本次附件上传 0、发送 0。系统不会自动登录、自动重试或创建新请求，上一版原图仍保留。',
+    'browser-handle-lost':
+      task?.cleanupStatus === 'closed' || task?.ownedTabState === 'closed_verified'
+        ? '专用标签页创建后，执行流程未能继续；附件上传 0、发送 0。本次专用标签页已确认关闭。修复本地执行步骤后，可手动只重试这一张。'
+        : '专用标签页创建后，执行流程未能继续；附件上传 0、发送 0，关闭状态尚未确认。系统不会自动重试。',
+    'owned-tab-stage-write-failed':
+      task?.cleanupStatus === 'closed' || task?.ownedTabState === 'closed_verified'
+        ? '专用标签页已创建，但本地阶段记录失败，网页操作已停止；附件上传 0、发送 0。本次专用标签页已确认关闭。'
+        : '专用标签页已创建，但本地阶段记录失败，网页操作已停止；附件上传 0、发送 0，关闭状态尚未确认。',
     BROWSER_BACKGROUND_UNAVAILABLE:
       '这是旧请求记录中的后台浏览器能力失败；没有上传附件或发送消息。当前生产链路不会使用隐藏 IAB，请确认 Chrome 焦点管理能力后再重试。',
   };
-  const webFailureCode = String(project.pending?.errorCode || '');
+  const webFailureCode = String(project.pending?.errorCode || task?.errorCode || project.lastFailure?.kind || '');
   const attachmentExpected =
     project.pending?.attachmentExpectedCount ??
     task?.attachmentExpectedCount ??
@@ -235,6 +247,7 @@ export function WorkflowStatus({
   const statusMessage =
     (quotaSnapshotStop ? project.message || '额度快照过旧，本次没有上传附件或发送请求，原图未变化；不会自动重试。' : '') ||
     webFailureText ||
+    webFailureMessages[String(task?.errorCode || project.lastFailure?.kind || '')] ||
     (ownedTabState === 'uploading' || ownedTabState === 'uploaded'
       ? `${ownedTabText}；尚未发送消息`
       : ownedTabText && ['close_unconfirmed', 'orphaned'].includes(ownedTabState)

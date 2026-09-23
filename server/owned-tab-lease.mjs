@@ -359,8 +359,11 @@ export function markOwnedTabCleanup({dir, runId, requestId, status, ownedTabId, 
     if (cleanupStatus === 'close_failed' && !text(ownedTabId) && !lease.ownedTabId) {
       throw Object.assign(new Error('close_failed 必须携带实际 ownedTabId。'), {code: 'OWNED_TAB_ID_MISSING'});
     }
-    if ((closed || cleanupStatus === 'close_failed') && ['not_created', 'creating'].includes(lease.state)) {
+    if ((closed || cleanupStatus === 'close_failed') && lease.state === 'not_created') {
       throw Object.assign(new Error(`owned tab 尚未创建，不能记录 ${cleanupStatus}。`), {code: 'OWNED_TAB_NOT_CREATED'});
+    }
+    if ((closed || cleanupStatus === 'close_failed') && lease.state === 'creating' && !text(ownedTabId)) {
+      throw Object.assign(new Error(`creating 阶段只有在提供实际 ownedTabId 后才能记录 ${cleanupStatus}。`), {code: 'OWNED_TAB_ID_MISSING'});
     }
     const next = {
       ownedTabId: text(ownedTabId) || lease.ownedTabId,
@@ -484,15 +487,21 @@ function parseArgs(argv) {
 
 function cli() {
   const args = parseArgs(process.argv.slice(2));
-  const dir = path.dirname(path.resolve(args.leaseFile || path.join(args.runDir || '', OWNED_TAB_LEASE_FILE)));
-  const common = {dir, runId: args.runId || path.basename(dir), requestId: args.requestId};
+  const manifestFile = args.manifestFile ? path.resolve(args.manifestFile) : null;
+  const dir = args.leaseFile
+    ? path.dirname(path.resolve(args.leaseFile))
+    : args.runDir
+      ? path.resolve(args.runDir)
+      : path.dirname(path.resolve(manifestFile || ''));
+  const current = readLeaseFile(leaseFileFor(dir));
+  const common = {dir, runId: args.runId || current?.runId || path.basename(dir), requestId: args.requestId || current?.requestId};
   let lease;
   if (args.stage === 'ensure') lease = ensureOwnedTabLease({...common, sessionName: args.sessionName});
   else if (args.stage === 'reserve-create') lease = reserveOwnedTabCreate({...common, sessionName: args.sessionName});
   else if (args.stage === 'stage') lease = markOwnedTabStage({...common, state: args.state, ownedTabId: args.ownedTabId, sessionName: args.sessionName, createdAt: args.createdAt});
   else if (args.stage === 'cleanup') lease = markOwnedTabCleanup({...common, status: args.status, ownedTabId: args.ownedTabId, error: args.error, kernelReset: args.kernelReset === 'true', verification: args.verification});
   else throw new Error(`不支持的 owned tab lease 阶段：${args.stage}`);
-  const manifest = args.manifestFile ? syncOwnedTabLeaseToManifest({dir, manifestFile: args.manifestFile, lease}) : null;
+  const manifest = manifestFile ? syncOwnedTabLeaseToManifest({dir, manifestFile, lease}) : null;
   process.stdout.write(JSON.stringify({ok: true, lease, manifest}) + '\n');
 }
 
