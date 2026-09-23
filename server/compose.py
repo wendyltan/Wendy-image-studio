@@ -8,7 +8,7 @@ BG='#f7f1e7'; INK='#4f4037'; BORDER='#8f7664'
 def font(size): return ImageFont.truetype(FONT,size)
 def medium(size): return ImageFont.truetype(FONT_MEDIUM,size)
 def wrap(text,width,size=24):
-    f=font(size); lines=[]
+    f=font(size); lines=[];closing_punctuation=set('，。！？；：、）】》」』”’…％')
     token_pattern=re.compile(r"[A-Za-z0-9]+(?:['’\-][A-Za-z0-9]+)*")
     for paragraph in text.split('\n'):
         line='';units=[];position=0
@@ -16,7 +16,7 @@ def wrap(text,width,size=24):
             units.extend(paragraph[position:match.start()]);units.append(match.group());position=match.end()
         units.extend(paragraph[position:])
         for unit in units:
-            if line and f.getlength(line+unit)>width:
+            if line and f.getlength(line+unit)>width and unit not in closing_punctuation:
                 lines.append(line);line=''
             if f.getlength(unit)>width:
                 for char in unit:

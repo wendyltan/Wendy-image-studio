@@ -30,6 +30,7 @@ export type Picture = {
   url: string;
   nextStep?: string;
   layoutHints?: { style?: string; captionAnchors?: string[] };
+  layoutVerification?: { manualConfirmationRequired?: boolean };
   qa: {
     pass: boolean | null;
     status?: string;
@@ -39,6 +40,8 @@ export type Picture = {
     repairPrompt?: string;
     issueDetails?: {
       id?: string;
+      category?: string;
+      location?: string;
       description?: string;
       severity?: string;
       repairAction?: string;
@@ -71,6 +74,10 @@ export type Task = {
   providerInvocationLimit?: number;
   providerInvocations?: number;
   errorCode?: string;
+  error?: string;
+  accepted?: boolean;
+  submitted?: boolean;
+  referenceCount?: number;
   webState?: string | null;
   webTimings?: Record<string, string | number | boolean | null> | null;
   executorExecutionState?: string | null;

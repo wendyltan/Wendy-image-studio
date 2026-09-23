@@ -18,6 +18,7 @@ export function ProjectPictures({
   action,
   setZoom,
   setEdit,
+  setEditNote,
   analyze,
   checks,
   setChecks,
@@ -28,11 +29,31 @@ export function ProjectPictures({
   action: ProjectAction;
   setZoom: (value: { url: string; title: string } | null) => void;
   setEdit: (value: { key: string; title: string } | null) => void;
+  setEditNote: (value: string) => void;
   analyze: (kind: 'page' | 'panel' | 'sample', key: string | number) => void;
   checks: string[];
   setChecks: (value: string[]) => void;
   allChecks: string[];
 }) {
+  const panelForPageIssue = (pageNumber: number, issue: NonNullable<Picture['qa']['issueDetails']>[number]) => {
+    if (issue.repairAction !== 'regenerate' || !['blocking', 'review'].includes(issue.severity || '')) return null;
+    const location = String(issue.location || '');
+    const explicitPage = location.match(/第\s*(\d+)\s*页/);
+    if (explicitPage && Number(explicitPage[1]) !== pageNumber) return null;
+    const arabic = location.match(/第\s*(\d+)\s*格/);
+    const chinese = location.match(/第?([一二三四五六七八九十两]+)格/);
+    const ordinalValue = (word: string) => {
+      const digits: Record<string, number> = {一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9};
+      if (word === '十') return 10;
+      if (word.startsWith('十')) return 10 + (digits[word[1]] || 0);
+      if (word.endsWith('十')) return (digits[word[0]] || 0) * 10;
+      return digits[word] || null;
+    };
+    const panelNumber = arabic ? Number(arabic[1]) : chinese ? ordinalValue(chinese[1]) : null;
+    if (!panelNumber) return null;
+    const panelCount = project.plan.pages.find((entry) => entry.number === pageNumber)?.panels.length || 0;
+    return panelNumber > 0 && panelNumber <= panelCount ? `${pageNumber}-${panelNumber}` : null;
+  };
   const qaAction = (qa: { pass: boolean | null; status?: string; manualReviewRequired?: boolean }, page: boolean) => {
     const initial =
       (page && (qa.manualReviewRequired === true || qa.status === 'local_deterministic_preflight')) ||
@@ -92,6 +113,24 @@ export function ProjectPictures({
                   />
                 </h3>
                 <p>{page.qa.summary}</p>
+                {page.layoutVerification?.manualConfirmationRequired && <p className="muted">已重排，待人工确认遮挡是否解决。自动校对结果和前后问题记录已保留。</p>}
+                {page.qa.issueDetails?.filter((issue) => ['blocking', 'review'].includes(issue.severity || '')).map((issue, index) => {
+                  const panelKey = panelForPageIssue(page.number, issue);
+                  if (!panelKey || issue.repairAction !== 'regenerate') return null;
+                  const description = String(issue.description || '');
+                  return (
+                    <div className="page-issue-route" key={issue.id || `${panelKey}-${index}`}>
+                      <p>成稿问题：{description}</p>
+                      <button className="secondary" disabled={disabled} onClick={() => {
+                        const [pageNumber, panelNumber] = panelKey.split('-');
+                        setEditNote(`成稿校对指出：${description}\n\n请只修复第 ${pageNumber} 页第 ${panelNumber} 格这一项问题，保留该格其余人物、场景、动作、构图和风格，不改动其他分镜。`);
+                        setEdit({key: panelKey, title: `修改分镜 ${panelKey}`});
+                      }}>
+                        按成稿问题修改这一格
+                      </button>
+                    </div>
+                  );
+                })}
                 <div className="inline-actions">
                   {project.accepted && (
                     <a href={page.url + '?download=1'}>
@@ -140,7 +179,8 @@ export function ProjectPictures({
       ) : null}
       {Object.keys(project.panels).length > 0 && (
         <details className="source-panels" open={!project.pages.length}>
-          <summary>查看原始分镜 · 局部修改</summary>
+          <summary>查看原始分镜 · 单格画面校对与局部修改</summary>
+          <p className="muted">分镜校对只检查这一张原图的人物、动作和画面内容；成稿校对检查排版后的文字遮挡、页码与跨格连续性。成稿指出某一格的问题时，可直接从上方问题卡进入该格修改，并在提交前确认。</p>
           <MeasuredMasonryGrid className="source-grid">
             {Object.entries(project.panels).map(([key, panel]) => (
               <div key={key}>

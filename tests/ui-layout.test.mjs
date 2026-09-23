@@ -64,11 +64,27 @@ test('page and storyboard cards expose one clear action hierarchy with accessibl
   assert.match(pictures, /className="secondary page-layout-button"[\s\S]*?重排本页/);
   assert.match(pictures, /\{!project\.accepted && \([\s\S]*?repair-page-layout/);
   assert.match(pictures, /className="panel-card-heading"[\s\S]*?<QaBadge qa=\{panel\.qa\} \/>[\s\S]*?className="panel-review-row"[\s\S]*?className="primary"[\s\S]*?action\('review-image', \{key\}\)/);
+  assert.match(pictures, /issue\.repairAction !== 'regenerate'/);
+  assert.match(pictures, /一二三四五六七八九十两/);
+  assert.match(pictures, /setEditNote\(`成稿校对指出/);
+  assert.match(pictures, /按成稿问题修改这一格/);
+  assert.match(pictures, /分镜校对只检查这一张原图/);
+  assert.match(pictures, /已重排，待人工确认遮挡是否解决/);
   assert.match(pictures, /className="tertiary-action"[\s\S]*?提炼为素材/);
   assert.match(css, /\.inline-actions \.primary,[\s\S]*?min-height:42px/);
   assert.match(css, /\.tertiary-action:focus-visible/);
   assert.match(css, /\.source-grid>div>\.panel-card-meta\{display:flex;flex-direction:column/);
   assert.match(css, /\.source-grid \.panel-review-row\{display:grid;grid-template-columns:minmax\(0,1fr\) auto/);
+});
+
+test('pre-submission quota pause explains the zero-upload state and does not retry automatically', () => {
+  const cards = fs.readFileSync(path.join(appRoot, 'app/studio/recovery-cards.tsx'), 'utf8');
+  const status = fs.readFileSync(path.join(appRoot, 'app/studio/workflow-status.tsx'), 'utf8');
+  assert.match(cards, /quotaSnapshotStop/);
+  assert.match(cards, /附件上传 0、发送 0，原图未变化/);
+  assert.match(cards, /系统不会自动重试/);
+  assert.match(cards, /只有在额度已刷新后确认/);
+  assert.match(status, /5\\s\*小时创作额度\.\*旧快照/);
 });
 
 test('public panel media URL enables review and page review is a separate action', () => {

@@ -43,6 +43,16 @@ test('deferred file checks are not visual QA passes',()=>{
   const fixture=panelDecisionFixture('区分延迟文件检查与真实质检');fixture.project.panels['1-1'].qa={pass:true,status:'deferred',summary:'仅文件检查',issues:[],repairPrompt:''};E.saveProject(fixture.project);
   const restored=E.readProject(fixture.project.id);assert.equal(restored.panels['1-1'].qa.pass,null);assert.equal(restored.panels['1-1'].qa.status,'deferred');assert.equal(restored.panels['1-1'].qa.summary,'仅文件检查');
 });
+test('re-reviewing a storyboard panel never removes or invalidates its existing page artifact',async()=>{
+  const fixture=panelDecisionFixture('分镜校对只读保留成稿'),project=fixture.project,artifactId=fixture.artifactId;
+  project.panels['1-1'].qa={pass:null,status:'unavailable',summary:'等待单格校对',issues:[],issueDetails:[],repairPrompt:''};
+  project.pages=[{number:1,file:fixture.relative,qa:{pass:true,status:'qa_pass',summary:'成稿已校对',issues:[],issueDetails:[]},at:fixture.at,projectVersion:1,dependsOn:[artifactId]}];
+  project.artifacts.push({id:'page:1',kind:'page',file:fixture.relative,dependsOn:[artifactId],valid:true,at:fixture.at});project.panelDecision=null;project.status='paused';E.saveProject(project);
+  const marker=path.join(temp,'single-panel-review-finds-issue'),priorCalls=callCount();process.env.WENDI_TEST_FAIL_PANEL_QA_ONCE=marker;
+  E.reviewImage(project,'1-1');const reviewed=await done(project.id);delete process.env.WENDI_TEST_FAIL_PANEL_QA_ONCE;
+  assert.equal(reviewed.panels['1-1'].qa.pass,false);assert.equal(reviewed.pages.length,1);assert.equal(reviewed.pages[0].file,fixture.relative);
+  assert.equal(reviewed.artifacts.find(item=>item.id==='page:1').valid,true);assert.equal(callCount(),priorCalls+1);
+});
 test('manual panel rejection is local, identity-checked, and idempotent',()=>{
   const fixture=panelDecisionFixture('人工打回不触发生图');const project=fixture.project,artifactId=fixture.artifactId,oldPage={number:1,file:fixture.relative,qa:{pass:true,status:'qa_pass',issues:[],issueDetails:[],repairPrompt:''},at:fixture.at,dependsOn:[artifactId]};project.panels['1-1'].qa={pass:true,status:'deferred',summary:'仅文件检查',issues:[],repairPrompt:''};project.pages=[oldPage];project.artifacts.push({id:'page:1',kind:'page',file:fixture.relative,dependsOn:[artifactId],valid:true,at:fixture.at},{id:'story:audit',kind:'story-audit',file:null,dependsOn:['page:1'],valid:true,at:fixture.at},{id:'export:bundle',kind:'export',file:'v1/温蒂漫画成品.zip',dependsOn:['story:audit'],valid:true,at:fixture.at});project.status='paused';E.saveProject(project);
   const expectedRevision=project.revision,issue='意式机萃取头、手柄与出液口/液流位置关系不正确',repairPrompt='只修正萃取头、portafilter 手柄卡口、双出液嘴与液流起点的功能连接，其他内容保持不变。',body={panelKey:'1-1',expectedRevision,artifactId,contentHash:W.digest({artifactId,file:fixture.relative,at:fixture.at}),issue,repairPrompt,idempotencyKey:`manual:${project.id}:1-1`},beforeBytes=fs.readFileSync(fixture.file),beforeCalls=callCount();

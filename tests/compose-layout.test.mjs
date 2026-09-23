@@ -67,6 +67,9 @@ test('caption wrapping keeps Latin words together and bounds overlong tokens',()
   assert.deepEqual(run('routine',100),['routine']);
   const mixed=run('固定的 routine，对我这个 i 人来说',120);
   assert(mixed.some(line=>line.includes('routine')));
+  const caption='但趁一袋，把坚果，像松鼠一样嘎嘎嘎地。也能快乐小会儿。',narrow=run(caption,215);
+  assert.equal(narrow.join(''),caption);
+  assert(narrow.every(line=>! /^[，。！？；：、）】》」』”’…]/.test(line)));
   const long=run('中文 extraordinarilylongwordwithoutbreaks 和 abc-def',140);
   assert(long.some(line=>line.includes('abc-def')));
   const measured=execFileSync(B.python(),['-c','from PIL import ImageFont; import sys; f=ImageFont.truetype("/System/Library/Fonts/STHeiti Light.ttc",24); print(max((f.getlength(x) for x in sys.stdin.read().splitlines()),default=0))'],{input:long.join('\n'),encoding:'utf8'});

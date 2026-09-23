@@ -257,6 +257,7 @@ export function ProjectView({
           action={action}
           setZoom={setZoom}
           setEdit={setEdit}
+          setEditNote={setEditNote}
           analyze={analyze}
           checks={checks}
           setChecks={setChecks}

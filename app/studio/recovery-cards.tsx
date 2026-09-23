@@ -51,18 +51,28 @@ export function NoOutputCard({
     project.currentTask?.attachmentPending === false &&
     project.currentTask?.sendEnabled === true &&
     project.currentTask?.status === 'failed_no_output';
+  const quotaSnapshotStop =
+    project.currentTask?.errorCode === 'USAGE_LIMIT_BEFORE_START' ||
+    (project.currentTask?.accepted === true &&
+      project.currentTask?.submitted === false &&
+      project.currentTask?.referenceCount === 0 &&
+      /5\s*小时创作额度.*旧快照|额度快照/.test(project.message || ''));
   return (
     <div className="recovery-card">
       <div>
         <h3>
-          {postUploadPreSubmit
+          {quotaSnapshotStop
+            ? '额度检查未完成，原分镜仍保留'
+            : postUploadPreSubmit
             ? '附件已核实，但发送前失败，上一版原图仍保留'
             : uploadUnavailable
             ? '附件上传未完成，上一版原图仍保留'
             : '本次没有取得图片，可重试这一张'}
         </h3>
         <p>
-          {postUploadPreSubmit
+          {quotaSnapshotStop
+            ? `${target} 本次修改停在额度检查：5 小时额度只返回旧快照，附件上传 0、发送 0，原图未变化。系统不会自动重试；先确认额度已刷新，再由你决定是否发起新的单格修改。`
+            : postUploadPreSubmit
             ? `${target} 已观察到 ${attachmentObserved}/${attachmentExpected} 个附件，发送前失败，未发送消息，也未生成新图。系统不会自行重发；修复发送阶段后可只重试这一张。`
             : uploadUnavailable
             ? `${target} 的附件入口没有打开浏览器文件选择器；本次未上传附件、未发送消息，也未生成新图。系统不会自行重试，修复附件入口后可只重试这一张。`
@@ -76,7 +86,9 @@ export function NoOutputCard({
           onClick={() => {
             if (
               confirm(
-                '确认重新生成这一张吗？这会发起一次新的生图，并消耗创作额度。',
+                quotaSnapshotStop
+                  ? '本次没有上传附件或发送图片请求，原图仍保留。只有在额度已刷新后确认，才会发起一条新的单格修改请求。继续吗？'
+                  : '确认重新生成这一张吗？这会发起一次新的生图，并消耗创作额度。',
               )
             )
               action('retry-missing', {
@@ -86,7 +98,7 @@ export function NoOutputCard({
           }}
         >
           <RotateCcw />
-          重新生成这一张
+          {quotaSnapshotStop ? '额度刷新后再决定是否修改' : '重新生成这一张'}
         </button>
       </div>
     </div>

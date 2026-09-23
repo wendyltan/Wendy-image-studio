@@ -226,7 +226,14 @@ export function WorkflowStatus({
   const recoveredExecutorIssue =
     task?.artifactAcceptanceState === 'recovered' ||
     task?.webTimings?.artifactAcceptanceState === 'recovered';
+  const quotaSnapshotStop =
+    task?.errorCode === 'USAGE_LIMIT_BEFORE_START' ||
+    (task?.accepted === true &&
+      task?.submitted === false &&
+      task?.referenceCount === 0 &&
+      /5\s*小时创作额度.*旧快照|额度快照/.test(project.message || ''));
   const statusMessage =
+    (quotaSnapshotStop ? project.message || '额度快照过旧，本次没有上传附件或发送请求，原图未变化；不会自动重试。' : '') ||
     webFailureText ||
     (ownedTabState === 'uploading' || ownedTabState === 'uploaded'
       ? `${ownedTabText}；尚未发送消息`

@@ -408,6 +408,18 @@ function normalizeQA(result){
   if(!details.length&&Array.isArray(normalized.issues))normalized.issueDetails=normalized.issues.map((description,i)=>({id:`legacy-${i+1}`,category:/(?:画幅|比例|竖图)/.test(description)?'aspect_ratio':'uncertain',severity:'review',location:'待确认',description,repairAction:'review'}));
   return normalized;
 }
+function normalizePageQA(result){
+  const normalized=normalizeQA(result);
+  // Input-panel dimensions are intentionally normalized by the local cover
+  // compositor. A small source-ratio discrepancy is not a reason to redraw.
+  normalized.issueDetails=(normalized.issueDetails||[]).map(issue=>{
+    if(issue.category!=='aspect_ratio')return issue;
+    const ratios=[...String(issue.description||'').matchAll(/(\d+(?:\.\d+)?)\s*[:：]\s*(\d+(?:\.\d+)?)/g)].map(match=>Number(match[1])/Number(match[2])).filter(value=>Number.isFinite(value)&&value>0);
+    const close=ratios.length>=2&&Math.abs(ratios[0]-ratios[1])/Math.max(ratios[0],ratios[1])<=.01;
+    return close?{...issue,severity:'suggestion',repairAction:'recompose',description:`${issue.description}（画幅差小于 1%，沿用本地 cover 裁切，不需要重生分镜。）`}:issue;
+  });
+  return normalized;
+}
 function materialSampleIssues(issues=[],details=[]){if(details.length)return details.filter(x=>x.category!=='aspect_ratio').map(x=>x.description);return issues.filter(x=>!/(?:2\s*[:：]\s*3|3\s*[:：]\s*4).*(?:画幅|比例|竖图)|(?:画幅|比例|竖图).*(?:2\s*[:：]\s*3|3\s*[:：]\s*4)/i.test(x));}
 function qaPassed(qa){return qa?.pass===true&&qa?.status!=='deferred';}
 function sampleAccepted(sample){return Boolean(qaPassed(sample?.qa)||sample?.userDecision?.action==='accept_current');}
@@ -680,16 +692,52 @@ export async function decidePanel(p,decision={}){
 }
 function defaultCaptionAnchor(panel,index){return ['time','dialogue'].includes(panel?.captionKind)?'top-right':index%2?'top-left':'bottom-left';}
 function nextCaptionAnchor(anchor){return {'bottom-left':'top-right','top-left':'bottom-right','top-right':'bottom-left','bottom-right':'top-left'}[anchor]||'top-right';}
+function panelNumberFromLocation(location,pageNumber){
+  const value=String(location||'');
+  const explicitPage=value.match(/第\s*(\d+)\s*页/);
+  if(explicitPage&&Number(explicitPage[1])!==Number(pageNumber))return null;
+  const arabic=value.match(/第\s*(\d+)\s*格/);
+  if(arabic)return Number(arabic[1]);
+  const chinese=value.match(/第?([一二三四五六七八九十两]+)格/);
+  if(chinese){const digits={一:1,二:2,两:2,三:3,四:4,五:5,六:6,七:7,八:8,九:9};const ordinal=chinese[1];if(ordinal==='十')return 10;if(ordinal.startsWith('十'))return 10+(digits[ordinal[1]]||0);if(ordinal.endsWith('十'))return (digits[ordinal[0]]||0)*10;return digits[ordinal]||null;}
+  return null;
+}
+function actionableLayoutIssues(report,pageNumber){return (report?.issueDetails||[]).filter(issue=>['recompose','reletter'].includes(issue.repairAction)&&/(?:文字|文案|字幕|排字|遮挡)/.test(`${issue.location||''} ${issue.description||''}`)).map(issue=>({...issue,panelNumber:panelNumberFromLocation(issue.location,pageNumber)}));}
 function repairedLayoutHints(page,report,current={}){
   const anchors=page.panels.map((panel,index)=>current.captionAnchors?.[index]||defaultCaptionAnchor(panel,index));
   const widths=page.panels.map((_,index)=>Number(current.captionWidthRatios?.[index])||.62);
   const affected=new Set();
-  for(const issue of report?.issueDetails||[]){
-    if(!['recompose','reletter'].includes(issue.repairAction)||!/(?:文字|文案|字幕|排字|遮挡)/.test(`${issue.location||''} ${issue.description||''}`))continue;
-    const match=/第\s*(\d+)\s*格/.exec(`${issue.location||''} ${issue.description||''}`);if(match)affected.add(Number(match[1])-1);
+  const layoutIssues=actionableLayoutIssues(report,page.number);
+  if(layoutIssues.some(issue=>!issue.panelNumber))throw new Error('成稿问题没有指出明确分镜格位，无法安全猜测重排位置；请人工查看成稿后决定。');
+  for(const issue of layoutIssues)affected.add(issue.panelNumber-1);
+  if(layoutIssues.length&&!affected.size)throw new Error('成稿问题没有指出可用的分镜格位；请人工查看成稿后决定。');
+  for(const index of affected)if(index>=0&&index<anchors.length){
+    const detail=layoutIssues.find(issue=>issue.panelNumber===index+1);
+    const mentionsUpperHead=/(?:发髻|头顶|头发|头部|头顶)/.test(`${detail?.location||''} ${detail?.description||''}`);
+    // A top-left bubble covering a bun moves to the lower-left safe corner;
+    // shrinking it alone would leave the collision in place.
+    anchors[index]=mentionsUpperHead?'bottom-left':nextCaptionAnchor(anchors[index]);
+    widths[index]=.36;
   }
-  for(const index of affected)if(index>=0&&index<anchors.length){if(!current.captionAnchors?.[index]||widths[index]<=.38)anchors[index]=nextCaptionAnchor(anchors[index]);widths[index]=.36;}
-  return {style:'floating-v2',captionAnchors:anchors,captionWidthRatios:widths,source:'qa-repair',repairPrompt:report?.repairPrompt||'',at:new Date().toISOString()};
+  return {style:'floating-v2',captionAnchors:anchors,captionWidthRatios:widths,source:'qa-repair',repairPrompt:report?.repairPrompt||'',repairIssueFingerprint:layoutIssueFingerprint(report,page.number),at:new Date().toISOString()};
+}
+function layoutIssueFingerprint(report,pageNumber){
+  const relevant=actionableLayoutIssues(report,pageNumber).map(issue=>({category:issue.category||'layout',panelNumber:issue.panelNumber||null,region:/(?:发髻|头顶|头发|头部)/.test(`${issue.location||''} ${issue.description||''}`)?'head':/(?:脸|面部)/.test(`${issue.location||''} ${issue.description||''}`)?'face':'subject-overlap'}));
+  return relevant.length?digest(relevant):null;
+}
+function samePageSourceSnapshot(left,right){
+  const normalize=value=>(value||[]).map(item=>({key:item.key,file:item.file,sha256:item.sha256})).sort((a,b)=>String(a.key).localeCompare(String(b.key)));
+  const a=normalize(left),b=normalize(right);
+  return a.length>0&&a.length===b.length&&JSON.stringify(a)===JSON.stringify(b);
+}
+function selectLayoutRepairReport(p,pageNumber,current){
+  if(layoutIssueFingerprint(current?.qa,pageNumber))return {report:current.qa,source:'current-page-qa'};
+  if(current?.qa?.pass!==true||current.qa.manualReviewRequired||!current.sourceIntegrity?.length)return null;
+  const expectedIds=current.dependsOn||[];
+  const historical=(p.invalidatedPages||[]).filter(item=>Number(item.page?.number)===Number(pageNumber)&&Number(item.page?.projectVersion)===Number(p.version)&&JSON.stringify(item.page?.dependsOn||[])===JSON.stringify(expectedIds)&&samePageSourceSnapshot(item.page?.sourceIntegrity,current.sourceIntegrity)&&layoutIssueFingerprint(item.page?.qa,pageNumber)).map(item=>({report:item.page.qa,fingerprint:layoutIssueFingerprint(item.page.qa,pageNumber),at:item.at}));
+  const counts=new Map();for(const item of historical)counts.set(item.fingerprint,(counts.get(item.fingerprint)||0)+1);
+  const repeated=historical.filter(item=>(counts.get(item.fingerprint)||0)>=2).at(-1);
+  return repeated?{report:repeated.report,source:'repeated-matching-source-history',fingerprint:repeated.fingerprint,matchingReports:counts.get(repeated.fingerprint)}:null;
 }
 function pageQaDefinition(page){
   return {...page,panels:page.panels.map(({prompt:_legacyPrompt,...panel})=>panel),layoutAuthority:'页面实际分格与本地排版器输出为唯一标准；方案页标题仅用于网页方案查看，不绘制到最终漫画页；旧生图提示中的比例措辞不参与成稿验收。'};
@@ -714,7 +762,7 @@ async function composePage(p,page,signal){
   jsonWrite(path.join(dir,'排版.json'),{page,total:p.plan.pages.length,images,output,layoutHints,compositionVersion:COMPOSITION_VERSION});
   await pythonRun(['compose',path.join(dir,'排版.json')]);checkpoint(signal);
   activity(p,`正在核对第 ${page.number} 页的文字、画面和连续性…`);
-  const report=await qa(p,output,JSON.stringify(pageQaDefinition(page)),imageRefs(p,[...new Set(page.panels.flatMap(q=>q.references))]),signal,'1080×1440最终漫画页');
+  const report=normalizePageQA(await qa(p,output,JSON.stringify(pageQaDefinition(page)),imageRefs(p,[...new Set(page.panels.flatMap(q=>q.references))]),signal,'1080×1440最终漫画页'));
   const pageIntegrity=await verifyImage(output),result={number:page.number,file:path.relative(projectDir(p.id),output),qa:report,layoutHints,compositionVersion:COMPOSITION_VERSION,projectVersion:p.version,integrity:pageIntegrity,sourceIntegrity,at:new Date().toISOString(),dependsOn:page.panels.map((_,i)=>artifactIdForImageKey(`${page.number}-${i+1}`))};
   p.pages=p.pages.filter(q=>q.number!==page.number);p.pages.push(result);p.pages.sort((a,b)=>a.number-b.number);recordArtifact(p,`page:${page.number}`,'page',result.file,result.dependsOn,{compositionVersion:COMPOSITION_VERSION,projectVersion:p.version,integrity:pageIntegrity,sourceIntegrity});saveProject(p);
   if(!report.pass){
@@ -731,14 +779,29 @@ export function repairPageLayout(p,pageNumber){
   // Page reflow is an entirely local job.  Keep it out of the generic
   // revising/image phase so browser leases and image-worker state can never
   // be consulted by this path.
+  const selectedRepair=selectLayoutRepairReport(p,number,current),repairReport=selectedRepair?.report||current.qa;
+  const repairFingerprint=layoutIssueFingerprint(repairReport,number);
+  const sourceIssues=(current.qa?.issueDetails||[]).filter(issue=>['blocking','review'].includes(issue.severity)&&issue.repairAction==='regenerate');
+  if(sourceIssues.length&&!repairFingerprint)throw new Error(`第 ${number} 页的问题指向源分镜内容（${sourceIssues.map(issue=>issue.description).join('；')}），不能用成稿重排代替分镜修改。请从对应格的成稿问题入口确认后再修订。`);
+  if(current.qa?.pass===false&&!repairFingerprint)throw new Error(`第 ${number} 页当前问题没有明确的排版修复目标；已停止猜测。请按校对指出的问题人工处理对应分镜或文字。`);
+  if(current.qa?.manualReviewRequired)throw new Error(`第 ${number} 页上次重排后仍需人工核对；请先查看成稿，确认问题已消失后再操作。`);
+  if(repairFingerprint&&p.pageLayouts?.[number]?.repairIssueFingerprint===repairFingerprint)throw new Error(`第 ${number} 页同一文字遮挡问题在上次重排后仍未得到可信确认。已停止重复重排；请人工调整文字框位置或先修正分镜。`);
   return job(p,'page-layout',async signal=>{
+    const beforeQa=structuredClone(current.qa||{}),triggerQa=structuredClone(repairReport||{});
     activity(p,`准备排版第 ${number} 页（本地，不重新生图）`,number,p.plan.pages.length,'页面');
-    invalidatePagePresentation(p,number,'layout-repaired');p.pageLayouts=p.pageLayouts||{};p.pageLayouts[number]=repairedLayoutHints(page,current.qa,p.pageLayouts[number]);saveProject(p);
+    await validatePageReviewEvidence(p,number);
+    invalidatePagePresentation(p,number,'layout-repaired');p.pageLayouts=p.pageLayouts||{};p.pageLayouts[number]=repairedLayoutHints(page,repairReport,p.pageLayouts[number]);saveProject(p);
     activity(p,`正在合成第 ${number} 页（本地排版器）`,number,p.plan.pages.length,'页面');
     const result=await composePage(p,page,signal);p.error=null;
     activity(p,`正在校验第 ${number} 页成稿`,number,p.plan.pages.length,'页面');
-    if(result.qa.pass){p.status='paused';activity(p,`第 ${number} 页排版完成；原始分镜没有重新生成。`,number,p.plan.pages.length,'页面');}
+    const afterFingerprint=layoutIssueFingerprint(result.qa,number);
+    if(repairFingerprint&&afterFingerprint===repairFingerprint){result.qa.manualReviewRequired=true;result.qa.status='manual_layout_review';result.qa.summary='同一文字遮挡问题在重排后仍被校对指出，已停止自动循环。请人工调整文字框位置，或修正对应分镜后再排版。';result.nextStep='人工调整文字框或分镜';p.status='attention';p.error=null;p.message=`第 ${number} 页的同一问题在重排后仍存在；已停止自动重复，请人工调整文字框或分镜。`;saveProject(p);activity(p,p.message,number,p.plan.pages.length,'页面');}
+    else if(result.qa.pass){
+      if(repairFingerprint){result.qa.manualReviewRequired=true;result.qa.status='manual_layout_review';result.qa.summary='已按问题调整本地文字框位置。自动校对通过不能单独证明遮挡已消失，请查看成稿确认对应主体完整可见。';result.nextStep='人工确认重排效果';p.status='attention';p.message=`第 ${number} 页已按校对指出的位置调整文字框。请查看成稿，确认遮挡确实消失后再继续；没有重新生成分镜。`;saveProject(p);activity(p,p.message,number,p.plan.pages.length,'页面');}
+      else {p.status='paused';activity(p,`第 ${number} 页排版完成；原始分镜没有重新生成。`,number,p.plan.pages.length,'页面');}
+    }
     else {p.status='attention';activity(p,`第 ${number} 页排版失败：仍有排版问题，请查看后再次调整。`,number,p.plan.pages.length,'页面');}
+    if(repairFingerprint){result.layoutVerification={beforeQa,triggerQa,triggerSource:selectedRepair?.source||'current-page-qa',matchingHistoricalReports:selectedRepair?.matchingReports||1,afterQa:structuredClone(result.qa||{}),sourceIssueFingerprint:repairFingerprint,remainingIssueFingerprint:afterFingerprint,automatedVisualProof:false,manualConfirmationRequired:true};saveProject(p);}
   });
 }
 export async function validatePageReviewEvidence(p,pageNumber){
@@ -785,12 +848,15 @@ function reviewPageQaOnly(p,pageNumber){
     const task=beginTask(p,'review',`第 ${number} 页成稿`,{artifact:page.file,source:'manual_page_review'});
     activity(p,`正在校对第 ${number} 页（保留现有 PNG）`,number,p.pages.length,'页面');
     try{
-      const report=await qa(p,pageFile,JSON.stringify(pageQaDefinition(definition)),imageRefs(p,[...new Set(definition.panels.flatMap(item=>item.references))]),signal,'1080×1440最终漫画页');
+      const report=normalizePageQA(await qa(p,pageFile,JSON.stringify(pageQaDefinition(definition)),imageRefs(p,[...new Set(definition.panels.flatMap(item=>item.references))]),signal,'1080×1440最终漫画页'));
       const after=await verifyImage(pageFile);if(after.sha256!==before.sha256)throw new Error('校对期间成稿文件发生变化，已停止更新校对状态。');
-      page.qa=report;delete page.nextStep;
+      const priorLayoutConfirmation=page.layoutVerification?.manualConfirmationRequired===true||page.qa?.manualReviewRequired===true;
+      page.qa=report;
+      if(priorLayoutConfirmation){page.qa.manualReviewRequired=true;page.qa.status='manual_layout_review';page.qa.summary='成稿已重新校对，但先前排版问题仍需人工确认是否解决。请查看页面图；自动校对通过不会替代这项确认。'}
+      delete page.nextStep;
       if(!report.pass){page.nextStep='查看或修订';invalidateArtifacts(p,['story:audit','export:bundle']);p.storyQA=null;p.bundle=null;p.accepted=false;p.acceptance=null;}
       finishTask(p,task,'completed',{artifact:pageFile,qa:report.pass?'passed':'needs_review'});
-      p.status=report.pass?'paused':'attention';p.error=null;p.message=report.pass?`第 ${number} 页已校对。`:`第 ${number} 页校对未通过，请查看建议。`;
+      p.status=priorLayoutConfirmation?'attention':report.pass?'paused':'attention';p.error=null;p.message=priorLayoutConfirmation?`第 ${number} 页自动校对已完成；请人工确认之前的文字遮挡是否解决。`:report.pass?`第 ${number} 页已校对。`:`第 ${number} 页校对未通过，请查看建议。`;
       saveProject(p);activity(p,report.pass?`第 ${number} 页校对完成，成稿文件与哈希未改变。`:`第 ${number} 页校对完成，发现需要查看的问题。`,number,p.pages.length,'页面');return page;
     }catch(error){
       if(signal.aborted){finishTask(p,task,'review_failed',{artifact:pageFile,error:String(error.message||error)});saveProject(p);throw error;}
@@ -808,7 +874,10 @@ export function unifyPageLayouts(p){
       const page=p.plan.pages.find(item=>item.number===number),current=p.pages.find(item=>item.number===number);if(!page||!current)continue;
       checkpoint(signal);activity(p,`正在统一第 ${number} 页的圆角分格、浮动文字框和页码…`,index,numbers.length,'页面');
       invalidatePagePresentation(p,number,'layout-unified');p.pageLayouts[number]=current.qa?.pass?{...p.pageLayouts[number],style:'floating-v2',source:'whole-story-unify',at:new Date().toISOString()}:repairedLayoutHints(page,current.qa,p.pageLayouts[number]);
-      const result=await composePage(p,page,signal);if(!result.qa.pass)failed++;
+      const result=await composePage(p,page,signal);
+      const manualLayoutCheck=current.qa?.manualReviewRequired||current.layoutVerification?.manualConfirmationRequired;
+      if(manualLayoutCheck){result.qa.manualReviewRequired=true;result.qa.status='manual_layout_review';result.qa.summary='版式已统一，但先前的文字遮挡仍需人工查看确认；自动校对通过不会替代这项确认。';result.layoutVerification={...(current.layoutVerification||{}),manualConfirmationRequired:true,automatedVisualProof:false};saveProject(p);}
+      if(!result.qa.pass||manualLayoutCheck)failed++;
     }
     p.error=null;p.status=failed?'attention':'paused';activity(p,failed?`已有页面已统一为同一版式，其中 ${failed} 页仍需单独调整。`:`已有 ${numbers.length} 页已统一为同一版式，原始分镜均未重新生成。`,numbers.length,numbers.length,'页面');
   });
@@ -986,7 +1055,7 @@ export function reviewImage(p,key){
     const task=beginTask(p,'review',record.key||key,{artifact:record.file,source:'manual_review'});
     record.integrity=integrity;record.qa={pass:null,status:'pending',summary:'原图已保存，正在重新校对。',issues:[],repairPrompt:''};saveProject(p);
     try{
-      const report=await qa(p,file,prompt,imageRefs(p,refs),signal,kind);record.qa=report;if(panel&&!report.pass){invalidatePanelDownstream(p,key);requirePanelDecision(p,key,record);}else if(panel)p.panelDecision=null;
+      const report=await qa(p,file,prompt,imageRefs(p,refs),signal,kind);record.qa=report;
       jsonWrite(file+'.json',record);finishTask(p,task,'completed',{artifact:file,qa:report.pass?'passed':'needs_review'});
       p.status='paused';p.error=null;p.message=report.pass?'原图已重新校对，可以继续下一步。':'原图已重新校对，请查看建议后决定是否修改。';saveProject(p);return record;
     }catch(error){
