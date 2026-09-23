@@ -79,13 +79,13 @@ test('existing conversation navigation timeout is checked before pre-submission 
  const args={...setup('success'),timeoutMs:5000};
  await dispatchChatGptWebJob({...args,conversationUrl:'https://chatgpt.com/c/existing-conversation'});
  const instruction=fs.readFileSync(path.join(args.dir,'prompt.txt'),'utf8');
- assert.match(instruction,/既有会话.*导航.*超时/);
- assert.match(instruction,/同一.*owned tab.*URL.*DOM.*composer|同一.*自有 tab.*URL.*DOM.*composer/);
- assert.match(instruction,/Page\.navigate|navigation timeout/i);
+ assert.match(instruction,/只允许一次 goto[\s\S]*禁止先打开 chatgpt\.com 首页/);
+ assert.match(instruction,/同一调用中有界读取 owned tab 当前 URL 和精简 AX 状态/);
+ assert.match(instruction,/若 goto 或页面就绪等待超时/);
  assert.match(instruction,/CHATGPT_NAVIGATION_FAILED/);
- assert.match(instruction,/这个 tab.*完成聊天模式/);
- assert.match(instruction,/新聊天继续/);
- assert.match(instruction,/不得再次 createBrowserTab|不得盲目再次调用 createBrowserTab/);
+ assert.match(instruction,/不得改在新聊天发送/);
+ assert.match(instruction,/不得再次 goto/);
+ assert.match(instruction,/不得再次 createBrowserTab|不允许第二次 createBrowserTab/);
 });
 test('a proven pre-acceptance usage limit resumes the same request and archives the first attempt',async()=>{
  const args=setup('usage-limit-once'),identity={provider:WEB_IMAGE_PROVIDER,projectId:'11111111-1111-4111-8111-111111111111',projectVersion:3,taskId:'22222222-2222-4222-8222-222222222222',target:'第5页-第1格'};
