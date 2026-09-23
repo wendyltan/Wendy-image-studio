@@ -33,8 +33,11 @@ export function ProjectPictures({
   setChecks: (value: string[]) => void;
   allChecks: string[];
 }) {
-  const qaAction = (qa: { pass: boolean | null; status?: string }, page: boolean) => {
-    const initial = qa.pass === null || ['deferred', 'unavailable'].includes(qa.status || '');
+  const qaAction = (qa: { pass: boolean | null; status?: string; manualReviewRequired?: boolean }, page: boolean) => {
+    const initial =
+      (page && (qa.manualReviewRequired === true || qa.status === 'local_deterministic_preflight')) ||
+      qa.pass === null ||
+      ['deferred', 'unavailable'].includes(qa.status || '');
     return page ? (initial ? '校对本页' : '重新校对') : initial ? '校对这一格' : '重新校对';
   };
   return (
@@ -79,7 +82,14 @@ export function ProjectPictures({
               </button>
               <div className="image-meta">
                 <h3>
-                  第 {page.number} 页 <QaBadge qa={page.qa} />
+                  第 {page.number} 页{' '}
+                  <QaBadge
+                    qa={page.qa}
+                    pageReviewPending={
+                      page.qa.manualReviewRequired === true ||
+                      page.qa.status === 'local_deterministic_preflight'
+                    }
+                  />
                 </h3>
                 <p>{page.qa.summary}</p>
                 <div className="inline-actions">

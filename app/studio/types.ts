@@ -33,6 +33,7 @@ export type Picture = {
   qa: {
     pass: boolean | null;
     status?: string;
+    manualReviewRequired?: boolean;
     summary: string;
     issues: string[];
     repairPrompt?: string;

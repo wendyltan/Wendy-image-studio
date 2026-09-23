@@ -85,6 +85,16 @@ test('public panel media URL enables review and page review is a separate action
   assert.match(engine, /qa\(p,pageFile,JSON\.stringify\(pageQaDefinition\(definition\)\)/);
 });
 
+test('local page preflight remains pending manual review until page QA runs', () => {
+  const pictures = fs.readFileSync(path.join(appRoot, 'app/studio/project-pictures.tsx'), 'utf8');
+  const visuals = fs.readFileSync(path.join(appRoot, 'app/studio/visuals.tsx'), 'utf8');
+  assert.match(pictures, /pageReviewPending=\{[\s\S]*?page\.qa\.manualReviewRequired === true[\s\S]*?page\.qa\.status === 'local_deterministic_preflight'/);
+  assert.match(pictures, /qa\.manualReviewRequired === true \|\| qa\.status === 'local_deterministic_preflight'/);
+  assert.match(pictures, /qaAction\(page\.qa, true\)/);
+  assert.match(pictures, /qaAction\(panel\.qa, false\)/);
+  assert.match(visuals, /pageReviewPending[\s\S]*?待人工复核/);
+});
+
 test('completed browser lease does not become the current global warning', () => {
   const status = fs.readFileSync(path.join(appRoot, 'app/studio/workflow-status.tsx'), 'utf8');
   assert.match(status, /project\.pending\?\.ownedTabState/);

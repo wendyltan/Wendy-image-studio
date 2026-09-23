@@ -18,8 +18,16 @@ export function qaLabel(qa: Picture['qa']) {
   return { className: '', text: '待修订' };
 }
 
-export function QaBadge({ qa }: { qa: Picture['qa'] }) {
-  const state = qaLabel(qa);
+export function QaBadge({
+  qa,
+  pageReviewPending = false,
+}: {
+  qa: Picture['qa'];
+  pageReviewPending?: boolean;
+}) {
+  const state = pageReviewPending
+    ? { className: 'deferred', text: '待人工复核' }
+    : qaLabel(qa);
   return <span className={'qa-label ' + state.className}>{state.text}</span>;
 }
 
