@@ -914,14 +914,30 @@ function qaPromptForRecord(record,definition,key){
   return record?.prompt||definition?.prompt;
 }
 export function pageIsCurrent(p,page){
-  if(page?.compositionVersion!==COMPOSITION_VERSION||!page?.qa?.pass)return false;
+  if(page?.compositionVersion!==COMPOSITION_VERSION||!page?.qa?.pass||page?.layoutVerification?.manualConfirmationRequired===true)return false;
   const pageArtifact=(p.artifacts||[]).find(artifact=>artifact.id===`page:${page.number}`&&artifact.file===page.file&&artifact.valid!==false);
   const definition=p.plan?.pages?.find(item=>Number(item.number)===Number(page.number));
   if(!pageArtifact||pageArtifact.compositionVersion!==COMPOSITION_VERSION||!definition||!Array.isArray(page.dependsOn))return false;
   const expected=definition.panels.map((_,index)=>artifactIdForImageKey(`${page.number}-${index+1}`));
   return expected.every(id=>page.dependsOn.includes(id)&&currentImageArtifact(p,`${page.number}-${expected.indexOf(id)+1}`)?.id===id);
 }
-export function generatePages(p){verifyApproval(p);if(!p.samplesApproved)throw new Error('请先确认人物和场景样张。');return job(p,'generating',async signal=>{
+export async function confirmPageLayout(p,{pageNumber,projectVersion,contentHash}={}){
+  verifyApproval(p);if(p.pending||active.has(p.id)||hasLiveWork(p.id))throw new Error('当前作品仍有任务运行，暂不能确认页面排版。');
+  const number=Number(pageNumber),page=p.pages?.find(item=>Number(item.number)===number),artifact=(p.artifacts||[]).find(item=>item.id===`page:${number}`&&item.file===page?.file);
+  if(!page||!artifact)throw new Error('这一页没有可确认的当前成稿。');
+  if(Number(projectVersion)!==Number(p.version)||Number(page.projectVersion)!==Number(p.version)||Number(artifact.projectVersion)!==Number(p.version))throw new Error('作品版本已变化，请重新打开当前成稿后再确认。');
+  const expectedContentHash=digest({artifactId:`page:${number}`,file:page.file,at:page.at||artifact.at||null});
+  if(String(contentHash||'')!==expectedContentHash)throw new Error('成稿内容已更新，请重新查看当前页面后再确认。');
+  if(page.qa?.pass!==true||page.layoutVerification?.manualConfirmationRequired!==true)throw new Error('只有校对通过且明确标记待人工确认的重排页面，才能进行此确认。');
+  const evidence=await validatePageReviewEvidence(p,number);
+  if(evidence.integrity.sha256!==page.integrity?.sha256)throw new Error('成稿文件已变化，请重新打开页面后再确认。');
+  const confirmedAt=new Date().toISOString();
+  page.layoutVerification={...page.layoutVerification,manualConfirmationRequired:false,confirmedAt,confirmedContentHash:expectedContentHash,confirmedProjectVersion:p.version,confirmedFileSha256:evidence.integrity.sha256,automatedVisualProof:false};
+  page.qa={...page.qa,manualReviewRequired:false,status:'human_confirmed_layout',summary:'你已人工确认本页排版。自动校对结果和前后问题记录已保留。'};
+  p.status='paused';p.error=null;p.message=`第 ${number} 页排版已由你确认。后续制作不会自动重排或重新生成分镜；需要时可再手动处理。`;saveProject(p);
+  return page;
+}
+export function generatePages(p){verifyApproval(p);if(!p.samplesApproved)throw new Error('请先确认人物和场景样张。');const unconfirmedLayout=p.pages?.find(page=>page.layoutVerification?.manualConfirmationRequired===true);if(unconfirmedLayout){p.status='attention';p.error=null;p.message=`第 ${unconfirmedLayout.number} 页已重排并校对，但还没有人工确认。请先查看大图并确认排版；系统不会自动重复重排或生成分镜。`;saveProject(p);return p;}return job(p,'generating',async signal=>{
   const totalPanels=p.plan.pages.reduce((n,page)=>n+page.panels.length,0),verifyPanels=p.brief.workflowPreset==='careful';let completed=Object.keys(p.panels).length;
   for(const page of p.plan.pages){
     if(pageIsCurrent(p,p.pages.find(q=>q.number===page.number)))continue;

@@ -36,7 +36,7 @@ export function ProjectPictures({
   allChecks: string[];
 }) {
   const panelForPageIssue = (pageNumber: number, issue: NonNullable<Picture['qa']['issueDetails']>[number]) => {
-    if (issue.repairAction !== 'regenerate' || !['blocking', 'review'].includes(issue.severity || '')) return null;
+    if (!['regenerate', 'recompose'].includes(issue.repairAction || '') || !['blocking', 'review'].includes(issue.severity || '')) return null;
     const location = String(issue.location || '');
     const explicitPage = location.match(/第\s*(\d+)\s*页/);
     if (explicitPage && Number(explicitPage[1]) !== pageNumber) return null;
@@ -53,6 +53,20 @@ export function ProjectPictures({
     if (!panelNumber) return null;
     const panelCount = project.plan.pages.find((entry) => entry.number === pageNumber)?.panels.length || 0;
     return panelNumber > 0 && panelNumber <= panelCount ? `${pageNumber}-${panelNumber}` : null;
+  };
+  const sourceIssueGroups = (pageNumber: number, issues: NonNullable<Picture['qa']['issueDetails']>) => {
+    const groups = new Map<string, NonNullable<Picture['qa']['issueDetails']>>();
+    for (const issue of issues) {
+      const text = `${issue.location || ''} ${issue.description || ''}`;
+      const layoutCue = /文字框|文本框|文案|字幕|排字|排版|气泡|页码/.test(text);
+      const sourceCue = /人物|角色|身份|服装|发型|姿态|动作|视线|座椅|椅子|道具|物件|场景|手部|手脚|连续性|一致性/.test(text) ||
+        /^(continuity|anatomy|character|pose|setting|prop|object|appearance)$/i.test(issue.category || '');
+      if (layoutCue || !sourceCue) continue;
+      const panelKey = panelForPageIssue(pageNumber, issue);
+      if (!panelKey) continue;
+      groups.set(panelKey, [...(groups.get(panelKey) || []), issue]);
+    }
+    return [...groups.entries()].map(([panelKey, matchingIssues]) => ({panelKey, issues: matchingIssues}));
   };
   const qaAction = (qa: { pass: boolean | null; status?: string; manualReviewRequired?: boolean }, page: boolean) => {
     const initial =
@@ -113,20 +127,20 @@ export function ProjectPictures({
                   />
                 </h3>
                 <p>{page.qa.summary}</p>
-                {page.layoutVerification?.manualConfirmationRequired && <p className="muted">已重排，待人工确认遮挡是否解决。自动校对结果和前后问题记录已保留。</p>}
-                {page.qa.issueDetails?.filter((issue) => ['blocking', 'review'].includes(issue.severity || '')).map((issue, index) => {
-                  const panelKey = panelForPageIssue(page.number, issue);
-                  if (!panelKey || issue.repairAction !== 'regenerate') return null;
-                  const description = String(issue.description || '');
+                {page.layoutVerification?.manualConfirmationRequired && <p className="muted">已重排，待人工确认遮挡是否解决。可点上方成稿查看大图；若仍有遮挡，请不要确认，可先重新校对并保留问题记录。系统不会自动重排或生图。</p>}
+                {sourceIssueGroups(page.number, page.qa.issueDetails || []).map(({panelKey, issues}) => {
+                  const descriptions = issues.map((issue) => String(issue.description || '')).filter(Boolean);
+                  if (!descriptions.length) return null;
                   return (
-                    <div className="page-issue-route" key={issue.id || `${panelKey}-${index}`}>
-                      <p>成稿问题：{description}</p>
+                    <div className="page-issue-route" key={panelKey}>
+                      <p>成稿问题：{descriptions.join('；')}</p>
                       <button className="secondary" disabled={disabled} onClick={() => {
                         const [pageNumber, panelNumber] = panelKey.split('-');
-                        setEditNote(`成稿校对指出：${description}\n\n请只修复第 ${pageNumber} 页第 ${panelNumber} 格这一项问题，保留该格其余人物、场景、动作、构图和风格，不改动其他分镜。`);
+                        const items = descriptions.map((description) => `- ${description}`).join('\n');
+                        setEditNote(`成稿校对指出以下分镜问题：\n${items}\n\n请只修改第 ${pageNumber} 页第 ${panelNumber} 格，逐项修复以上问题；保留该格其他人物、场景、动作、构图和风格，不改动其他分镜。`);
                         setEdit({key: panelKey, title: `修改分镜 ${panelKey}`});
                       }}>
-                        按成稿问题修改这一格
+                        修改分镜 {panelKey}{issues.length > 1 ? `（${issues.length}项）` : ''}
                       </button>
                     </div>
                   );
@@ -148,6 +162,20 @@ export function ProjectPictures({
                         <Check />
                         {qaAction(page.qa, true)}
                       </button>
+                      {page.layoutVerification?.manualConfirmationRequired && page.qa.pass === true && (
+                        <button
+                          className="primary"
+                          disabled={disabled || !page.contentHash || page.projectVersion === undefined}
+                          onClick={() => action('confirm-page-layout', {
+                            pageNumber: page.number,
+                            projectVersion: page.projectVersion,
+                            contentHash: page.contentHash,
+                          })}
+                        >
+                          <Check />
+                          确认这一页排版
+                        </button>
+                      )}
                       <button
                         className="secondary page-layout-button"
                         disabled={disabled}

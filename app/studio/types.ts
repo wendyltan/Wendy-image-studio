@@ -28,9 +28,17 @@ export type Plan = {
 
 export type Picture = {
   url: string;
+  contentHash?: string;
+  projectVersion?: number;
+  integrity?: { sha256?: string };
   nextStep?: string;
   layoutHints?: { style?: string; captionAnchors?: string[] };
-  layoutVerification?: { manualConfirmationRequired?: boolean };
+  layoutVerification?: {
+    manualConfirmationRequired?: boolean;
+    confirmedAt?: string;
+    confirmedProjectVersion?: number;
+    confirmedFileSha256?: string;
+  };
   qa: {
     pass: boolean | null;
     status?: string;
