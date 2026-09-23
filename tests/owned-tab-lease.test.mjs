@@ -194,17 +194,18 @@ test('executor exit before a handle is observed keeps the pre-create reservation
   assert.equal(result.kernelReset, false);
 });
 
-test('orphaned lease can enter cleanup-only closing only with the exact handle', () => {
+test('orphaned lease cannot be converted to closing by cross-executor bookkeeping', () => {
   const run = fixture();
   ensureOwnedTabLease(run);
   reserveOwnedTabCreate(run);
   markOwnedTabStage({...run, state: 'created', ownedTabId: 'tab-orphan'});
   finalizeOwnedTabLease({...run, reason: 'budget'});
-  const prepared = prepareOwnedTabCleanup({...run, ownedTabId: 'tab-orphan'});
-  assert.equal(prepared.state, 'closing');
-  assert.equal(prepared.cleanupStatus, 'cleanup_pending');
+  assert.throws(() => markOwnedTabStage({...run, state: 'closing', ownedTabId: 'tab-orphan'}), error => error.code === 'OWNED_TAB_ORPHANED_RECOVERY_REQUIRED');
+  assert.throws(() => markOwnedTabStage({...run, state: 'uploaded'}), error => error.code === 'OWNED_TAB_ORPHANED_RECOVERY_REQUIRED');
+  const lease = readOwnedTabLease(run.dir, run);
+  assert.equal(lease.state, 'orphaned');
+  assert.equal(lease.cleanupStatus, 'cleanup_pending');
+  assert.throws(() => prepareOwnedTabCleanup({...run, ownedTabId: 'tab-orphan'}), error => error.code === 'OWNED_TAB_CROSS_SESSION_UNAVAILABLE');
   assert.throws(() => prepareOwnedTabCleanup({...run, ownedTabId: 'tab-other'}), error => error.code === 'OWNED_TAB_ID_MISMATCH');
-  assert.throws(() => markOwnedTabStage({...run, state: 'uploaded'}), error => error.code === 'OWNED_TAB_ORPHANED_RECOVERY_REQUIRED' || error.code === 'OWNED_TAB_STAGE_REGRESSION');
-  const closed = markOwnedTabCleanup({...run, status: 'closed', ownedTabId: 'tab-orphan', verification: 'exact-owned-tab-close-returned'});
-  assert.equal(closed.state, 'closed_verified');
+  assert.equal(readOwnedTabLease(run.dir, run).state, 'orphaned');
 });

@@ -5,7 +5,7 @@ import {runCodex,findCodex,writeExecutorRuntimeError,readExecutorRuntimeError,re
 import {identityFields,sameIdentityValue,readJsonObject as readRunJson,readRunIdentity,compareRunIdentity} from './run-identity.mjs';
 import {patchManifest} from './run-manifest.mjs';
 import {chatGptWebImagePrompt,ownedTabCleanupPrompt} from './web-executor-instructions.mjs';
-import {ensureOwnedTabLease,ownedTabSessionName,readOwnedTabLease,resetOwnedTabLeaseForResume,reserveOwnedTabCreate,prepareOwnedTabCleanup,syncOwnedTabLeaseToManifest} from './owned-tab-lease.mjs';
+import {ensureOwnedTabLease,ownedTabSessionName,readOwnedTabLease,resetOwnedTabLeaseForResume,reserveOwnedTabCreate,syncOwnedTabLeaseToManifest} from './owned-tab-lease.mjs';
 import {browserFailurePrefix,browserPreSubmissionUnavailableText,browserRunEvidenceText,structuredBrowserToolResultText,browserOriginPermissionDeniedEvidence,fileUploadChromeUnavailableEvidence,browserCreateUnavailableEvidence,browserHandleLostEvidence,browserModeEntryUnavailableEvidence,fileChooserEventTimeoutEvidence,fileChooserRouteUnavailableEvidence,fileSetFailedEvidence,attachmentVerificationTimeoutEvidence,browserToolBudgetExceededEvidence,workerScriptRuntimeErrorEvidence,executorRuntimeErrorEvidence,downloadFailedEvidence,iabUnavailableEvidence,browserTabBackgroundEvidence,chromeUnavailableEvidence,browserFocusEvidence,completeDownloadEvidence,enrichDownloadEvidenceIdentity,extractDownloadEvidence,inspectDownloadArtifact,readDownloadEvidence,validateDownloadEvidence,writeDownloadEvidence} from './web-download-evidence.mjs';
 import {uploadEvidenceFailureCode,uploadEvidenceFromRun,validateUploadEvidence} from './web-upload-evidence.mjs';
 import {REMOTE_PROMPT_FILE,assertRemotePrompt,remotePromptMetadata,validateRemotePrompt} from './remote-prompt.mjs';
@@ -413,52 +413,20 @@ export function confirmedUnsentWebAudit({dir,expected={}}={}){
   }catch{return null;}
 }
 
-/**
- * Recover one orphaned owned tab without creating a new image request.
- * This is intentionally a separate executor invocation so a business-budget
- * kill cannot remove the only opportunity to close the tab.  The caller must
- * invoke it only when the local runtime is allowed to use Chrome; a locked Mac
- * is represented by the durable cleanup_pending/orphaned lease and can be
- * retried after unlock.
- */
-export async function recoverOwnedTabCleanup({codexBin,dir,signal,timeoutMs=120000,model=null,reasoningEffort=WEB_IMAGE_EXECUTOR_EFFORT,role='browser-cleanup',runCodexImpl=runCodex} = {}) {
-  if (signal?.aborted) throw new Error('已暂停，cleanup-only 尚未启动。');
-  const manifestFile=path.join(dir,'web-generation.json'),manifest=readWebManifest(manifestFile),runId=path.basename(path.resolve(dir));
-  const requestId=manifest?.requestId;
+/** A fresh CUA executor cannot rebind the old executor's session or handle. */
+export async function recoverOwnedTabCleanup({dir} = {}) {
+  const manifest=readWebManifest(path.join(dir,'web-generation.json')),runId=path.basename(path.resolve(dir)),requestId=manifest?.requestId;
   const lease=readOwnedTabLease(dir,{runId,requestId});
-  if (!lease || !requestId || !lease.ownedTabId) {
-    const error=new Error('cleanup-only 缺少可验证的本次 ownedTabId 或 requestId。');
-    error.code='OWNED_TAB_CLEANUP_ID_MISSING';
-    throw error;
-  }
-  if (!['orphaned','closing'].includes(lease.state) || !['cleanup_pending','not_observed','orphaned'].includes(lease.cleanupStatus)) {
-    const error=new Error(`当前 owned tab lease 不需要 cleanup-only：${lease.state}/${lease.cleanupStatus}。`);
-    error.code='OWNED_TAB_CLEANUP_NOT_PENDING';
-    throw error;
-  }
-  const prepared=prepareOwnedTabCleanup({dir,runId,requestId,ownedTabId:lease.ownedTabId});
-  syncOwnedTabLeaseToManifest({dir,manifestFile,lease:prepared});
-  const prompt=ownedTabCleanupPrompt({manifestFile,runId,requestId,ownedTabId:prepared.ownedTabId});
-  const cleanupDir=path.join(dir,'cleanup-only',`${Date.now()}-${crypto.randomUUID().slice(0,8)}`);
-  fs.mkdirSync(cleanupDir,{recursive:true});
-  let failure=null;
-  try {
-    await runCodexImpl({codexBin:codexBin||findCodex(),dir:cleanupDir,leaseDir:dir,runIdOverride:runId,prompt,signal,browserMode:'chrome',image:false,timeoutMs,model,reasoningEffort,role});
-  } catch (error) { failure=error; }
-  const finalLease=readOwnedTabLease(dir,{runId,requestId});
-  if (finalLease) syncOwnedTabLeaseToManifest({dir,manifestFile,lease:finalLease});
-  if (finalLease?.state==='closed_verified') return {ok:true,lease:finalLease,cleanupDir};
-  const error=failure||new Error(`cleanup-only 未能确认关闭：${finalLease?.cleanupStatus||'not_observed'}。`);
-  error.code=error.code||'OWNED_TAB_CLEANUP_UNCONFIRMED';
-  error.lease=finalLease;
-  error.cleanupDir=cleanupDir;
+  const error=new Error(ownedTabCleanupPrompt({manifestFile:path.join(dir,'web-generation.json'),runId,requestId,ownedTabId:lease?.ownedTabId}));
+  error.code='OWNED_TAB_CROSS_SESSION_UNAVAILABLE';
+  error.lease=lease;
   throw error;
 }
 
 /**
- * Cleanup is deliberately best-effort and identity-bound.  It never creates
- * another image request; a locked/unavailable browser leaves the durable
- * orphaned/cleanup_pending marker for a later explicit cleanup-only attempt.
+ * A fresh CUA executor cannot safely reacquire the previous executor's tab.
+ * Preserve the durable orphan marker and record that cleanup is blocked rather
+ * than launching a second session which cannot access the original handle.
  */
 export async function autoRecoverOwnedTabCleanup({codexBin,dir,signal,timeoutMs,model,reasoningEffort,role='browser-cleanup',runCodexImpl=runCodex} = {}) {
   const manifestFile=path.join(dir,'web-generation.json'),runId=path.basename(path.resolve(dir));
@@ -470,17 +438,10 @@ export async function autoRecoverOwnedTabCleanup({codexBin,dir,signal,timeoutMs,
   let lease=null;
   try { lease=readOwnedTabLease(dir,{runId}); } catch { return {attempted:false,identityMismatch:true,lease:null}; }
   if (!lease || !requestId || lease.requestId!==requestId || lease.state!=='orphaned' || !lease.ownedTabId) return {attempted:false,identityMismatch:Boolean(lease&&requestId&&lease.requestId!==requestId),lease:lease||null};
-  const startedAt=new Date().toISOString();
-  const safeReadLease=()=>{try{return readOwnedTabLease(dir,{runId,requestId});}catch{return null;}};
-  let outcome;
-  try {
-    const result=await recoverOwnedTabCleanup({codexBin,dir,signal,timeoutMs,model,reasoningEffort,role,runCodexImpl});
-    outcome={ok:true,cleanupDir:result.cleanupDir||null,lease:result.lease||safeReadLease()};
-  } catch (error) {
-    outcome={ok:false,error:String(error?.message||error).slice(0,1000),cleanupDir:error?.cleanupDir||null,lease:error?.lease||safeReadLease()};
-  }
-  writeJson(path.join(dir,'cleanup-recovery.json'),{schemaVersion:1,runId,requestId,ownedTabId:lease.ownedTabId,startedAt,completedAt:new Date().toISOString(),...outcome});
-  return {attempted:true,...outcome};
+  const completedAt=new Date().toISOString(),reason='cross_executor_session_cannot_rebind',error=ownedTabCleanupPrompt({manifestFile,runId,requestId,ownedTabId:lease.ownedTabId});
+  const outcome={attempted:false,blocked:true,reason,error,cleanupDir:null,lease};
+  writeJson(path.join(dir,'cleanup-recovery.json'),{schemaVersion:2,runId,requestId,ownedTabId:lease.ownedTabId,startedAt:completedAt,completedAt,...outcome});
+  return outcome;
 }
 
 
@@ -524,9 +485,9 @@ export async function dispatchChatGptWebJob({codexBin,dir,outputFile,prompt,refe
   reserveOwnedTabCreate({dir,runId,requestId,sessionName});
   let result,failure;
   try{result=await runCodex({codexBin,dir,image:true,browserMode:'chrome',signal,timeoutMs,model,reasoningEffort,role,writableDirs:[path.dirname(path.resolve(outputFile))],prompt:executorPrompt});}catch(error){failure=error;}
-  // The business executor cannot call CUA close from Node.  Once it has
-  // durably finalized an orphaned exact handle, spend one independent
-  // cleanup-only invocation before projecting the image result.
+  // The business executor may have retained a same-session cleanup record.
+  // This diagnostic helper never starts another executor: separate CUA
+  // sessions cannot rebind the old tab handle.
   await autoRecoverOwnedTabCleanup({codexBin,dir,signal,timeoutMs:Math.min(timeoutMs,120000),model,reasoningEffort,role:'browser-cleanup'});
   const lease=readOwnedTabLease(dir,{runId,requestId});
   if(lease)syncOwnedTabLeaseToManifest({dir,manifestFile,lease});

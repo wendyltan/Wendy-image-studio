@@ -18,40 +18,25 @@ function fixture(){
   return {dir,runId,requestId};
 }
 
-test('automatic cleanup uses an isolated executor directory and the exact lease identity',async()=>{
+test('automatic cleanup does not launch a new executor that cannot rebind the old CUA session',async()=>{
   const run=fixture();
-  let invocation=null;
-  const result=await autoRecoverOwnedTabCleanup({dir:run.dir,timeoutMs:1000,runCodexImpl:async args=>{
-    invocation=args;
-    assert.notEqual(path.resolve(args.dir),path.resolve(run.dir));
-    assert.equal(path.resolve(args.leaseDir),path.resolve(run.dir));
-    assert.equal(args.runIdOverride,run.runId);
-    const script=args.prompt.slice(args.prompt.indexOf('WENDI_OWNED_TAB_CLEANUP_V1'));
-    assert.match(args.prompt,/第一个 CUA js 调用必须单独且精确执行 await cua\.getState\(\)/);
-    assert.match(args.prompt,/之后的 cleanup CUA 调用[\s\S]*cua\.getTab\("tab-owned", \{browser:"chrome"\}\)/);
-    assert.match(script,/cua\.getTab\("tab-owned"/);
-    assert.doesNotMatch(script,/cua\.createBrowserTab|cua\.listTabs|tab\.goto|setFiles|filechooser|pageAssets|tab\.playwright/);
-    markOwnedTabCleanup({dir:run.dir,runId:run.runId,requestId:run.requestId,status:'closed',ownedTabId:'tab-owned',verification:'exact-owned-tab-close-returned'});
-  }});
-  assert.equal(result.attempted,true);
-  assert.equal(result.ok,true);
-  assert.ok(invocation);
-  assert.equal(readOwnedTabLease(run.dir,{runId:run.runId,requestId:run.requestId}).state,'closed_verified');
+  let called=false;
+  const result=await autoRecoverOwnedTabCleanup({dir:run.dir,timeoutMs:1000,runCodexImpl:async()=>{called=true;}});
+  assert.equal(result.attempted,false);
+  assert.equal(result.blocked,true);
+  assert.equal(result.reason,'cross_executor_session_cannot_rebind');
+  assert.equal(called,false);
+  assert.equal(readOwnedTabLease(run.dir,{runId:run.runId,requestId:run.requestId}).state,'orphaned');
   const record=JSON.parse(fs.readFileSync(path.join(run.dir,'cleanup-recovery.json'),'utf8'));
-  assert.equal(record.ok,true);
+  assert.equal(record.blocked,true);
   assert.equal(record.ownedTabId,'tab-owned');
 });
 
-test('cleanup marker is emitted as a harmless JavaScript comment',()=>{
+test('cleanup-only prompt does not attempt cross-session tab discovery',()=>{
   const prompt=ownedTabCleanupPrompt({manifestFile:'/tmp/fixture/web-generation.json',runId:'fixture-run',requestId:'11111111-1111-4111-8111-111111111111',ownedTabId:'tab-owned'});
-  const script=prompt.slice(prompt.indexOf('WENDI_OWNED_TAB_CLEANUP_V1'));
-  assert.match(script,/\/\/ WENDI_OWNED_TAB_CLEANUP_V1/);
-  assert.doesNotMatch(script,/^WENDI_OWNED_TAB_CLEANUP_V1$/m);
-  assert.match(script,/cua\.getTab\("tab-owned", \{browser:"chrome"\}\)/);
-  assert.match(prompt,/await cua\.getState\(\)/);
-  assert.match(script,/try \{ tab = await cua\.getTab[\s\S]*await tab\.close\(\)/);
-  assert.match(script,/catch \(error\)[\s\S]*cleanup_pending helper/);
-  assert.match(script,/await tab\.close\(\)/);
+  assert.match(prompt,/原执行器仍持有同一持久句柄/);
+  assert.match(prompt,/新执行器无法通过 cua\.getTab 重新绑定/);
+  assert.doesNotMatch(prompt,/cua\.(?:getTab|listTabs|createBrowserTab)\s*\(/);
 });
 
 test('a non-orphaned lease does not start cleanup-only',async()=>{

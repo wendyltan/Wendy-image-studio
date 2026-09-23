@@ -199,9 +199,11 @@ function manifestBrowserState(dir){
   catch{return '';}
 }
 
+function sourceCallCount(source,pattern){return (String(source||'').match(pattern)||[]).length;}
+
 function writeBrowserToolBudget(dir,value={}){
   if(!dir||!value)return null;
-  const record={schemaVersion:2,errorCode:'BROWSER_TOOL_BUDGET_EXCEEDED',limit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,businessLimit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,cleanupLimit:BROWSER_TOOL_CLEANUP_CALL_BUDGET,stageBudgets:BROWSER_TOOL_STAGE_BUDGETS,observed:Number(value.observed)||0,observedBusiness:Number(value.observedBusiness)||0,observedCleanup:Number(value.observedCleanup)||0,stageCounts:value.stageCounts&&typeof value.stageCounts==='object'?{...value.stageCounts}:{},budgetKind:value.budgetKind||'business',stageName:value.stageName||null,stageLimit:Number(value.stageLimit)||null,stageCount:Number(value.stageCount)||null,submissionIntentObserved:value.submissionIntentObserved===true,stage:value.submissionIntentObserved===true?'post_submission_intent':'pre_submission_intent',terminationDeferred:value.terminationDeferred===true,terminationRequestedAt:new Date().toISOString()};
+  const record={schemaVersion:2,errorCode:'BROWSER_TOOL_BUDGET_EXCEEDED',limit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,businessLimit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,cleanupLimit:BROWSER_TOOL_CLEANUP_CALL_BUDGET,stageBudgets:BROWSER_TOOL_STAGE_BUDGETS,observed:Number(value.observed)||0,observedBusiness:Number(value.observedBusiness)||0,observedCleanup:Number(value.observedCleanup)||0,stageCounts:value.stageCounts&&typeof value.stageCounts==='object'?{...value.stageCounts}:{},budgetKind:value.budgetKind||'business',stageName:value.stageName||null,stageLimit:Number(value.stageLimit)||null,stageCount:Number(value.stageCount)||null,protectedAction:value.protectedAction||null,submissionIntentObserved:value.submissionIntentObserved===true,stage:value.submissionIntentObserved===true?'post_submission_intent':'pre_submission_intent',terminationDeferred:value.terminationDeferred===true,terminationRequestedAt:new Date().toISOString()};
   try{
     const file=path.join(dir,BROWSER_TOOL_BUDGET_FILE),temp=`${file}.tmp-${crypto.randomUUID()}`;
     fs.writeFileSync(temp,JSON.stringify(record,null,2)+'\n',{mode:0o600});fs.renameSync(temp,file);return record;
@@ -499,7 +501,7 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
     let buf='',last='',error='',settled=false,timedOut=false,usage=null;
     const capturedEvents=[];
     let runtimeError=null;
-    let browserToolCalls=0,browserBusinessCalls=0,browserCleanupCalls=0,browserInitializationCalls=0,submissionIntentObserved=false,budgetFailure=null,anonymousCallSequence=0;
+    let browserToolCalls=0,browserBusinessCalls=0,browserCleanupCalls=0,browserInitializationCalls=0,browserTabCreateAttempts=0,browserSetFilesCallCount=0,submissionIntentObserved=false,budgetFailure=null,anonymousCallSequence=0;
     const browserBusinessStageCounts={};
     const browserToolCallIds=new Set();
     const deferredCleanupCallIds=new Set(),anonymousActiveCallIds=[];
@@ -542,6 +544,19 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
     const registerBrowserToolCall=(callKey,kind,event,stageHint=null,{deferTermination=false}={})=>{
       if(browserToolCallIds.has(callKey))return;
       browserToolCallIds.add(callKey);browserToolCalls+=1;
+      const source=String(event?.item?.arguments?.code||event?.item?.arguments?.command||'');
+      let protectedAction=null;
+      if(kind!=='cleanup'){
+        const creates=sourceCallCount(source,/\bcua\s*\.\s*createBrowserTab\s*\(/gi);
+        const uploads=sourceCallCount(source,/\.\s*setFiles\s*\(/gi);
+        // A single setFiles CUA batch may legitimately invoke setFiles once per
+        // frozen file when the chooser is single-select. This guard only blocks
+        // a later CUA call that re-enters setFiles; it does not claim to count
+        // dynamic loop iterations or verify attachment identity/order.
+        if(browserTabCreateAttempts+creates>1)protectedAction='createBrowserTab';
+        else if(uploads>0&&browserSetFilesCallCount>0)protectedAction='setFiles';
+        browserTabCreateAttempts+=creates;browserSetFilesCallCount+=uploads>0?1:0;
+      }
       const effectiveKind=kind==='initialization'&&browserInitializationCalls>0?'business':kind;
       if(effectiveKind==='initialization')browserInitializationCalls+=1;
       if(effectiveKind==='cleanup')browserCleanupCalls+=1;else if(effectiveKind!=='initialization'){
@@ -553,19 +568,22 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
       const stage=stageHint||browserToolBusinessStage(event?.item?.arguments?.code||event?.item?.arguments?.command||'');
       const stageCount=browserBusinessStageCounts[stage]||0;
       const stageLimit=BROWSER_TOOL_STAGE_BUDGETS[stage]||BROWSER_TOOL_BUSINESS_CALL_BUDGET;
-      if(kind!=='cleanup'&&(browserBusinessCalls>BROWSER_TOOL_BUSINESS_CALL_BUDGET||stageCount>stageLimit)&&!budgetFailure){
-        const terminationDeferred=Boolean(deferTermination&&stage==='submit'&&submissionIntentObserved);
-        const record=writeBrowserToolBudget(dir,{observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,budgetKind:'business',stageName:stage,stageLimit,stageCount,stageCounts:browserBusinessStageCounts,submissionIntentObserved,terminationDeferred});
-        const reason=stageCount>stageLimit?`${stage} 阶段已达到 ${stageLimit} 次上限（第 ${stageCount} 次）`:`浏览器业务 CUA 调用已达到 ${BROWSER_TOOL_BUSINESS_CALL_BUDGET} 次总上限`;
-        budgetFailure={code:'BROWSER_TOOL_BUDGET_EXCEEDED',observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,limit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,stageName:stage,stageLimit,stageCount,stageCounts:{...browserBusinessStageCounts},submissionIntentObserved,terminationDeferred,message:terminationDeferred?`BROWSER_TOOL_BUDGET_EXCEEDED: ${reason}；发送调用已经开始，保留未知结果保护，不异步终止。`:`BROWSER_TOOL_BUDGET_EXCEEDED: ${reason}；本次业务调用已被父进程终止。`};
+      if(kind!=='cleanup'&&(protectedAction||browserBusinessCalls>BROWSER_TOOL_BUSINESS_CALL_BUDGET||stageCount>stageLimit)&&!budgetFailure){
+        // Budget enforcement interrupts the executor as soon as the over-limit
+        // item.started event is observed. Tool dispatch and browser side effects
+        // may race this event, so this cannot prove the call did not execute.
+        // Persisted submission intent therefore makes the outcome unknown and
+        // non-retryable; never defer termination to allow another send.
+        const terminationDeferred=false;
+        const record=writeBrowserToolBudget(dir,{observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,budgetKind:'business',stageName:stage,stageLimit,stageCount,stageCounts:browserBusinessStageCounts,protectedAction,submissionIntentObserved,terminationDeferred});
+        const reason=protectedAction?`${protectedAction} 只允许一次，本调用触发重复动作保护`:stageCount>stageLimit?`${stage} 阶段已达到 ${stageLimit} 次上限（第 ${stageCount} 次）`:`浏览器业务 CUA 调用已达到 ${BROWSER_TOOL_BUSINESS_CALL_BUDGET} 次总上限`;
+        const intentNotice=submissionIntentObserved?'已记录发送意图，结果按未知保护且禁止重发':'尚未记录发送意图';
+        budgetFailure={code:'BROWSER_TOOL_BUDGET_EXCEEDED',observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,limit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,stageName:stage,stageLimit,stageCount,stageCounts:{...browserBusinessStageCounts},protectedAction,submissionIntentObserved,terminationDeferred,message:`BROWSER_TOOL_BUDGET_EXCEEDED: ${reason}；${intentNotice}；父进程在观察到超限工具调用后请求中断执行器；工具分发与浏览器副作用可能存在竞态，不能据此证明该调用未执行。`};
         const budgetEvent={type:'browser_tool_budget_exceeded',errorCode:budgetFailure.code,observed:browserToolCalls,observedBusiness:browserBusinessCalls,observedCleanup:browserCleanupCalls,limit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,cleanupLimit:BROWSER_TOOL_CLEANUP_CALL_BUDGET,submissionIntentObserved,stage:record?.stage||(budgetFailure.submissionIntentObserved?'post_submission_intent':'pre_submission_intent')};
         budgetEvent.stageName=stage;budgetEvent.stageLimit=stageLimit;budgetEvent.stageCount=stageCount;budgetEvent.stageCounts={...browserBusinessStageCounts};
+        budgetEvent.protectedAction=protectedAction;
         budgetEvent.terminationDeferred=terminationDeferred;
         capturedEvents.push(budgetEvent);log.write(boundedEventLine(budgetEvent)+'\n');
-        // A submit item.started means the side effect may already be in
-        // flight. Killing it asynchronously can turn a real send into an
-        // unverifiable result. Preserve the conservative unknown-result path
-        // and let the already-started call reach its own completion instead.
         if(!terminationDeferred)stop();
       }
     };

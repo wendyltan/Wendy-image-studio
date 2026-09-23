@@ -39,10 +39,10 @@ export const OWNED_TAB_CLEANUP_STATUSES = Object.freeze([
   'orphaned',
 ]);
 
-// An orphaned tab is not a terminal fact: it means the worker lost its
-// browser handle before a same-tab close could be verified.  It must remain
-// eligible for the separate cleanup-only recovery path.  A verified close or
-// a close that actually threw is terminal for this run and cannot be rebound.
+// An orphaned tab means the worker lost its browser handle before a same-tab
+// close could be verified. A new executor cannot rebind the old CUA session,
+// so this state must remain visible as unresolved rather than being converted
+// to closing by a cleanup-only bookkeeping call.
 const TERMINAL_STATES = new Set(['closed_verified', 'close_unconfirmed']);
 const CREATED_OR_LATER_STATES = new Set(['created', 'uploading', 'uploaded', 'sent', 'generating', 'downloaded', 'closing']);
 const STATE_ORDER = new Map(OWNED_TAB_STATES.map((state, index) => [state, index]));
@@ -301,13 +301,12 @@ export function markOwnedTabStage({dir, runId, requestId, state, ownedTabId, ses
       error.code = 'OWNED_TAB_LEASE_TERMINAL';
       throw error;
     }
-    const cleanupRecovery = lease.state === 'orphaned' && nextState === 'closing' && ['cleanup_pending', 'not_observed', 'orphaned'].includes(lease.cleanupStatus);
-    if (lease.state === 'orphaned' && !cleanupRecovery) {
-      const error = new Error(`owned tab lease 已标记为 orphaned，只能进入 cleanup-only closing，不能回写 ${nextState}。`);
+    if (lease.state === 'orphaned') {
+      const error = new Error(`owned tab lease 已标记为 orphaned；新执行器无法重新绑定旧 CUA session，不能回写 ${nextState}。`);
       error.code = 'OWNED_TAB_ORPHANED_RECOVERY_REQUIRED';
       throw error;
     }
-    if (!cleanupRecovery && STATE_ORDER.get(nextState) < STATE_ORDER.get(lease.state)) {
+    if (STATE_ORDER.get(nextState) < STATE_ORDER.get(lease.state)) {
       const error = new Error(`owned tab lease 阶段不能回退：${lease.state} -> ${nextState}。`);
       error.code = 'OWNED_TAB_STAGE_REGRESSION';
       throw error;
@@ -328,7 +327,7 @@ export function markOwnedTabStage({dir, runId, requestId, state, ownedTabId, ses
       ownedTabId: text(ownedTabId) || lease.ownedTabId,
       sessionName: text(sessionName) || lease.sessionName,
       createdAt: createdAt || lease.createdAt || (nextState === 'created' ? now() : null),
-      cleanupStatus: cleanupRecovery ? 'cleanup_pending' : (nextState === 'created' ? 'open' : lease.cleanupStatus),
+      cleanupStatus: nextState === 'created' ? 'open' : lease.cleanupStatus,
     };
     return writeLease(file, lease, next);
   });
@@ -378,40 +377,16 @@ export function markOwnedTabCleanup({dir, runId, requestId, status, ownedTabId, 
 }
 
 /**
- * Mark an orphaned lease as entering the independent cleanup-only path.
- * This transition is intentionally local and identity-bound; it does not
- * inspect, navigate, or close a browser tab.  The cleanup executor must still
- * use the exact persisted ownedTabId and prove that the same handle's close()
- * returned successfully before the lease can become closed_verified.
+ * Kept as a fail-closed compatibility guard for callers from older code.
+ * Local bookkeeping cannot restore a CUA session or prove that a tab closed.
  */
 export function prepareOwnedTabCleanup({dir, runId, requestId, ownedTabId} = {}) {
   const expected = {runId: text(runId) || path.basename(path.resolve(String(dir || ''))), requestId};
-  return withLease(dir, expected, (file, current) => {
-    const lease = current ? normalizeLease(current, expected) : null;
-    if (!lease || !lease.ownedTabId) {
-      const error = new Error('cleanup-only 缺少可验证的本次 ownedTabId。');
-      error.code = 'OWNED_TAB_CLEANUP_ID_MISSING';
-      throw error;
-    }
-    assertOwnedTabMatch(lease, ownedTabId);
-    if (TERMINAL_STATES.has(lease.state)) {
-      const error = new Error(`owned tab lease 已进入终态 ${lease.state}，不能启动 cleanup-only：${lease.state}。`);
-      error.code = 'OWNED_TAB_CLEANUP_TERMINAL';
-      throw error;
-    }
-    if (!['orphaned', 'closing'].includes(lease.state)) {
-      const error = new Error(`cleanup-only 只接受 orphaned/closing lease，当前为 ${lease.state}。`);
-      error.code = 'OWNED_TAB_CLEANUP_STATE_INVALID';
-      throw error;
-    }
-    return writeLease(file, lease, {
-      state: 'closing',
-      ownedTabId: lease.ownedTabId,
-      cleanupStatus: 'cleanup_pending',
-      cleanupVerifiedAt: null,
-      cleanupError: null,
-    });
-  });
+  const lease = readOwnedTabLease(dir, expected);
+  if (lease) assertOwnedTabMatch(lease, ownedTabId);
+  const error = new Error('跨执行器 cleanup-only 无法恢复原 CUA session；保留 orphaned/cleanup_pending，只有原执行器持有的同一句柄返回 close 成功才能确认关闭。');
+  error.code = 'OWNED_TAB_CROSS_SESSION_UNAVAILABLE';
+  throw error;
 }
 
 /** Best-effort local close handshake when the child exits, aborts, or times out. */
@@ -425,7 +400,8 @@ export function finalizeOwnedTabLease({dir, runId, requestId, reason = 'executor
   // The Node parent cannot call CUA close.  A known handle therefore enters an
   // explicit cleanup_pending/orphaned state; close_failed is reserved for the
   // executor reporting that the same handle's close() actually threw.  The
-  // pending marker is what makes an unlock-time cleanup-only retry safe.
+  // pending marker is evidence of unresolved cleanup, not permission for a
+  // later executor to rebind or close this tab.
   const status = 'cleanup_pending';
   return markOwnedTabCleanup({
     dir,

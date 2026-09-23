@@ -50,7 +50,7 @@ export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,remoteProm
 - 旧版固定标签名示例 createBrowserTab("chrome",undefined,{sessionName:"🎨 温蒂生图"}) 仅用于识别历史记录，禁止执行；本次实际调用必须使用上面带 run token 的唯一 sessionName。
 - 若 createBrowserTab 或 tab.goto 出现 user declined、denied permission、browser security policy 等 chatgpt.com 站点源权限拒绝，必须执行 ${commands.originPermissionDenied}；这不是 BROWSER_CREATE_UNAVAILABLE，禁止上传或发送，也不要退回 IAB 或其他标签页重试。只有真正的 Chrome extension/浏览器能力不可用才记录 ${commands.browserCreateUnavailable} 或 BROWSER_FOCUS_UNAVAILABLE。
 - createBrowserTab 的 request-header policy 前置加载失败（例如“Unable to load browser request-header policy”）必须按 BROWSER_CREATE_UNAVAILABLE 处理：这不是 chatgpt.com 站点源权限拒绝，也不是导航已成功。该调用只允许尝试一次；无论错误提示是否写着 Retry，都不得盲目再次调用 createBrowserTab、cua.getTab、cua.listTabs 或创建第二个 tab，以免一次调用已经产生的自有 tab 漏泄成双 tab。若没有可确认归属的返回 tab，原子执行 ${commands.browserHandleLost}，保留真实的 ownedTabId 与 cleanup status，不能写成“tab 不存在”或“已关闭”；若已返回一个自有 tab，只继续使用它并在最后用同一 globalThis.__wendiOwnedTab 清理。
-- 如果 CUA kernel 在提交前重置、globalThis 变量丢失或句柄调用抛出无法继续的错误，先停止所有网页动作，再原子执行 ${commands.browserHandleLost}；必须把 kernel-reset=true、owned-tab-cleanup-status=cleanup_pending（除非同一持久句柄真实 close 返回成功）写入这次 pre-submission 失败。不要声称旧 tab 不存在、已被关闭或可以安全接管；父流程会在解锁后调用独立 cleanup-only 回收路径。
+- 如果 CUA kernel 在提交前重置、globalThis 变量丢失或句柄调用抛出无法继续的错误，先停止所有网页动作，再原子执行 ${commands.browserHandleLost}；必须把 kernel-reset=true、owned-tab-cleanup-status=cleanup_pending（除非同一持久句柄真实 close 返回成功）写入这次 pre-submission 失败。不要声称旧 tab 不存在、已被关闭或可以安全接管；新的 Codex 执行器不能重新绑定旧 CUA session，只有本执行器仍持有的原句柄能确认关闭。句柄丢失时保留 cleanup_pending，不得启动另一个 CUA session 试图接管。
 - owned tab 阶段必须同步写入本地 lease：创建成功后是 created；开始附件流程前执行 ${commands.ownedTabStage('uploading','<实际 ownedTabId>')}；所有附件 group 按冻结顺序完成且发送按钮 enabled 后执行 ${commands.ownedTabStage('uploaded','<实际 ownedTabId>')}；发送得到正向新用户消息或停止生成控件后执行 ${commands.ownedTabStage('sent','<实际 ownedTabId>')}；页面进入生成中执行 ${commands.ownedTabStage('generating','<实际 ownedTabId>')}；取得原图并复制到目标路径后执行 ${commands.ownedTabStage('downloaded','<实际 ownedTabId>')}。阶段写入失败必须停止网页动作并按对应失败矩阵记录，不能跳过或手工伪造。
 - 上传只能使用该 tab 的 Playwright 文件选择流程。provider 已完成并冻结下方五个（或本次明确列出的）附件路径，并完成普通文件、可读性、大小和 sha256 校验；执行器禁止再调用本地文件存在性/权限预检 API，也不得自行重建、排序、改写或猜测附件数组。只能按下方顺序把这些路径交给 chooser：多选时一次 setFiles，单选时按原顺序逐项 setFiles；不得手写/手打路径、截短 UUID 或从文字清单重构数组。
 - 附件上传是一个有界批次：最多 2 个 upload CUA 调用。首个上传脚本在同一 owned tab 内依序尝试有 chooser waiter 的路径 A 和必要时路径 B；路径 A 没有 chooser 时只能在这个脚本中继续 B，不得为每个入口另开调用。确定 chooser 后，把整个 provider 冻结附件数组交给 setFiles：多选时一次 setFiles，单选时在同一脚本中按冻结顺序逐项 setFiles；不得按附件逐个调用 CUA。若需要第二个 upload 调用，它只能用于对整批附件做一次有界核验/继续轮询并填入冻结提示词，不得重新打开 chooser、重复 setFiles 或补传部分附件。两个 upload 调用后仍不完整就执行 typed failure，禁止消耗其他阶段预算来继续上传。
@@ -63,7 +63,7 @@ export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,remoteProm
 - 参考文件必须作为彼此独立的附件上传并逐项确认。不得用截图代替附件。
 - 完成后必须下载网页生成的原始图片。网页截图、屏幕截图和程序绘制图片都不能作为结果。
 - 除写入下列目标图片和执行记录外，不修改本地文件。
-- CUA 输出必须保持紧凑：每次浏览器 CUA 调用可能自动附带截图并进入执行器上下文。运行时首次初始化只允许一次独立、精确的 await cua.getState()；它被单独记账，不消耗业务预算，重复调用仍按 bootstrap 计数。父进程按阶段设置有限业务预算：bootstrap（建 tab、单次目标导航、登录/聊天模式/创建图片入口及有界就绪恢复）最多 3 次，upload（整批上传、核验附件、填入 remotePrompt）最多 2 次，submit（ready、submission-intent 后的一次发送和正向确认）最多 1 次，wait_download（等待生成与 pageAssets 原图下载）最多 2 次；业务总上限仍为 8 次。正常 bootstrap 是 2 次（创建并记录 owned tab；导航到起始地址并在同一调用内等待/确认登录和 composer），只允许 1 次额外 bootstrap 调用在当前 URL 上做有界就绪/入口检查；此恢复调用不得重建 tab 或重发 goto。上传最多 2 次，路径 A/B、整批 setFiles、附件核验和填词必须合并；第二次调用仅可继续核验，禁止第二次 chooser/setFiles 或逐文件 CUA。另保留 1 个独立 cleanup/close 槽位；cleanup 槽位不计入业务槽，但只接受同时满足以下审计条件的最后清理调用：仍持有本次 owned tab、脚本包含固定标记 ${BROWSER_CLEANUP_MARKER}、已先写入 owned-tab 的 closing 阶段、并在同一 finally/固定收尾路径调用同一句柄的 close。普通业务脚本即使出现 close() 也按业务调用计数，不能伪装成 cleanup；cleanup 只能使用一次。不要为每个按钮或每个附件单独发起 CUA 调用。禁止调用 getScreenshot()、getAXStateAndScreenshot() 或 domSnapshot()。需要读取 DOM 时，只在当前脚本变量中调用 tab.getAXState({emit:false})，解析成布尔值、附件名称数组、数量、发送按钮状态、当前 URL 和错误摘要，再通过 nodeRepl.write(JSON.stringify(summary)) 返回；任何中间输出不得包含 AX 原文、页面截图、data:image/base64、完整侧边栏或提示词，单次摘要不超过 4KB。必须把导航、创建图片入口、路径 A/B、setFiles、附件核验和填词合并到尽可能少的 CUA 调用；通过 ready 后把 submission-intent 与紧接着的一次发送/正向确认合并到同一个最短 CUA 调用。完整截图/base64 不属于状态证据，禁止写入事件、回复或下一轮上下文。
+- CUA 输出必须保持紧凑：每次浏览器 CUA 调用可能自动附带截图并进入执行器上下文。运行时首次初始化只允许一次独立、精确的 await cua.getState()；它被单独记账，不消耗业务预算，重复调用仍按 bootstrap 计数。父进程按阶段设置有限业务预算：bootstrap（建 tab、单次目标导航、登录/聊天模式/创建图片入口及有界就绪恢复）最多 3 次，upload（整批上传、核验附件、填入 remotePrompt）最多 2 次，submit（ready、submission-intent 后的一次发送和正向确认）最多 1 次，wait_download（等待生成与 pageAssets 原图下载）最多 2 次；业务总上限仍为 8 次。正常 bootstrap 是 2 次（创建并记录 owned tab；导航到起始地址并在同一调用内等待/确认登录和 composer），只允许 1 次额外 bootstrap 调用在当前 URL 上做有界就绪/入口检查；此恢复调用不得重建 tab 或重发 goto。上传最多 2 次，路径 A/B、整批 setFiles、附件核验和填词必须合并；第二次调用仅可继续核验，禁止第二次 chooser/setFiles 或逐文件 CUA。另保留 1 个独立 cleanup/close 槽位；cleanup 槽位不计入业务槽，但只接受同时满足以下审计条件的最后清理调用：仍持有本次 owned tab、脚本包含固定标记 ${BROWSER_CLEANUP_MARKER}、已先写入 owned-tab 的 closing 阶段、并在同一 finally/固定收尾路径调用同一句柄的 close。普通业务脚本即使出现 close() 也按业务调用计数，不能伪装成 cleanup；cleanup 只能使用一次。不要为每个按钮或每个附件单独发起 CUA 调用。禁止调用 getScreenshot()、getAXStateAndScreenshot() 或 domSnapshot()。需要读取 DOM 时，只在当前脚本变量中调用 tab.getAXState({emit:false})，解析成布尔值、附件名称数组、数量、发送按钮状态、当前 URL 和错误摘要，再通过 nodeRepl.write(JSON.stringify(summary)) 返回；任何中间输出不得包含 AX 原文、页面截图、data:image/base64、完整侧边栏或提示词，单次摘要不超过 4KB。必须把导航、创建图片入口、路径 A/B、setFiles、附件核验和填词合并到尽可能少的 CUA 调用；通过 ready 后把 submission-intent 与紧接着的一次发送/正向确认合并到同一个最短 CUA 调用；但若父进程观察到超预算调用并中断执行器，不得声称后续 cleanup 槽位已运行或 tab 已关闭，必须保留未确认状态；若 submission-intent 已持久化，结果按未知保护并禁止重发。完整截图/base64 不属于状态证据，禁止写入事件、回复或下一轮上下文。
 
 失败阶段矩阵（必须按阶段写入完整字段，不得省略）：
 - 通用失败命令模板（必须替换为对应阶段的 typed 值）：${commands.failed}
@@ -78,7 +78,7 @@ export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,remoteProm
 1. 真正开始处理本次 requestId（${requestId||'由本地 provider 冻结'}），并使用下方已经冻结的 manifestFile、outputFile、附件路径和 remotePrompt。不要读取本地执行指令来重建这些值；不要把任何控制字段或附件路径写入 ChatGPT composer。未写入 accepted 前不得打开或准备网页、登录、上传附件。manifest 只能通过预置的原子生命周期 helper 更新，禁止手工拼接、覆盖或重建 JSON，也禁止改变或删除 projectId、projectVersion、taskId、target、requestId、runId、outputFile。先执行：
    ${commands.accepted}
    只有命令返回 JSON 中的 ok=true 后，才算 accepted 成功；helper 会从同一执行目录复核 request、worker、execution 和锁定身份并自行生成 ISO 时间。若 helper 失败，立即停止，不要用其他命令补写；若需记录失败，只执行上面的 typed failed helper。
-2. 父流程已经在启动执行器前持久完成 reserve-create；本步骤不得再次执行 reserve-create，也不得把 lease 从 creating 改回 not_created。第一次 CUA js 调用只执行一次 globalThis.__wendiOwnedTab=await cua.createBrowserTab("chrome",undefined,{sessionName:${JSON.stringify(resolvedSessionName)}})，把返回句柄的真实 id 记录到 globalThis.__wendiOwnedTabId，并立即执行 ${commands.ownedTabCreated('<实际 ownedTabId>','<本次 sessionName>')}；其中 &lt;实际 ownedTabId&gt; 必须来自返回句柄，禁止填占位符。只有 stage created 返回 ok=true 才能继续；不传入 visible，不创建第二个标签页。随后每一次独立 CUA 调用都先执行 const tab=globalThis.__wendiOwnedTab 并验证它仍然存在，再执行一次 await tab.goto(${JSON.stringify(startUrl)})。${conversation} 不依赖跨调用的 const tab，因为它不会持久保留。若页面仍处于加载态，只能在当前 URL 上发起一次额外、有界的 bootstrap 就绪检查，不得再次 goto 或 createBrowserTab；正常流程把导航、就绪等待、登录/聊天模式和创建图片入口确认合并在第二个 CUA 调用。逻辑上相当于 try { 使用 globalThis.__wendiOwnedTab } finally { 使用同一句柄清理 }，但这些块不能跨 CUA 调用伪造；业务调用结束或发生错误时，最后单独使用固定 cleanup CUA 调用；该调用必须包含 ${BROWSER_CLEANUP_MARKER}，先执行 ${commands.ownedTabStage('closing','<实际 ownedTabId>')}，再在 finally/固定收尾路径中用同一个 globalThis.__wendiOwnedTab 句柄执行 close。只有 close 返回成功才执行 ${commands.ownedTabCleanup('closed','<实际 ownedTabId>','')} 并记录 cleanup-status=closed，异常执行 ${commands.ownedTabCleanup('close_failed','<实际 ownedTabId>','<真实异常>','')}，句柄丢失执行 ${commands.ownedTabCleanup('not_observed','<实际或 unknown ownedTabId>','<真实句柄丢失原因>')}。普通业务调用中出现 close 不获得 cleanup 槽位。创建时 Chrome 可能短暂取得焦点，公开 CUA 没有焦点恢复接口，因此不得声称零焦点切换或后台隐藏。
+2. 父流程已经在启动执行器前持久完成 reserve-create；本步骤不得再次执行 reserve-create，也不得把 lease 从 creating 改回 not_created。第一次 CUA js 调用只执行一次 globalThis.__wendiOwnedTab=await cua.createBrowserTab("chrome",undefined,{sessionName:${JSON.stringify(resolvedSessionName)}})，把返回句柄的真实 id 记录到 globalThis.__wendiOwnedTabId，并立即执行 ${commands.ownedTabCreated('<实际 ownedTabId>','<本次 sessionName>')}；其中 &lt;实际 ownedTabId&gt; 必须来自返回句柄，禁止填占位符。只有 stage created 返回 ok=true 才能继续；不传入 visible，不创建第二个标签页。随后每一次独立 CUA 调用都先执行 const tab=globalThis.__wendiOwnedTab 并验证它仍然存在，再执行一次 await tab.goto(${JSON.stringify(startUrl)})。${conversation} 不依赖跨调用的 const tab，因为它不会持久保留。若页面仍处于加载态，只能在当前 URL 上发起一次额外、有界的 bootstrap 就绪检查，不得再次 goto 或 createBrowserTab；正常流程把导航、就绪等待、登录/聊天模式和创建图片入口确认合并在第二个 CUA 调用。逻辑上相当于 try { 使用 globalThis.__wendiOwnedTab } finally { 使用同一句柄清理 }，但这些块不能跨 CUA 调用伪造；业务调用结束或发生错误时，最后单独使用固定 cleanup CUA 调用；该调用必须包含 ${BROWSER_CLEANUP_MARKER}，先执行 ${commands.ownedTabStage('closing','<实际 ownedTabId>')}，再在 finally/固定收尾路径中用同一个 globalThis.__wendiOwnedTab 句柄执行 close。只有 close 返回成功才执行 ${commands.ownedTabCleanup('closed','<实际 ownedTabId>','')} 并记录 cleanup-status=closed，异常执行 ${commands.ownedTabCleanup('close_failed','<实际 ownedTabId>','<真实异常>','')}，句柄丢失执行 ${commands.ownedTabCleanup('not_observed','<实际或 unknown ownedTabId>','<真实句柄丢失原因>')}。预算超限后父进程可能立即中断本次执行器，不能声称随后的 cleanup 调用已运行；此时保留 orphaned/cleanup_pending，不得在新执行器恢复。普通业务调用中出现 close 不获得 cleanup 槽位。创建时 Chrome 可能短暂取得焦点，公开 CUA 没有焦点恢复接口，因此不得声称零焦点切换或后台隐藏。
 3. 在完成上一步导航的同一个 CUA 调用内，有界等待页面就绪并读取精简 AX 状态；不要用首屏占位内容判断登录。若存在“聊天/工作”切换，选择“聊天”并确认选中；不得在“工作”模式发送生图提示。确认已登录且聊天输入框可用，在添加菜单确认“创建图片”入口（需要时选择该模式）。若页面加载仍未完成，只允许一个额外 bootstrap 调用继续有界等待/核验当前 URL 和入口，不得重发导航；超时、登录按钮存在或无法进入本条任务所需会话时，执行对应 typed failure 并停止。开始附件前先执行 ${commands.ownedTabStage('uploading','<实际 ownedTabId>')}；按上一条两段式附件流程上传所有参考文件，并在每次菜单变化后重新读取当前 DOM 的精简 AX 状态；不得操作系统文件选择窗口。若脚本自身出现未定义模块、语法或运行时异常，立即执行 ${commands.workerScriptRuntimeError}，不要把它描述成附件入口或 chooser 不可用。
 4. 在发送聊天消息前，严格执行上面的附件完成门：附件 group 名称和数量、冻结数组顺序、上传状态和发送按钮必须全部通过；继续有界等待所有附件上传进度或“等待文件上传”状态消失，最长 240 秒，每次核对都在当前批处理脚本内用 tab.getAXState({emit:false}) 读取并记录精简阶段日志。只有发送按钮真实可用才能进入下一步；按钮仍 disabled 时禁止点击，也不得先执行 ready 或 submission-intent。通过附件完成门后先执行 ${commands.ownedTabStage('uploaded','<实际 ownedTabId>')}，再执行：
    ${commands.ready}
@@ -114,33 +114,9 @@ ${frozenRemotePrompt.prompt}
   return `${instruction}\n固定 cleanup 调用必须实际执行 await tab.close()，不得用其他 close 表达式替代。`.replace('；全部工作结束后，最后一次 CUA 调用才执行 await tab.close()', '；全部工作结束后，最后一次 CUA 调用才执行\nawait tab.close()');
 }
 
-/**
- * Build the independent recovery instruction used after a worker exits before
- * it can close its owned tab.  It deliberately has no navigation, upload,
- * send, download, or tab discovery path: the only allowed browser operation
- * is getTab for the exact lease-owned id followed by that same handle's close.
- */
+/** Retained only to explain why old-tab cleanup cannot run in a fresh CUA session. */
 export function ownedTabCleanupPrompt({manifestFile,runId,requestId,ownedTabId} = {}) {
-  const dir = path.dirname(path.resolve(manifestFile || '.'));
-  const commands = buildManifestCommands(manifestFile, {requestId, sessionName: null});
-  const resolvedRunId = String(runId || path.basename(dir));
+  const resolvedRunId = String(runId || path.basename(path.dirname(path.resolve(manifestFile || '.'))));
   const resolvedTabId = String(ownedTabId || 'unknown');
-  return `你是温蒂创作室的 cleanup-only 浏览器回收执行器。上一个执行器已经结束，本次只负责回收本次 run 的自有 Chrome 标签页，不得继续任何生图工作。
-
-硬约束：
-- CUA runtime 在本次独立执行器中可能刚重置。第一个 CUA js 调用必须单独且精确执行 await cua.getState() 来初始化运行环境；不检查、不输出、不使用它返回的浏览器或标签页信息，也不调用其他 API。此调用是初始化，不是发现、接管或操作标签页。
-- 初始化之后的 cleanup CUA 调用只允许使用 Chrome Computer Use 的 cua.getTab(${JSON.stringify(resolvedTabId)}, {browser:"chrome"}) 获取这个精确 ownedTabId；禁止 cua.listTabs、再次调用 cua.getState、cua.getBrowser、cua.createBrowserTab、导航、切换会话、上传、填词、发送、等待生成、下载、截图或接管其他标签页。getTab 失败表示本执行器无法观察这个精确标签页，必须如实留下 cleanup_pending；不得用其他 ID 搜索或把失败报告成已关闭。
-- 本次 runId 固定为 ${JSON.stringify(resolvedRunId)}，requestId 固定为 ${JSON.stringify(String(requestId || ''))}；不得猜测、替换或省略。
-- cleanup 前必须用 ${commands.ownedTabStage('closing', resolvedTabId)} 写入 closing；不要把任何其他 tab 标记为 closing。
-- 只在同一个返回句柄上执行 await tab.close()。只有 close() 返回成功后，才执行 ${commands.ownedTabCleanup('closed', resolvedTabId, '', 'exact-owned-tab-close-returned')}；不得凭 getTab 不存在、超时、锁屏或猜测写成 closed。
-- 如果 getTab 失败、Chrome 被锁定或 close 抛错，只执行 ${commands.ownedTabCleanup('cleanup_pending', resolvedTabId, '<真实原因>', '')}，保留 orphaned/cleanup_pending，供解锁后再次 cleanup-only；不要导航、重试创建 tab 或操作任何其他 tab。
-- 完成环境初始化后，本次必须只有一个 cleanup CUA 调用；该调用必须包含固定标记 ${BROWSER_CLEANUP_MARKER}，并把标记写成 JavaScript 注释；不要把它作为表达式执行。不输出截图、DOM、base64 或其他页面内容。
-
-固定 cleanup CUA 脚本结构（把真实错误写入 cleanup helper）：
-// ${BROWSER_CLEANUP_MARKER}
-let tab = null;
-try { tab = await cua.getTab(${JSON.stringify(resolvedTabId)}, {browser:"chrome"}); await tab.close(); /* 此后调用 closed helper */ }
-catch (error) { /* 输出真实错误摘要，此后调用 cleanup_pending helper 并停止 */ }
-
-完成后只返回 cleanup helper 的真实结果。`;
+  return `不能执行独立 cleanup-only 浏览器回收：Codex run ${JSON.stringify(resolvedRunId)} 已结束，新执行器无法通过 cua.getTab 重新绑定原执行器的 CUA session 或持久句柄。ownedTabId=${JSON.stringify(resolvedTabId)}，requestId=${JSON.stringify(String(requestId||''))} 仅用于审计身份，不代表新执行器可观察或关闭该标签页。禁止调用 cua.getTab、cua.listTabs、cua.createBrowserTab，禁止接管其他标签页；必须如实保留 orphaned/cleanup_pending。自动关闭只能发生在原执行器仍持有同一持久句柄时。`;
 }

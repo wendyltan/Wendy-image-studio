@@ -8,15 +8,16 @@ import {BROWSER_CLEANUP_MARKER,BROWSER_TOOL_BUSINESS_CALL_BUDGET,BROWSER_TOOL_CL
 
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'wendi-browser-budget-'));
 
-function fixture(mode){
+function fixture(mode,{lease=true}={}){
   const dir=fs.mkdtempSync(path.join(root,`${mode}-`)),bin=path.join(dir,'fixture-worker.mjs'),fifth=path.join(dir,'fifth-business'),closed=path.join(dir,'cleanup-call'),after=path.join(dir,'after-budget'),delayed=path.join(dir,'delayed-completed');
-  if(mode==='four-business-close'||mode==='close-abuse'||mode==='lifecycle-classification')fs.writeFileSync(path.join(dir,'owned-tab-lease.json'),JSON.stringify({schemaVersion:1,runId:path.basename(dir),requestId:'11111111-1111-4111-8111-111111111111',sessionName:'fixture',ownedTabId:'tab-fixture',createdAt:new Date().toISOString(),state:'created',cleanupStatus:'open',cleanupVerifiedAt:null,cleanupError:null,kernelReset:false,updatedAt:new Date().toISOString()}));
+  if(lease)fs.writeFileSync(path.join(dir,'owned-tab-lease.json'),JSON.stringify({schemaVersion:1,runId:path.basename(dir),requestId:'11111111-1111-4111-8111-111111111111',sessionName:'fixture',ownedTabId:'tab-fixture',createdAt:new Date().toISOString(),state:'created',cleanupStatus:'open',cleanupVerifiedAt:null,cleanupError:null,kernelReset:false,updatedAt:new Date().toISOString()}));
   const source=`#!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
 const dir=process.cwd();
 const runId=path.basename(process.cwd());
 const mode=${JSON.stringify(mode)};
+let uploadCallNumber=0;
 const fifth=${JSON.stringify(fifth)};
 const closed=${JSON.stringify(closed)};
 const after=${JSON.stringify(after)};
@@ -27,13 +28,32 @@ const emit=(index,code='noop')=>{const item=makeItem(index,code);console.log(JSO
 const emitStarted=(index,code='noop')=>{const item=makeItem(index,code);console.log(JSON.stringify({type:'item.started',item}));return item;};
 const emitCompleted=item=>console.log(JSON.stringify({type:'item.completed',item}));
 const emitIntentHelper=index=>{const item={id:'item_'+index,type:'command_execution',command:'node run-manifest.mjs submission-intent --manifest-file fixture/web-generation.json',aggregated_output:'{"ok":true,"submissionIntent":true}'};console.log(JSON.stringify({type:'item.started',item}));console.log(JSON.stringify({type:'item.completed',item}));};
-const calls=mode==='initialization-budget'?['init','create','navigation','entry','upload','upload','intent-helper','submit','download','download']:mode==='repeated-initialization'?['init','init','create','navigation','entry']:mode==='four-business-close'?['bootstrap','bootstrap','bootstrap','upload','close']:mode==='close-abuse'?['bootstrap','bootstrap','bootstrap','abuse','business']:mode==='lifecycle-classification'?['diagnostic-ax','entry-diagnostic','upload','submit','download','close']:mode==='pre-intent'?['bootstrap','bootstrap','bootstrap','upload','upload','upload']:mode==='post-intent'||mode==='post-intent-delayed'?['bootstrap','bootstrap','bootstrap','intent-helper','submit','submit']:mode==='intent-and-send'?['bootstrap','bootstrap','bootstrap','upload','intent-helper','submit']:['business','business','business','business','business'];
+const calls=mode==='initialization-budget'?['init','create','navigation','entry','upload','upload','intent-helper','submit','download','download']:mode==='repeated-initialization'?['init','init','create','navigation','entry']:mode==='four-business-close'?['bootstrap','bootstrap','bootstrap','upload','close']:mode==='close-abuse'?['bootstrap','bootstrap','bootstrap','abuse','business']:mode==='lifecycle-classification'?['diagnostic-ax','entry-diagnostic','upload','submit','download','close']:mode==='single-select-upload'?['duplicate-action']:mode==='duplicate-upload'?['upload','duplicate-action']:mode==='duplicate-create'?['duplicate-action']:mode==='pre-intent'?['bootstrap','bootstrap','bootstrap','upload','upload','upload']:mode==='post-intent'||mode==='post-intent-delayed'?['bootstrap','bootstrap','bootstrap','intent-helper','submit','submit']:mode==='intent-and-send'?['bootstrap','bootstrap','bootstrap','upload','intent-helper','submit']:['business','business','business','business','business'];
 let index=0;
-const next=()=>{const kind=calls[index];if(!kind){setTimeout(()=>{fs.writeFileSync(after,'1');process.exit(0)},800);return;}index+=1;if((mode==='four-business-close'||mode==='lifecycle-classification')&&kind!=='close'){const leaseFile=path.join(dir,'owned-tab-lease.json');const lease=JSON.parse(fs.readFileSync(leaseFile,'utf8'));lease.state=(kind==='upload'?'uploading':kind==='submit'?'uploaded':kind==='download'?'generating':'created');fs.writeFileSync(leaseFile,JSON.stringify(lease));if(mode==='lifecycle-classification'){const manifestFile=path.join(dir,'web-generation.json');let manifest={state:'accepted',submissionIntent:false,submitted:false};try{manifest=JSON.parse(fs.readFileSync(manifestFile,'utf8'))}catch{};if(kind==='submit')manifest.state='ready';if(kind==='download'){manifest.state='submitted';manifest.submissionIntent=true;manifest.submitted=true}fs.writeFileSync(manifestFile,JSON.stringify(manifest))}}if((index===5||index===6)&&kind==='business' || (mode==='pre-intent'&&index===6))fs.writeFileSync(fifth,'1');if(kind==='close'){const leaseFile=path.join(dir,'owned-tab-lease.json');const lease=JSON.parse(fs.readFileSync(leaseFile,'utf8'));lease.state='closing';fs.writeFileSync(leaseFile,JSON.stringify(lease));fs.writeFileSync(closed,'1');fs.writeFileSync(after,'1');emit(index,marker+'; await tab.close(); --run-id "'+runId+'" --owned-tab-id "tab-fixture" --state closing;');setTimeout(()=>process.exit(0),120);return;}if(kind==='abuse')emit(index,marker+'; await tab.close(); --run-id "'+runId+'" --owned-tab-id "tab-fixture" --state closing;');else if(kind==='intent-helper')emitIntentHelper(index);else if(kind==='submit'&&mode==='post-intent-delayed'&&index===6){const item=emitStarted(index,'const send=tab.playwright.getByRole("button",{name:/发送提示词/}); await send.click();');setTimeout(()=>{emitCompleted(item);fs.writeFileSync(delayed,'1');next();},700);return;}else if(kind==='submit')emit(index,'const send=tab.playwright.getByRole("button",{name:/发送提示词/}); await send.click();');else if(kind==='upload')emit(index,'await chooser.setFiles(files); const send=tab.playwright.getByRole("button",{name:/发送提示词/}); const sendEnabled=await send.isEnabled();');else if(kind==='init')emit(index,'await cua.getState()');else if(kind==='create')emit(index,'globalThis.__wendiOwnedTab=await cua.createBrowserTab("chrome",undefined,{sessionName:"fixture"})');else if(kind==='navigation')emit(index,'await tab.goto("https://chatgpt.com"); await tab.getAXState({emit:false})');else if(kind==='entry')emit(index,'login chat mode composer 创建图片');else if(kind==='download')emit(index,'const inventory=await pageAssets.list()');else if(kind==='diagnostic-ax')emit(index,'const ax=await tab.getAXState({emit:false}); const copy="prompt-textarea composer uploading"; return {ax,copy};');else if(kind==='entry-diagnostic')emit(index,'const ax=await tab.getAXState({emit:false}); const hasComposer=/prompt-textarea|composer/.test(String(ax));');else emit(index,kind==='business'?'noop':kind);setTimeout(next,60)};
+const next=()=>{const kind=calls[index];if(!kind){setTimeout(()=>{fs.writeFileSync(after,'1');process.exit(0)},800);return;}index+=1;if(kind!=='close'){const leaseFile=path.join(dir,'owned-tab-lease.json');const lease=JSON.parse(fs.readFileSync(leaseFile,'utf8'));lease.state=(kind==='upload'?'uploading':kind==='submit'?'uploaded':kind==='download'?'generating':'created');fs.writeFileSync(leaseFile,JSON.stringify(lease));if(mode==='lifecycle-classification'){const manifestFile=path.join(dir,'web-generation.json');let manifest={state:'accepted',submissionIntent:false,submitted:false};try{manifest=JSON.parse(fs.readFileSync(manifestFile,'utf8'))}catch{};if(kind==='submit')manifest.state='ready';if(kind==='download'){manifest.state='submitted';manifest.submissionIntent=true;manifest.submitted=true}fs.writeFileSync(manifestFile,JSON.stringify(manifest))}}if((index===5||index===6)&&kind==='business' || (mode==='pre-intent'&&index===6))fs.writeFileSync(fifth,'1');if(kind==='close'){const leaseFile=path.join(dir,'owned-tab-lease.json');const lease=JSON.parse(fs.readFileSync(leaseFile,'utf8'));lease.state='closing';fs.writeFileSync(leaseFile,JSON.stringify(lease));fs.writeFileSync(closed,'1');fs.writeFileSync(after,'1');emit(index,marker+'; await tab.close(); --run-id "'+runId+'" --owned-tab-id "tab-fixture" --state closing;');setTimeout(()=>process.exit(0),120);return;}if(kind==='abuse')emit(index,marker+'; await tab.close(); --run-id "'+runId+'" --owned-tab-id "tab-fixture" --state closing;');else if(kind==='intent-helper')emitIntentHelper(index);else if(kind==='submit'&&mode==='post-intent-delayed'&&index===6){const item=emitStarted(index,'const send=tab.playwright.getByRole("button",{name:/发送提示词/}); await send.click();');setTimeout(()=>{emitCompleted(item);fs.writeFileSync(delayed,'1');next();},700);return;}else if(kind==='submit')emit(index,'const send=tab.playwright.getByRole("button",{name:/发送提示词/}); await send.click();');else if(kind==='duplicate-action'&&mode==='duplicate-upload')emit(index,'await chooser.setFiles(files); await chooser.setFiles(files);');else if(kind==='duplicate-action'&&mode==='duplicate-create')emit(index,'await cua.createBrowserTab("chrome",undefined,{sessionName:"one"}); await cua.createBrowserTab("chrome",undefined,{sessionName:"two"});');else if(kind==='upload'){uploadCallNumber+=1;emit(index,uploadCallNumber===1?'await chooser.setFiles(files); const send=tab.playwright.getByRole("button",{name:/发送提示词/}); const sendEnabled=await send.isEnabled();':'const observed=await tab.getAXState({emit:false}); const sendEnabled=/send/.test(String(observed));')}else if(kind==='init')emit(index,'await cua.getState()');else if(kind==='create')emit(index,'globalThis.__wendiOwnedTab=await cua.createBrowserTab("chrome",undefined,{sessionName:"fixture"})');else if(kind==='navigation')emit(index,'await tab.goto("https://chatgpt.com"); await tab.getAXState({emit:false})');else if(kind==='entry')emit(index,'login chat mode composer 创建图片');else if(kind==='download')emit(index,'const inventory=await pageAssets.list()');else if(kind==='diagnostic-ax')emit(index,'const ax=await tab.getAXState({emit:false}); const copy="prompt-textarea composer uploading"; return {ax,copy};');else if(kind==='entry-diagnostic')emit(index,'const ax=await tab.getAXState({emit:false}); const hasComposer=/prompt-textarea|composer/.test(String(ax));');else emit(index,kind==='business'?'noop':kind);setTimeout(next,60)};
 next();
 `;
   fs.writeFileSync(bin,source,{mode:0o755});
   return {dir,codexBin:bin,fifth,closed,after,delayed};
+}
+
+function actionCallsFixture(codes){
+  const dir=fs.mkdtempSync(path.join(root,'action-calls-')),bin=path.join(dir,'fixture-worker.mjs'),after=path.join(dir,'after-actions');
+  const source=`#!/usr/bin/env node
+import fs from 'node:fs';
+const codes=${JSON.stringify(codes)};
+const after=${JSON.stringify(after)};
+for(let i=0;i<codes.length;i++){
+  const item={id:'action_'+i,type:'mcp_tool_call',server:'cua_repl',tool:'js',arguments:{code:codes[i]}};
+  console.log(JSON.stringify({type:'item.started',item}));
+  await new Promise(resolve=>setTimeout(resolve,150));
+  console.log(JSON.stringify({type:'item.completed',item}));
+}
+fs.writeFileSync(after,'1');
+process.exit(0);
+`;
+  fs.writeFileSync(bin,source,{mode:0o755});
+  return {dir,codexBin:bin,after};
 }
 
 async function flush(){await new Promise(resolve=>setImmediate(resolve));}
@@ -139,7 +159,7 @@ test('a close without the fixed marker and closing phase cannot use the cleanup 
 });
 
 test('pre-intent budget exhaustion becomes a safe retryable manifest failure',async()=>{
-  const run=fixture('pre-intent'),reference=path.join(run.dir,'reference.png'),output=path.join(run.dir,'out.png');
+  const run=fixture('pre-intent',{lease:false}),reference=path.join(run.dir,'reference.png'),output=path.join(run.dir,'out.png');
   fs.writeFileSync(reference,'fixture-reference');
   await assert.rejects(dispatchChatGptWebJob({codexBin:run.codexBin,dir:run.dir,outputFile:output,prompt:'fixture',referenceFiles:[reference],timeoutMs:5000}),error=>error.code==='BROWSER_TOOL_BUDGET_EXCEEDED'&&error.webManifest?.submitted===false&&error.webManifest?.preSubmissionFailure===true);
   const manifest=JSON.parse(fs.readFileSync(path.join(run.dir,'web-generation.json'),'utf8'));
@@ -147,7 +167,7 @@ test('pre-intent budget exhaustion becomes a safe retryable manifest failure',as
 });
 
 test('budget exhaustion after submission intent is persisted as unknown and never as pre-submission failure',async()=>{
-  const run=fixture('post-intent'),reference=path.join(run.dir,'reference.png'),output=path.join(run.dir,'out.png');
+  const run=fixture('post-intent',{lease:false}),reference=path.join(run.dir,'reference.png'),output=path.join(run.dir,'out.png');
   fs.writeFileSync(reference,'fixture-reference');
   await assert.rejects(dispatchChatGptWebJob({codexBin:run.codexBin,dir:run.dir,outputFile:output,prompt:'fixture',referenceFiles:[reference],timeoutMs:5000}),error=>error.code==='BROWSER_TOOL_BUDGET_EXCEEDED'&&error.webManifest?.submitted===true&&error.webManifest?.submissionUncertain===true);
   const manifest=JSON.parse(fs.readFileSync(path.join(run.dir,'web-generation.json'),'utf8'));
@@ -155,13 +175,35 @@ test('budget exhaustion after submission intent is persisted as unknown and neve
   const budget=readBrowserToolBudget(run.dir);assert.equal(budget.submissionIntentObserved,true);assert.equal(budget.stage,'post_submission_intent');
 });
 
-test('a submit call already started is not asynchronously killed by the stage budget',async()=>{
+test('an over-budget submit triggers parent interruption, with post-intent result treated as unknown',async()=>{
   const run=fixture('post-intent-delayed');
-  await assert.rejects(runCodex({codexBin:run.codexBin,dir:run.dir,prompt:'fixture',browserMode:'chrome',timeoutMs:5000}),error=>error.code==='BROWSER_TOOL_BUDGET_EXCEEDED'&&error.terminationDeferred===true);
-  assert.equal(fs.existsSync(run.delayed),true);
-  assert.equal(fs.existsSync(run.after),true);
+  await assert.rejects(runCodex({codexBin:run.codexBin,dir:run.dir,prompt:'fixture',browserMode:'chrome',timeoutMs:5000}),error=>error.code==='BROWSER_TOOL_BUDGET_EXCEEDED'&&error.terminationDeferred===false&&error.submissionIntentObserved===true&&/竞态.*不能据此证明该调用未执行/.test(error.message));
+  assert.equal(fs.existsSync(run.delayed),false);
+  assert.equal(fs.existsSync(run.after),false);
   const budget=readBrowserToolBudget(run.dir);
-  assert.equal(budget.terminationDeferred,true);
+  assert.equal(budget.terminationDeferred,false);
   const events=persistedEvents(run.dir);
-  assert.ok(events.some(event=>event.type==='browser_tool_budget_exceeded'&&event.terminationDeferred===true));
+  assert.ok(events.some(event=>event.type==='browser_tool_budget_exceeded'&&event.terminationDeferred===false&&event.submissionIntentObserved===true));
+});
+
+test('one batch may call setFiles repeatedly for the single-select attachment path',async()=>{
+  const run=actionCallsFixture(['const multiple=await chooser.isMultiple(); if(!multiple){for(const file of files) await chooser.setFiles([file]);}']);
+  const result=await runCodex({codexBin:run.codexBin,dir:run.dir,prompt:'fixture',browserMode:'chrome',timeoutMs:5000});
+  assert.equal(result.text,'');
+  assert.equal(fs.existsSync(run.after),true);
+  assert.equal(readBrowserToolBudget(run.dir),null);
+});
+
+test('a later CUA call cannot re-enter setFiles after the batch began',async()=>{
+  const run=actionCallsFixture(['await chooser.setFiles(files);','await chooser.setFiles(files);']);
+  await assert.rejects(runCodex({codexBin:run.codexBin,dir:run.dir,prompt:'fixture',browserMode:'chrome',timeoutMs:5000}),error=>error.code==='BROWSER_TOOL_BUDGET_EXCEEDED'&&error.protectedAction==='setFiles'&&error.submissionIntentObserved===false);
+  assert.equal(fs.existsSync(run.after),false);
+  assert.equal(readBrowserToolBudget(run.dir).protectedAction,'setFiles');
+});
+
+test('one browser script cannot create more than one owned tab',async()=>{
+  const run=fixture('duplicate-create');
+  await assert.rejects(runCodex({codexBin:run.codexBin,dir:run.dir,prompt:'fixture',browserMode:'chrome',timeoutMs:5000}),error=>error.code==='BROWSER_TOOL_BUDGET_EXCEEDED'&&error.protectedAction==='createBrowserTab');
+  assert.equal(fs.existsSync(run.after),false);
+  assert.equal(readBrowserToolBudget(run.dir).protectedAction,'createBrowserTab');
 });
