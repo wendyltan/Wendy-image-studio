@@ -258,6 +258,21 @@ test('completed browser lease does not become the current global warning', () =>
   );
 });
 
+test('orphaned and cleanup-pending tabs remain explicitly unconfirmed', () => {
+  const status = fs.readFileSync(
+    path.join(appRoot, 'app/studio/workflow-status.tsx'),
+    'utf8',
+  );
+  assert.match(
+    status,
+    /orphaned:\s*'专用标签页关闭未确认，可能仍留在 Chrome；本次没有自动接管或关闭其他标签页'/,
+  );
+  assert.match(status, /cleanup_pending:\s*'专用标签页关闭未确认/);
+  assert.match(status, /\['close_unconfirmed', 'cleanup_pending', 'orphaned'\]/);
+  assert.match(status, /pendingCleanupState === 'cleanup_pending'/);
+  assert.doesNotMatch(status, /orphaned:\s*'[^']*已关闭并核实/);
+});
+
 test('formal panel decision stays beside its source image and collapses when local cover can absorb a tiny ratio gap', () => {
   assert.match(studioSources, /className="panel-decision-card compact"/);
   assert.match(studioSources, /panel-decision-card urgent/);

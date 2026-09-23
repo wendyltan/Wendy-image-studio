@@ -128,9 +128,12 @@ export function WorkflowStatus({
     'review_required',
     'review_failed',
   ].includes(task?.status || '');
+  const pendingCleanupState = project.pending?.cleanupStatus;
   const ownedTabState =
     project.pending?.ownedTabState ||
-    (taskLeaseRelevant
+    (pendingCleanupState === 'cleanup_pending'
+      ? 'cleanup_pending'
+      : taskLeaseRelevant
       ? task?.ownedTabState ||
         (typeof task?.webTimings?.ownedTabState === 'string'
           ? task.webTimings.ownedTabState
@@ -147,8 +150,12 @@ export function WorkflowStatus({
     downloaded: '原图已下载，正在收尾',
     closing: '正在关闭专用标签页',
     closed_verified: '专用标签页已关闭并核实',
-    close_unconfirmed: '专用标签页关闭未确认',
-    orphaned: '专用标签页句柄未观察到，不能确认已关闭',
+    close_unconfirmed:
+      '专用标签页关闭未确认，可能仍留在 Chrome；本次没有自动接管或关闭其他标签页',
+    cleanup_pending:
+      '专用标签页关闭未确认，可能仍留在 Chrome；本次没有自动接管或关闭其他标签页',
+    orphaned:
+      '专用标签页关闭未确认，可能仍留在 Chrome；本次没有自动接管或关闭其他标签页',
   };
   const ownedTabText = ownedTabState
     ? ownedTabLabels[ownedTabState] || '专用标签页状态未知'
@@ -250,7 +257,8 @@ export function WorkflowStatus({
     webFailureMessages[String(task?.errorCode || project.lastFailure?.kind || '')] ||
     (ownedTabState === 'uploading' || ownedTabState === 'uploaded'
       ? `${ownedTabText}；尚未发送消息`
-      : ownedTabText && ['close_unconfirmed', 'orphaned'].includes(ownedTabState)
+      : ownedTabText &&
+          ['close_unconfirmed', 'cleanup_pending', 'orphaned'].includes(ownedTabState)
         ? ownedTabText
         : '') ||
     (recoveredExecutorIssue
