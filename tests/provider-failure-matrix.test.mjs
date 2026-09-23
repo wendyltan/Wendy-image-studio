@@ -187,6 +187,37 @@ test('executor instructions bind provider-frozen references and gate send on eve
   assert.match(instruction,/从电脑上传[\s\S]*重新创建一个全新的有界 waiter/);
 });
 
+test('existing conversation is the sole initial navigation target and readiness is bounded in-call',()=>{
+  const target='https://chatgpt.com/c/existing-conversation';
+  const instruction=chatGptWebImagePrompt({outputFile:'/tmp/out.png',manifestFile:'/tmp/run/web-generation.json',prompt:'fixture',conversationUrl:target});
+  assert.match(instruction,/await tab\.goto\("https:\/\/chatgpt\.com\/c\/existing-conversation"\)/);
+  assert.doesNotMatch(instruction,/await tab\.goto\("https:\/\/chatgpt\.com"\)/);
+  assert.match(instruction,/只允许一次 goto[\s\S]*同一调用中有界读取/);
+  assert.match(instruction,/bootstrap.*最多 3 次/);
+});
+
+test('conversationUrl rejects non-ChatGPT origins, non-conversation paths, HTTP, and lookalike domains',()=>{
+  const invalidUrls=[
+    'https://example.com/c/conversation',
+    'https://chatgpt.com/',
+    'http://chatgpt.com/c/conversation',
+    'https://chatgpt.com.evil.example/c/conversation',
+    'https://notchatgpt.com/c/conversation',
+  ];
+  for(const conversationUrl of invalidUrls){
+    assert.throws(()=>chatGptWebImagePrompt({outputFile:'/tmp/out.png',manifestFile:'/tmp/run/web-generation.json',prompt:'fixture',conversationUrl}),/conversationUrl/);
+  }
+});
+
+test('all frozen references are attached and verified in a bounded upload batch',()=>{
+  const refs=['/tmp/a.png','/tmp/b.png','/tmp/c.png','/tmp/d.png','/tmp/e.png'];
+  const instruction=chatGptWebImagePrompt({outputFile:'/tmp/out.png',manifestFile:'/tmp/run/web-generation.json',prompt:'fixture',referenceFiles:refs});
+  assert.match(instruction,/多选时一次 setFiles/);
+  assert.match(instruction,/首个上传脚本[\s\S]*整个 provider 冻结附件数组/);
+  assert.match(instruction,/不得按附件逐个调用 CUA/);
+  assert.match(instruction,/upload.*最多 2 次/);
+});
+
 test('executor retrieves the original generated media through page assets',()=>{
   const instruction=chatGptWebImagePrompt({
     outputFile:'/tmp/out.png',

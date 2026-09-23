@@ -27,6 +27,8 @@ test('automatic cleanup uses an isolated executor directory and the exact lease 
     assert.equal(path.resolve(args.leaseDir),path.resolve(run.dir));
     assert.equal(args.runIdOverride,run.runId);
     const script=args.prompt.slice(args.prompt.indexOf('WENDI_OWNED_TAB_CLEANUP_V1'));
+    assert.match(args.prompt,/第一个 CUA js 调用必须单独且精确执行 await cua\.getState\(\)/);
+    assert.match(args.prompt,/之后的 cleanup CUA 调用[\s\S]*cua\.getTab\("tab-owned", \{browser:"chrome"\}\)/);
     assert.match(script,/cua\.getTab\("tab-owned"/);
     assert.doesNotMatch(script,/cua\.createBrowserTab|cua\.listTabs|tab\.goto|setFiles|filechooser|pageAssets|tab\.playwright/);
     markOwnedTabCleanup({dir:run.dir,runId:run.runId,requestId:run.requestId,status:'closed',ownedTabId:'tab-owned',verification:'exact-owned-tab-close-returned'});
@@ -46,6 +48,9 @@ test('cleanup marker is emitted as a harmless JavaScript comment',()=>{
   assert.match(script,/\/\/ WENDI_OWNED_TAB_CLEANUP_V1/);
   assert.doesNotMatch(script,/^WENDI_OWNED_TAB_CLEANUP_V1$/m);
   assert.match(script,/cua\.getTab\("tab-owned", \{browser:"chrome"\}\)/);
+  assert.match(prompt,/await cua\.getState\(\)/);
+  assert.match(script,/try \{ tab = await cua\.getTab[\s\S]*await tab\.close\(\)/);
+  assert.match(script,/catch \(error\)[\s\S]*cleanup_pending helper/);
   assert.match(script,/await tab\.close\(\)/);
 });
 
