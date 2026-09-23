@@ -362,6 +362,27 @@ function archiveConfirmedUnsentAttempt(dir,manifest,execution,audit){
   return path.relative(dir,archive);
 }
 
+function onlyStandaloneCuaInitialization({dir,runId,requestId,execution,eventsFile}={}){
+  if(execution?.browserToolCallCount!==1||execution?.browserInitializationCallCount!==1||execution?.browserBusinessCallCount!==0||execution?.browserCleanupCallCount!==0||execution?.browserToolBudgetExceeded!==false||execution?.submissionIntentObserved!==false)return false;
+  if(Object.keys(execution.browserBusinessStageCounts||{}).length!==0)return false;
+  const lease=readOwnedTabLease(dir,{runId,requestId});
+  if(!lease||lease.runId!==runId||lease.requestId!==requestId||lease.state!=='creating'||lease.ownedTabId||lease.cleanupStatus!=='not_attempted'||lease.createdAt||lease.cleanupVerifiedAt||lease.cleanupError||lease.kernelReset)return false;
+  if(!fs.existsSync(eventsFile))return false;
+  const lines=fs.readFileSync(eventsFile,'utf8').split(/\r?\n/).filter(Boolean);if(!lines.length)return false;
+  const calls=new Map();
+  for(const line of lines){
+    let event;try{event=JSON.parse(line);}catch{return false;}
+    const item=event?.item;
+    if(item?.type==='mcp_tool_call'){
+      const code=String(item.arguments?.code||'');
+      if(!/^(?:cua_repl|mcp__cua_repl)$/i.test(String(item.server||''))||!/^js$/i.test(String(item.tool||''))||!/^[\w.-]+$/.test(String(item.id||''))||!/^\s*await\s+cua\.getState\(\)\s*;?\s*$/.test(code)||!['item.started','item.completed'].includes(event.type))return false;
+      const phases=calls.get(item.id)||new Set();if(phases.has(event.type))return false;phases.add(event.type);calls.set(item.id,phases);
+    }else if(item?.type==='command_execution'||item?.type==='local_shell_call'||item?.type==='mcp_tool_call')return false;
+    if(event?.type==='browser_tool_budget_exceeded')return false;
+  }
+  return calls.size===1;
+}
+
 function assertExpectedIdentity(expected,request,worker,manifest,{dir=null,outputFile=null}={}){
   if(dir){
     const record=readRunIdentity(dir,{strict:true}),comparison=compareRunIdentity({record,expected:{...expected,...(outputFile?{outputFile}: {})}});
@@ -510,7 +531,9 @@ export async function resumeChatGptWebJob({codexBin,dir,signal,timeoutMs=900000,
   if(!preAcceptance&&!audit)throw new Error('这次请求既不是接受前额度暂停，也没有严格匹配的网页未发送核验；不会上传或发送。');
   const usageText=`${execution.error||''}\n${fs.existsSync(eventsFile)?fs.readFileSync(eventsFile,'utf8'):''}`;
   if(preAcceptance&&execution.state!=='failed'||preAcceptance&&!/(?:you'?ve hit your usage limit|usage limit(?: has been)? reached|rate limit reached|额度(?:已用尽|不足|限制)|使用额度(?:已用尽|不足)|hit your limit)/i.test(usageText))throw new Error('没有找到本次请求在接受前被额度限制拦下的证据；不会上传或发送。');
-  if(preAcceptance&&(/"type"\s*:\s*"mcp_tool_call"/.test(usageText)||fs.existsSync(outputFile)))throw new Error('本次请求可能已经开始浏览器操作或已有输出，不能自动续接。');
+  const browserActivityRecorded=/"type"\s*:\s*"mcp_tool_call"/.test(usageText)||Number(execution.browserToolCallCount)>0||Number(execution.browserBusinessCallCount)>0||Number(execution.browserCleanupCallCount)>0||Number(execution.browserInitializationCallCount)>0;
+  const initializationOnly=preAcceptance&&browserActivityRecorded&&onlyStandaloneCuaInitialization({dir,runId:path.basename(path.resolve(dir)),requestId,execution,eventsFile});
+  if(preAcceptance&&(fs.existsSync(outputFile)||(browserActivityRecorded&&!initializationOnly)))throw new Error('本次请求已有浏览器调用或输出，但无法严格证明它只有无副作用的 CUA 初始化读取，不能自动续接。');
   if(worker.executorModel&&model&&worker.executorModel!==model)throw new Error('待续接请求的执行器模型已变化；不会重新执行。');
   if(worker.executorReasoningEffort&&reasoningEffort&&worker.executorReasoningEffort!==reasoningEffort)throw new Error('待续接请求的执行器思考力度已变化；不会重新执行。');
   if(worker.role&&role&&worker.role!==role)throw new Error('待续接请求的执行器角色已变化；不会重新执行。');
