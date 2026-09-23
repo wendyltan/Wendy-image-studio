@@ -10,7 +10,7 @@ const root=fs.mkdtempSync(path.join(os.tmpdir(),'wendi-browser-budget-'));
 
 function fixture(mode){
   const dir=fs.mkdtempSync(path.join(root,`${mode}-`)),bin=path.join(dir,'fixture-worker.mjs'),fifth=path.join(dir,'fifth-business'),closed=path.join(dir,'cleanup-call'),after=path.join(dir,'after-budget'),delayed=path.join(dir,'delayed-completed');
-  if(mode==='four-business-close'||mode==='close-abuse')fs.writeFileSync(path.join(dir,'owned-tab-lease.json'),JSON.stringify({schemaVersion:1,runId:path.basename(dir),requestId:'11111111-1111-4111-8111-111111111111',sessionName:'fixture',ownedTabId:'tab-fixture',createdAt:new Date().toISOString(),state:mode==='four-business-close'?'downloaded':'created',cleanupStatus:'open',cleanupVerifiedAt:null,cleanupError:null,kernelReset:false,updatedAt:new Date().toISOString()}));
+  if(mode==='four-business-close'||mode==='close-abuse'||mode==='lifecycle-classification')fs.writeFileSync(path.join(dir,'owned-tab-lease.json'),JSON.stringify({schemaVersion:1,runId:path.basename(dir),requestId:'11111111-1111-4111-8111-111111111111',sessionName:'fixture',ownedTabId:'tab-fixture',createdAt:new Date().toISOString(),state:'created',cleanupStatus:'open',cleanupVerifiedAt:null,cleanupError:null,kernelReset:false,updatedAt:new Date().toISOString()}));
   const source=`#!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
@@ -27,9 +27,9 @@ const emit=(index,code='noop')=>{const item=makeItem(index,code);console.log(JSO
 const emitStarted=(index,code='noop')=>{const item=makeItem(index,code);console.log(JSON.stringify({type:'item.started',item}));return item;};
 const emitCompleted=item=>console.log(JSON.stringify({type:'item.completed',item}));
 const emitIntentHelper=index=>{const item={id:'item_'+index,type:'command_execution',command:'node run-manifest.mjs submission-intent --manifest-file fixture/web-generation.json',aggregated_output:'{"ok":true,"submissionIntent":true}'};console.log(JSON.stringify({type:'item.started',item}));console.log(JSON.stringify({type:'item.completed',item}));};
-const calls=mode==='initialization-budget'?['init','create','navigation','entry','upload','upload','intent-helper','submit','download','download']:mode==='repeated-initialization'?['init','init','create','navigation','entry']:mode==='four-business-close'?['bootstrap','bootstrap','bootstrap','upload','close']:mode==='close-abuse'?['bootstrap','bootstrap','bootstrap','abuse','business']:mode==='pre-intent'?['bootstrap','bootstrap','bootstrap','upload','upload','upload']:mode==='post-intent'||mode==='post-intent-delayed'?['bootstrap','bootstrap','bootstrap','intent-helper','submit','submit']:mode==='intent-and-send'?['bootstrap','bootstrap','bootstrap','upload','intent-helper','submit']:['business','business','business','business','business'];
+const calls=mode==='initialization-budget'?['init','create','navigation','entry','upload','upload','intent-helper','submit','download','download']:mode==='repeated-initialization'?['init','init','create','navigation','entry']:mode==='four-business-close'?['bootstrap','bootstrap','bootstrap','upload','close']:mode==='close-abuse'?['bootstrap','bootstrap','bootstrap','abuse','business']:mode==='lifecycle-classification'?['diagnostic-ax','entry-diagnostic','upload','submit','download','close']:mode==='pre-intent'?['bootstrap','bootstrap','bootstrap','upload','upload','upload']:mode==='post-intent'||mode==='post-intent-delayed'?['bootstrap','bootstrap','bootstrap','intent-helper','submit','submit']:mode==='intent-and-send'?['bootstrap','bootstrap','bootstrap','upload','intent-helper','submit']:['business','business','business','business','business'];
 let index=0;
-const next=()=>{const kind=calls[index];if(!kind){setTimeout(()=>{fs.writeFileSync(after,'1');process.exit(0)},800);return;}index+=1;if((index===5||index===6)&&kind==='business' || (mode==='pre-intent'&&index===6))fs.writeFileSync(fifth,'1');if(kind==='close'){const leaseFile=path.join(dir,'owned-tab-lease.json');const lease=JSON.parse(fs.readFileSync(leaseFile,'utf8'));lease.state='closing';fs.writeFileSync(leaseFile,JSON.stringify(lease));fs.writeFileSync(closed,'1');fs.writeFileSync(after,'1');emit(index,marker+'; await tab.close(); --run-id "'+runId+'" --owned-tab-id "tab-fixture" --state closing;');setTimeout(()=>process.exit(0),120);return;}if(kind==='abuse')emit(index,marker+'; await tab.close(); --run-id "'+runId+'" --owned-tab-id "tab-fixture" --state closing;');else if(kind==='intent-helper')emitIntentHelper(index);else if(kind==='submit'&&mode==='post-intent-delayed'&&index===6){const item=emitStarted(index,'const send=tab.playwright.getByRole("button",{name:/发送提示词/}); await send.click();');setTimeout(()=>{emitCompleted(item);fs.writeFileSync(delayed,'1');next();},700);return;}else if(kind==='submit')emit(index,'const send=tab.playwright.getByRole("button",{name:/发送提示词/}); await send.click();');else if(kind==='upload')emit(index,'await chooser.setFiles(files); const send=tab.playwright.getByRole("button",{name:/发送提示词/}); const sendEnabled=await send.isEnabled();');else if(kind==='init')emit(index,'await cua.getState()');else if(kind==='create')emit(index,'globalThis.__wendiOwnedTab=await cua.createBrowserTab("chrome",undefined,{sessionName:"fixture"})');else if(kind==='navigation')emit(index,'await tab.goto("https://chatgpt.com"); await tab.getAXState({emit:false})');else if(kind==='entry')emit(index,'login chat mode composer 创建图片');else if(kind==='download')emit(index,'const inventory=await pageAssets.list()');else emit(index,kind==='business'?'noop':kind);setTimeout(next,60)};
+const next=()=>{const kind=calls[index];if(!kind){setTimeout(()=>{fs.writeFileSync(after,'1');process.exit(0)},800);return;}index+=1;if((mode==='four-business-close'||mode==='lifecycle-classification')&&kind!=='close'){const leaseFile=path.join(dir,'owned-tab-lease.json');const lease=JSON.parse(fs.readFileSync(leaseFile,'utf8'));lease.state=(kind==='upload'?'uploading':kind==='submit'?'uploaded':kind==='download'?'generating':'created');fs.writeFileSync(leaseFile,JSON.stringify(lease));if(mode==='lifecycle-classification'){const manifestFile=path.join(dir,'web-generation.json');let manifest={state:'accepted',submissionIntent:false,submitted:false};try{manifest=JSON.parse(fs.readFileSync(manifestFile,'utf8'))}catch{};if(kind==='submit')manifest.state='ready';if(kind==='download'){manifest.state='submitted';manifest.submissionIntent=true;manifest.submitted=true}fs.writeFileSync(manifestFile,JSON.stringify(manifest))}}if((index===5||index===6)&&kind==='business' || (mode==='pre-intent'&&index===6))fs.writeFileSync(fifth,'1');if(kind==='close'){const leaseFile=path.join(dir,'owned-tab-lease.json');const lease=JSON.parse(fs.readFileSync(leaseFile,'utf8'));lease.state='closing';fs.writeFileSync(leaseFile,JSON.stringify(lease));fs.writeFileSync(closed,'1');fs.writeFileSync(after,'1');emit(index,marker+'; await tab.close(); --run-id "'+runId+'" --owned-tab-id "tab-fixture" --state closing;');setTimeout(()=>process.exit(0),120);return;}if(kind==='abuse')emit(index,marker+'; await tab.close(); --run-id "'+runId+'" --owned-tab-id "tab-fixture" --state closing;');else if(kind==='intent-helper')emitIntentHelper(index);else if(kind==='submit'&&mode==='post-intent-delayed'&&index===6){const item=emitStarted(index,'const send=tab.playwright.getByRole("button",{name:/发送提示词/}); await send.click();');setTimeout(()=>{emitCompleted(item);fs.writeFileSync(delayed,'1');next();},700);return;}else if(kind==='submit')emit(index,'const send=tab.playwright.getByRole("button",{name:/发送提示词/}); await send.click();');else if(kind==='upload')emit(index,'await chooser.setFiles(files); const send=tab.playwright.getByRole("button",{name:/发送提示词/}); const sendEnabled=await send.isEnabled();');else if(kind==='init')emit(index,'await cua.getState()');else if(kind==='create')emit(index,'globalThis.__wendiOwnedTab=await cua.createBrowserTab("chrome",undefined,{sessionName:"fixture"})');else if(kind==='navigation')emit(index,'await tab.goto("https://chatgpt.com"); await tab.getAXState({emit:false})');else if(kind==='entry')emit(index,'login chat mode composer 创建图片');else if(kind==='download')emit(index,'const inventory=await pageAssets.list()');else if(kind==='diagnostic-ax')emit(index,'const ax=await tab.getAXState({emit:false}); const copy="prompt-textarea composer uploading"; return {ax,copy};');else if(kind==='entry-diagnostic')emit(index,'const ax=await tab.getAXState({emit:false}); const hasComposer=/prompt-textarea|composer/.test(String(ax));');else emit(index,kind==='business'?'noop':kind);setTimeout(next,60)};
 next();
 `;
   fs.writeFileSync(bin,source,{mode:0o755});
@@ -48,6 +48,18 @@ test('send-button inspection stays in upload while an actual click is submit',()
   assert.equal(browserToolStage(upload),'upload');
   assert.equal(browserToolStage(menu),'upload');
   assert.equal(browserToolStage(send),'submit');
+});
+
+test('browser call stages follow persisted lease lifecycle, not diagnostic source words',()=>{
+  const readOnlyReady=`const ax=await tab.getAXState({emit:false}); const hasComposer=/prompt-textarea|composer/.test(String(ax)); const copy="uploading attachmentObserved prompt-textarea"; return {hasComposer,copy};`;
+  const attach=`await chooser.setFiles(files); const observed=await tab.getAXState({emit:false});`;
+  const readyCheck=`const ax=await tab.getAXState({emit:false}); return /prompt-textarea|composer/.test(String(ax));`;
+  const generationPoll=`const ax=await tab.getAXState({emit:false}); return {composer:/composer/.test(String(ax)),text:"uploading"};`;
+  assert.equal(browserToolStage(readOnlyReady,{leaseState:'created',manifestState:'accepted'}),'bootstrap');
+  assert.equal(browserToolStage(attach,{leaseState:'uploading',manifestState:'accepted'}),'upload');
+  assert.equal(browserToolStage(readyCheck,{leaseState:'uploaded',manifestState:'ready'}),'submit');
+  assert.equal(browserToolStage(generationPoll,{leaseState:'generating',manifestState:'submitted'}),'wait_download');
+  assert.equal(browserToolStage(`const send=tab.playwright.getByRole('button',{name:/发送提示词/}); await send.click();`,{leaseState:'uploading',manifestState:'accepted'}),'submit');
 });
 
 test('manifest submission-intent helper is not a browser budget call',async()=>{
@@ -74,6 +86,18 @@ test('required one-time CUA environment initialization does not consume bootstra
   assert.equal(execution.browserBusinessCallCount,8);
   assert.equal(execution.browserInitializationCallCount,1);
   assert.deepEqual(execution.browserBusinessStageCounts,{bootstrap:3,upload:2,submit:1,wait_download:2});
+});
+
+test('persisted owned-tab lifecycle keeps AX diagnostics in their current stage and setFiles in upload',async()=>{
+  const run=fixture('lifecycle-classification');
+  const result=await runCodex({codexBin:run.codexBin,dir:run.dir,prompt:'fixture',browserMode:'chrome',timeoutMs:5000});
+  await flush();
+  assert.equal(result.text,'');
+  assert.equal(readBrowserToolBudget(run.dir),null);
+  const execution=JSON.parse(fs.readFileSync(path.join(run.dir,'execution.json'),'utf8'));
+  assert.equal(execution.browserBusinessCallCount,5);
+  assert.equal(execution.browserCleanupCallCount,1);
+  assert.deepEqual(execution.browserBusinessStageCounts,{bootstrap:2,upload:1,submit:1,wait_download:1});
 });
 
 test('a repeated environment initialization call remains charged to bootstrap',async()=>{

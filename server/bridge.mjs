@@ -175,7 +175,8 @@ function browserToolCallInfo(event,{dir,cleanupCallUsed=false,runIdOverride=null
   const ownedTabMatches=Boolean(leaseOwnedTabId&&sourceOwnedTabId&&leaseOwnedTabId===sourceOwnedTabId);
   const cleanupCandidate=fixedCleanup&&closeLike;
   const cleanupAuthorized=cleanupCandidate&&lease?.state==='closing'&&leaseRunMatches&&sourceRunMatches&&ownedTabMatches&&!cleanupCallUsed;
-  return {id:String(item.id||event?.item_id||event?.id||''),phase:type.includes('started')?'started':type.includes('completed')?'completed':'other',kind:runtimeInitialization?'initialization':cleanupAuthorized?'cleanup':cleanupCandidate?'deferred_cleanup':'business',stage:browserToolBusinessStage(source),closeLike,fixedCleanup,cleanupCandidate,leaseState:lease?.state||null,leaseRunMatches,sourceRunMatches,ownedTabMatches,ownedTabId:leaseOwnedTabId||null};
+  const manifestState=manifestBrowserState(dir);
+  return {id:String(item.id||event?.item_id||event?.id||''),phase:type.includes('started')?'started':type.includes('completed')?'completed':'other',kind:runtimeInitialization?'initialization':cleanupAuthorized?'cleanup':cleanupCandidate?'deferred_cleanup':'business',stage:browserToolBusinessStage(source,'bootstrap',{leaseState:lease?.state||null,manifestState,submissionIntentObserved:manifestHasSubmissionIntent(dir)}),closeLike,fixedCleanup,cleanupCandidate,leaseState:lease?.state||null,manifestState,leaseRunMatches,sourceRunMatches,ownedTabMatches,ownedTabId:leaseOwnedTabId||null};
 }
 
 function eventContainsSubmissionIntent(event){
@@ -193,6 +194,11 @@ function manifestHasSubmissionIntent(dir){
   }catch{return false;}
 }
 
+function manifestBrowserState(dir){
+  try{return String(JSON.parse(fs.readFileSync(path.join(dir,'web-generation.json'),'utf8'))?.state||'');}
+  catch{return '';}
+}
+
 function writeBrowserToolBudget(dir,value={}){
   if(!dir||!value)return null;
   const record={schemaVersion:2,errorCode:'BROWSER_TOOL_BUDGET_EXCEEDED',limit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,businessLimit:BROWSER_TOOL_BUSINESS_CALL_BUDGET,cleanupLimit:BROWSER_TOOL_CLEANUP_CALL_BUDGET,stageBudgets:BROWSER_TOOL_STAGE_BUDGETS,observed:Number(value.observed)||0,observedBusiness:Number(value.observedBusiness)||0,observedCleanup:Number(value.observedCleanup)||0,stageCounts:value.stageCounts&&typeof value.stageCounts==='object'?{...value.stageCounts}:{},budgetKind:value.budgetKind||'business',stageName:value.stageName||null,stageLimit:Number(value.stageLimit)||null,stageCount:Number(value.stageCount)||null,submissionIntentObserved:value.submissionIntentObserved===true,stage:value.submissionIntentObserved===true?'post_submission_intent':'pre_submission_intent',terminationDeferred:value.terminationDeferred===true,terminationRequestedAt:new Date().toISOString()};
@@ -206,15 +212,11 @@ export function readBrowserToolBudget(dir){
   try{return JSON.parse(fs.readFileSync(path.join(dir,BROWSER_TOOL_BUDGET_FILE),'utf8'));}catch{return null;}
 }
 
-export function browserToolStage(value){
+export function browserToolStage(value,lifecycle={}){
   const source=typeof value==='string'?value:JSON.stringify(value||{});
   if(/close\(\)/i.test(source))return 'cleanup';
-  // Merely inspecting the send button is part of upload verification.  The
-  // previous matcher treated `getByRole(...发送提示词...)` and
-  // `sendEnabled` as a submission, so the upload call consumed the one-call
-  // submit budget before the real send.  Only an intent marker, Enter/Return,
-  // or an actual send-button click is a submit call.
-  const intentMarker=/(?:submission[-_ ]?intent|submission_intent_recorded)/i.test(source);
+  // Only a real send action outranks the persisted lifecycle stage. Text in
+  // diagnostics, AX matchers, and the frozen prompt is not an action.
   const enterSubmit=/(?:pressKey|press)\([^)]*(?:Enter|Return)\)/i.test(source);
   // Do not treat an arbitrary locator click as sending.  Upload fallback
   // necessarily clicks the plus button and the menu item before it receives a
@@ -224,15 +226,24 @@ export function browserToolStage(value){
   const roleSendClick=/getByRole\(\s*['"]button['"][^)]*(?:发送提示词|composer-submit-button)[^)]*\)\s*\.\s*(?:click|press)\s*\(/i.test(source);
   const locatorSendClick=/locator\(\s*['"]#(?:composer-submit-button|send-button)['"]\s*\)\s*\.\s*(?:click|press)\s*\(/i.test(source);
   const sendButtonClick=namedSendHandle||roleSendClick||locatorSendClick;
-  if(intentMarker||enterSubmit||sendButtonClick)return 'submit';
+  if(enterSubmit||sendButtonClick)return 'submit';
+  const leaseState=String(lifecycle?.leaseState||'');
+  const manifestState=String(lifecycle?.manifestState||'');
+  // Durable stages own normal business-call classification. This prevents
+  // words in read-only page checks (for example prompt-textarea/composer or
+  // an uploading label) from spending the later upload/send budgets.
+  if(['sent','generating','downloaded'].includes(leaseState)||['submitted','downloaded'].includes(manifestState))return 'wait_download';
+  if(manifestState==='ready'||lifecycle?.submissionIntentObserved===true)return 'submit';
+  if(['uploading','uploaded'].includes(leaseState))return 'upload';
+  if(['creating','created'].includes(leaseState))return 'bootstrap';
   if(/pageAssets|\.bundle\(|\.list\(\)|download-evidence|下载原图|生成结果|停止生成|等待生成/i.test(source))return 'wait_download';
-  if(/\bupload\b|setFiles|filechooser|从电脑上传|上传文件|上传照片|attachment(?:s|Signals|Expected|Observed|Pending)|上传中|等待文件上传|remotePrompt|填入冻结|\.fill\(|\.paste\(|prompt-textarea|textbox/i.test(source))return 'upload';
+  if(/setFiles\s*\(|waitForEvent\s*\(\s*['\"]filechooser['\"]|filechooser|\.fill\s*\(|\.paste\s*\(/i.test(source))return 'upload';
   if(/createBrowserTab|\.goto\(|waitForLoadState|getAXState|聊天模式|创建图片|composer|登录/i.test(source))return 'bootstrap';
   return 'bootstrap';
 }
 
-function browserToolBusinessStage(source, fallback='bootstrap'){
-  const stage=browserToolStage(source);
+function browserToolBusinessStage(source, fallback='bootstrap',lifecycle={}){
+  const stage=browserToolStage(source,lifecycle);
   return stage==='cleanup'?'bootstrap':(Object.prototype.hasOwnProperty.call(BROWSER_TOOL_STAGE_BUDGETS,stage)?stage:fallback);
 }
 
