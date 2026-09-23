@@ -27,6 +27,25 @@ test('a legacy network lastFailure also remains an unknown result',()=>{
   assert.equal(legacy.status,'attention');assert.match(legacy.message,/无法证明/);assert.equal(legacy.currentTask.status,'unknown_result');assert.equal(E.retryableImageFailure(legacy),null);assert.equal(E.imageRetryState(legacy).certainty,'unknown_result');
   legacy.status='paused';legacy.message='第二次启动前残留提示';E.saveProject(legacy);E.recover();legacy=E.readProject(legacy.id);assert.equal(legacy.status,'attention');assert.match(legacy.message,/无法证明/);
 });
+test('a pre-intent browser budget interruption is unknown and cannot surface a safe-retry claim',()=>{
+  let project=E.createProject({...brief,idea:'预算中断的浏览器状态不得误判为无图'});const runId='budget-interrupted-run',requestId=crypto.randomUUID(),dir=path.join(E.projectDir(project.id),'.制作记录',runId),outputFile=path.join(E.projectDir(project.id),'v1','素材','预算中断.png');fs.mkdirSync(dir,{recursive:true});
+  const task={id:'budget-unknown-task',kind:'image',target:'第1页-第1格',requestId,status:'failed_no_output',errorCode:'browser-tool-budget-exceeded',providerInvocations:0,completedAt:new Date().toISOString()};
+  fs.writeFileSync(path.join(dir,'web-generation.json'),JSON.stringify({schemaVersion:2,provider:G.WEB_IMAGE_PROVIDER,runId,requestId,state:'failed',accepted:true,submitted:false,submissionIntent:false,submissionUncertain:false,errorCode:'BROWSER_TOOL_BUDGET_EXCEEDED',ownedTabId:'1514999999',ownedTabCreatedAt:new Date().toISOString(),outputFile}));
+  fs.writeFileSync(path.join(dir,'browser-tool-budget.json'),JSON.stringify({observedBusiness:4,submissionIntentObserved:false}));fs.writeFileSync(path.join(dir,'events.jsonl'),JSON.stringify({type:'item.started',item:{id:'item_x',type:'mcp_tool_call',server:'cua_repl',tool:'js',arguments:{code:'await tab.playwright.getByRole("button").click()'}}})+'\n');
+  project.tasks=[task];project.currentTask=task;project.lastFailure={kind:'browser-tool-budget-exceeded',definiteNoOutput:true,key:task.target,attempts:0,taskId:task.id,diagnostics:{runId},message:'未记录发送意图，可安全重试'};project.status='attention';E.saveProject(project);
+  E.recover();project=E.readProject(project.id);
+  assert.equal(project.currentTask.status,'unknown_result');assert.equal(project.currentTask.errorCode,'browser-tool-budget-unknown');assert.equal(project.lastFailure,null);
+  assert.equal(E.imageRetryState(project).certainty,'unknown_result');assert.equal(E.retryableImageFailure(project),null);
+  assert.match(project.message,/竞态|无法确认/);assert.match(project.message,/不要自动重试|不会自动重试/);assert.doesNotMatch(project.message,/可安全重试/);
+});
+test('a budget record with only initialization and no owned tab remains confirmed pre-submit',()=>{
+  let project=E.createProject({...brief,idea:'纯初始化额度证据可确认无浏览器副作用'});const dir=path.join(E.projectDir(project.id),'.制作记录',`budget-safe-proof-${crypto.randomUUID()}`),requestId=crypto.randomUUID(),outputFile=path.join(dir,'not-created.png'),task={id:'budget-safe-task',kind:'image',target:'第1页-第1格',status:'unknown_result',errorCode:'unknown_result',providerInvocations:0};fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(path.join(dir,'web-generation.json'),JSON.stringify({schemaVersion:2,provider:G.WEB_IMAGE_PROVIDER,state:'failed',requestId,errorCode:'BROWSER_TOOL_BUDGET_EXCEEDED',outputFile}));
+  fs.writeFileSync(path.join(dir,'browser-tool-budget.json'),JSON.stringify({observedBusiness:0}));
+  const init={type:'mcp_tool_call',server:'cua_repl',tool:'js',arguments:{code:'await cua.getState()'}};fs.writeFileSync(path.join(dir,'events.jsonl'),JSON.stringify({type:'item.started',item:{id:'init-start',...init}})+'\n'+JSON.stringify({type:'item.completed',item:{id:'init-done',...init}})+'\n');
+  project.tasks=[task];project.currentTask=task;project.pending={key:task.target,file:outputFile,dir,provider:'test-provider',taskId:task.id,projectId:project.id,projectVersion:project.version,requestId,at:new Date().toISOString()};E.saveProject(project);
+  E.recover();project=E.readProject(project.id);
+  assert.equal(project.currentTask.status,'failed_no_output');assert.equal(project.currentTask.errorCode,'browser-tool-budget-exceeded');assert.equal(project.lastFailure.kind,'browser-tool-budget-exceeded');assert.equal(E.imageRetryState(project).certainty,'confirmed_missing');
+});
 test('an explicitly approved unknown pending image is archived before one retry',async()=>{
   let unknown=E.createProject({...brief,idea:'保留未知旧请求后只重试一张'});unknown.plan=structuredClone(plan);unknown.version=1;unknown.approved={version:1,hash:W.digest(unknown.plan)};unknown.samplesApproved=true;unknown.status='attention';
   const oldFile=path.join(E.projectDir(unknown.id),'v1','素材','旧请求.png'),oldDir=path.join(E.projectDir(unknown.id),'.制作记录','旧请求');

@@ -272,8 +272,12 @@ export function createImageWorkflow({
         throw error;
       }
       cleanupOwnStaging(project, dir, 'unknown', {submitted: webManifest?.submitted === true, submissionUncertain: webManifest?.submissionUncertain === true, reason: 'artifact_not_located'});
-      finishTask(project, task, 'unknown_result', {errorCode: 'unknown_result'});
-      throw failure || new Error('连接在保存结果前中断。当前节点已保存，请先检查已有原图，避免重复生成。');
+      const browserBudgetUnknown=webManifest?.errorCode==='BROWSER_TOOL_BUDGET_EXCEEDED';
+      const unknownMessage=browserBudgetUnknown
+        ? `${key} 的浏览器操作在安全预算中断后未能核实。虽然没有记录发送意图，但工具派发与中断可能竞态，附件或发送状态无法确认。系统不会自动重试；请先检查对应 ChatGPT 会话和本地制作记录。`
+        : '连接在保存结果前中断。当前节点已保存，请先检查已有原图，避免重复生成。';
+      finishTask(project, task, 'unknown_result', {errorCode: browserBudgetUnknown?'browser-tool-budget-unknown':'unknown_result',error:unknownMessage});
+      throw new Error(unknownMessage,{cause:failure||undefined});
     }
     file = persisted.file;
     pending.file = file;

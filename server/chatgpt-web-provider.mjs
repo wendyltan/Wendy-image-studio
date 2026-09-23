@@ -265,7 +265,7 @@ function recordBrowserToolBudgetFailure(manifestFile,requestId,failure,dir){
   const budget=readBrowserToolBudget(dir)||{},projection=uploadProjection(dir,readJsonObject(path.join(dir,'worker-request.json'))),postIntent=budget.submissionIntentObserved===true||manifest.submissionIntent===true;
   const detail=String(failure?.message||'BROWSER_TOOL_BUDGET_EXCEEDED').slice(0,1000),prefix=browserFailurePrefix('BROWSER_TOOL_BUDGET_EXCEEDED');
   try{
-    patchManifestState(manifestFile,'failed',{...projection,submitted:postIntent?'true':'false',submissionIntent:postIntent?'true':'false',submissionUncertain:postIntent?'true':'false',preSubmissionFailure:postIntent?'false':'true',errorCode:'BROWSER_TOOL_BUDGET_EXCEEDED',failureStage:postIntent?'post_submit_unknown':'pre_submission_browser_budget',browserStage:postIntent?'submission_uncertain':'browser_budget_exceeded',error:`${prefix}；${postIntent?'已记录发送意图，但停止时无法确认消息是否送达，结果未知，禁止重发':'尚未记录发送意图，未上传或发送消息，可安全重试'}。原始错误：${detail}`});
+    patchManifestState(manifestFile,'failed',{...projection,submitted:postIntent?'true':'false',submissionIntent:postIntent?'true':'false',submissionUncertain:postIntent?'true':'false',preSubmissionFailure:postIntent?'false':'true',errorCode:'BROWSER_TOOL_BUDGET_EXCEEDED',failureStage:postIntent?'post_submit_unknown':'pre_submission_browser_budget',browserStage:postIntent?'submission_uncertain':'browser_budget_exceeded',error:`${prefix}；${postIntent?'已记录发送意图，但停止时无法确认消息是否送达，结果未知，禁止重发':'未记录发送意图；但超限调用与中断可能竞态，附件或发送状态无法核实，禁止自动重试'}。原始错误：${detail}`});
     return readWebManifest(manifestFile);
   }catch{return manifest;}
 }

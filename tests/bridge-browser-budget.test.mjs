@@ -158,12 +158,13 @@ test('a close without the fixed marker and closing phase cannot use the cleanup 
   const execution=JSON.parse(fs.readFileSync(path.join(run.dir,'execution.json'),'utf8'));assert.equal(execution.browserCleanupCallCount,0);
 });
 
-test('pre-intent budget exhaustion becomes a safe retryable manifest failure',async()=>{
+test('pre-intent budget exhaustion keeps submission facts but does not claim a safe retry',async()=>{
   const run=fixture('pre-intent',{lease:false}),reference=path.join(run.dir,'reference.png'),output=path.join(run.dir,'out.png');
   fs.writeFileSync(reference,'fixture-reference');
   await assert.rejects(dispatchChatGptWebJob({codexBin:run.codexBin,dir:run.dir,outputFile:output,prompt:'fixture',referenceFiles:[reference],timeoutMs:5000}),error=>error.code==='BROWSER_TOOL_BUDGET_EXCEEDED'&&error.webManifest?.submitted===false&&error.webManifest?.preSubmissionFailure===true);
   const manifest=JSON.parse(fs.readFileSync(path.join(run.dir,'web-generation.json'),'utf8'));
   assert.equal(manifest.errorCode,'BROWSER_TOOL_BUDGET_EXCEEDED');assert.equal(manifest.submissionIntent,false);assert.equal(manifest.submitted,false);assert.equal(manifest.submissionUncertain,false);assert.equal(manifest.preSubmissionFailure,true);assert.equal(manifest.failureStage,'pre_submission_browser_budget');
+  assert.match(manifest.error,/未记录发送意图.*竞态.*附件或发送状态无法核实.*禁止自动重试/);assert.doesNotMatch(manifest.error,/可安全重试/);
 });
 
 test('budget exhaustion after submission intent is persisted as unknown and never as pre-submission failure',async()=>{

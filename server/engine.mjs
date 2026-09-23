@@ -46,6 +46,24 @@ const BROWSER_STAGE_FAILURE_KIND=Object.freeze({
   REFERENCE_FILES_INVALID:'reference-files-invalid',
 });
 const CONFIRMED_PRE_SUBMISSION_KINDS=new Set(['no-output','browser-unavailable','browser-origin-permission-denied','browser-upload-unavailable',...Object.values(BROWSER_STAGE_FAILURE_KIND)]);
+function browserBudgetHasPossibleSideEffects(dir,manifest,pendingFile=null){
+  if(manifest?.ownedTabId||manifest?.ownedTabCreatedAt)return true;
+  const outputFile=String(manifest?.outputFile||pendingFile||'');
+  if(outputFile&&fs.existsSync(outputFile))return true;
+  let budget;
+  try{budget=JSON.parse(fs.readFileSync(path.join(dir,'browser-tool-budget.json'),'utf8'));}catch{return true;}
+  if(Number(budget.observedBusiness)!==0)return true;
+  let rows;
+  try{rows=fs.readFileSync(path.join(dir,'events.jsonl'),'utf8').split('\n').filter(Boolean).map(line=>JSON.parse(line));}catch{return true;}
+  for(const row of rows){
+    const item=row?.item;if(item?.type!=='mcp_tool_call')continue;
+    const namespace=[item.server,item.serverName,row.server,row.serverName,item.tool,item.name,row.tool].filter(Boolean).join(' ');
+    if(!/(?:cua[_-]?repl|browser|computer[_-]?use)/i.test(namespace))continue;
+    const source=String(item.arguments?.code||item.arguments?.command||item.code||item.command||'');
+    if(!/^\s*await\s+cua\.getState\(\)\s*;?\s*$/.test(source))return true;
+  }
+  return false;
+}
 function browserFailureKindFromCode(value){
   const text=String(value||'').trim();
   if(BROWSER_STAGE_FAILURE_KIND[text])return BROWSER_STAGE_FAILURE_KIND[text];
@@ -93,12 +111,26 @@ export function recover(){
       p.lastFailure=null;p.status='paused';p.error=message;p.message=message;migrated=true;
     }
   }
+  if(p.currentTask?.status==='failed_no_output'&&p.lastFailure?.kind==='browser-tool-budget-exceeded'){
+    const runId=String(p.lastFailure?.diagnostics?.runId||'');
+    const dir=runId&&path.basename(runId)===runId?path.join(projectDir(p.id),'.制作记录',runId):'';
+    const manifest=dir?readWebManifest(path.join(dir,'web-generation.json')):null;
+    if(manifest?.errorCode==='BROWSER_TOOL_BUDGET_EXCEEDED'&&manifest.requestId===p.currentTask.requestId&&browserBudgetHasPossibleSideEffects(dir,manifest)){
+      p.currentTask.status='unknown_result';p.currentTask.errorCode='browser-tool-budget-unknown';p.lastFailure=null;p.status='attention';
+      p.message=unknownResultMessage(p.currentTask.target,'browser-tool-budget-unknown');p.error=p.message;migrated=true;
+    }
+  }
   if(p.lastFailure?.kind==='network'&&p.lastFailure.definiteNoOutput!==false){p.lastFailure.definiteNoOutput=false;migrated=true;}
-  if(p.currentTask?.status==='failed_no_output'&&(!CONFIRMED_PRE_SUBMISSION_KINDS.has(p.currentTask.errorCode)||p.lastFailure?.kind==='network')){p.currentTask.status='unknown_result';p.currentTask.errorCode='network';p.status='attention';p.message=unknownResultMessage(p.currentTask.target);p.error=p.message;migrated=true;}
+  if(p.currentTask?.status==='failed_no_output'&&(!CONFIRMED_PRE_SUBMISSION_KINDS.has(p.currentTask.errorCode)||p.lastFailure?.kind==='network')){
+    const budgetUnknown=p.currentTask.errorCode==='browser-tool-budget-exceeded'||p.lastFailure?.kind==='browser-tool-budget-exceeded';
+    p.currentTask.status='unknown_result';p.currentTask.errorCode=budgetUnknown?'browser-tool-budget-unknown':'network';
+    if(budgetUnknown)p.lastFailure=null;
+    p.status='attention';p.message=unknownResultMessage(p.currentTask.target,budgetUnknown?'browser-tool-budget-unknown':'network');p.error=p.message;migrated=true;
+  }
   if(!p.lastFailure&&p.currentTask?.status==='failed_no_output'&&!p.pending){
     const state=imageRetryState(p);
     if(state?.certainty==='confirmed_missing')p.lastFailure={...state.failure,taskId:p.currentTask.id};
-    else {p.currentTask.status='unknown_result';p.currentTask.errorCode='network';p.status='attention';p.message=unknownResultMessage(state?.target||p.currentTask.target);p.error=p.message;}
+    else {const budgetUnknown=p.currentTask.errorCode==='browser-tool-budget-unknown';p.currentTask.status='unknown_result';p.currentTask.errorCode=budgetUnknown?'browser-tool-budget-unknown':'network';p.status='attention';p.message=unknownResultMessage(state?.target||p.currentTask.target,budgetUnknown?'browser-tool-budget-unknown':'network');p.error=p.message;}
     migrated=true;
   }
   if(p.lastFailure&&!p.currentTask){
@@ -120,7 +152,7 @@ export function recover(){
   }
   const retryState=imageRetryState(p);
   if(retryState&&!p.pending&&['attention','paused'].includes(p.status)){
-    const message=retryState.certainty==='confirmed_missing'?failureMessage(retryState.failure):unknownResultMessage(retryState.target);
+    const message=retryState.certainty==='confirmed_missing'?failureMessage(retryState.failure):unknownResultMessage(retryState.target,retryState.failure?.kind);
     if(p.status!=='attention'||p.message!==message){p.status='attention';p.message=message;p.error=message;migrated=true;}
   }
   if(['attention','paused'].includes(p.status)&&p.progress?.startedAt&&!p.progress.completedAt){p.progress.completedAt=p.lastFailure?.at||p.updatedAt||new Date().toISOString();migrated=true;}
@@ -183,7 +215,7 @@ export function refreshQuotaPauses(remaining){
     if(active.has(p.id)||!/5小时创作额度只剩\s*\d+%/.test(String(p.message||p.error||'')))continue;
     const retry=imageRetryState(p);
     p.status=retry?'attention':'paused';
-    p.message=retry?(retry.certainty==='confirmed_missing'?failureMessage(retry.failure):unknownResultMessage(retry.target)):'额度已恢复，可以继续制作。';
+    p.message=retry?(retry.certainty==='confirmed_missing'?failureMessage(retry.failure):unknownResultMessage(retry.target,retry.failure?.kind)):'额度已恢复，可以继续制作。';
     p.error=retry?p.message:null;
     p.lastQuotaCheck={remaining:Number(remaining),checkedAt:new Date().toISOString(),status:'fresh'};
     saveProject(p);changed++;
@@ -362,6 +394,10 @@ function definiteImageFailure(pending,extra=''){
   // Once the chat message was sent, absence of a local file is never proof
   // that the provider produced no image. Preserve it for recovery instead.
   if(manifest?.submitted)return null;
+  // Budget enforcement sees an over-limit item.started event after the tool
+  // may already have been dispatched. Without full source/result evidence,
+  // absence of a submission-intent marker is not proof of no browser effect.
+  if(manifest?.errorCode==='BROWSER_TOOL_BUDGET_EXCEEDED'&&browserBudgetHasPossibleSideEffects(pending.dir,manifest,pending.file))return null;
   if(manifest?.state==='failed'){
     const kind=manifestBrowserFailureKind(manifest)||'no-output';
     return {kind,definiteNoOutput:true,key:pending.key,attempts:0,inputTokens:Number(evidence.usage?.input_tokens)||0,diagnostics:generationDiagnosticSummary(classified),at:new Date().toISOString(),...(manifest.error?{message:manifest.error}: {}),ownedTabState:manifest.ownedTabState||null,cleanupStatus:manifest.cleanupStatus||manifest.ownedTabCleanupStatus||null,cleanupVerifiedAt:manifest.cleanupVerifiedAt||null};
@@ -1084,7 +1120,7 @@ export function retryableImageFailure(p){
 export function imageRetryState(p){
   return deriveImageRetryState(p,CONFIRMED_PRE_SUBMISSION_KINDS);
 }
-function unknownResultMessage(target='当前图片'){return deriveUnknownResultMessage(target);}
+function unknownResultMessage(target='当前图片',reason=null){return deriveUnknownResultMessage(target,reason);}
 export function retryMissingImage(p,target,{allowUnknownResult=false}={}){
   verifyApproval(p);
   if(active.has(p.id)||jobStore.hasLiveWork(p.id))throw new Error('这篇仍在制作或等待执行，请稍候。');

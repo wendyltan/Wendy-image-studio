@@ -84,7 +84,7 @@ export function imageRetryState(project,confirmedPreSubmissionKinds=new Set()){
   const task=project?.currentTask;
   if(project?.pending){
     if(task?.status==='unknown_result'&&task.target===project.pending.key){
-      return {certainty:'unknown_result',target:task.target,failure:{kind:'network',definiteNoOutput:false,key:task.target,attempts:task.providerInvocations||1,taskId:task.id,at:task.completedAt||project.updatedAt||new Date().toISOString()}};
+      return {certainty:'unknown_result',target:task.target,failure:{kind:task.errorCode==='browser-tool-budget-unknown'?'browser-tool-budget-unknown':'network',definiteNoOutput:false,key:task.target,attempts:task.providerInvocations||1,taskId:task.id,at:task.completedAt||project.updatedAt||new Date().toISOString()}};
     }
     return null;
   }
@@ -97,7 +97,7 @@ export function imageRetryState(project,confirmedPreSubmissionKinds=new Set()){
   if(task.status==='failed_no_output'&&confirmedPreSubmissionKinds.has(task.errorCode)){
     return {certainty:'confirmed_missing',target:task.target,failure:{kind:task.errorCode,definiteNoOutput:true,key:task.target,attempts:confirmedPreSubmissionKinds.has(task.errorCode)&&task.errorCode!=='no-output'?0:(task.providerInvocations||1),taskId:task.id,at:task.completedAt||project.updatedAt||new Date().toISOString()}};
   }
-  return {certainty:'unknown_result',target:task.target,failure:{kind:'network',definiteNoOutput:false,key:task.target,attempts:task.providerInvocations||1,taskId:task.id,at:task.completedAt||project.updatedAt||new Date().toISOString()}};
+  return {certainty:'unknown_result',target:task.target,failure:{kind:task.errorCode==='browser-tool-budget-unknown'?'browser-tool-budget-unknown':'network',definiteNoOutput:false,key:task.target,attempts:task.providerInvocations||1,taskId:task.id,at:task.completedAt||project.updatedAt||new Date().toISOString()}};
 }
 
 export function retryableImageFailure(project,confirmedPreSubmissionKinds=new Set()){
@@ -105,6 +105,7 @@ export function retryableImageFailure(project,confirmedPreSubmissionKinds=new Se
   return state?.certainty==='confirmed_missing'?state.failure:null;
 }
 
-export function unknownResultMessage(target='当前图片'){
+export function unknownResultMessage(target='当前图片',reason=null){
+  if(reason==='browser-tool-budget-unknown')return `${target} 的浏览器操作在安全预算中断后未能核实。虽然没有记录发送意图，但工具派发与中断可能竞态，附件或发送状态无法确认。系统不会自动重试；请先检查对应 ChatGPT 会话和本地制作记录。`;
   return `${target} 的连接在结果确认前中断，无法证明远端是否已经生成。系统不会自行重试；你可以先检查本地记录，或明确选择重新生成这一张。`;
 }
