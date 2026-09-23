@@ -60,15 +60,35 @@ test('source storyboard cards keep mixed-ratio images at natural card height', (
 test('page and storyboard cards expose one clear action hierarchy with accessible routes', () => {
   const pictures = fs.readFileSync(path.join(appRoot, 'app/studio/project-pictures.tsx'), 'utf8');
   assert.match(pictures, /aria-label=\{`点击查看第 \$\{page\.number\} 页大图`\}/);
-  assert.match(pictures, /className="primary"[\s\S]*?重排本页/);
-  assert.match(pictures, /只调整版式与文字，不重新生图/);
+  assert.match(pictures, /qaAction\(page\.qa, true\)/);
+  assert.match(pictures, /className="secondary page-layout-button"[\s\S]*?重排本页/);
   assert.match(pictures, /\{!project\.accepted && \([\s\S]*?repair-page-layout/);
-  assert.match(pictures, /className="panel-review-row"[\s\S]*?<QaBadge qa=\{panel\.qa\} \/>[\s\S]*?className="primary"[\s\S]*?action\('review-image', \{key\}\)/);
+  assert.match(pictures, /className="panel-card-heading"[\s\S]*?<QaBadge qa=\{panel\.qa\} \/>[\s\S]*?className="panel-review-row"[\s\S]*?className="primary"[\s\S]*?action\('review-image', \{key\}\)/);
   assert.match(pictures, /className="tertiary-action"[\s\S]*?提炼为素材/);
   assert.match(css, /\.inline-actions \.primary,[\s\S]*?min-height:42px/);
   assert.match(css, /\.tertiary-action:focus-visible/);
-  assert.match(css, /\.source-grid \.panel-review-row\{grid-column:1\/-1;display:flex/);
-  assert.match(css, /\.source-grid>div>div\{display:grid;grid-template-columns:1fr 1fr/);
+  assert.match(css, /\.source-grid>div>\.panel-card-meta\{display:flex;flex-direction:column/);
+  assert.match(css, /\.source-grid \.panel-review-row\{display:grid;grid-template-columns:minmax\(0,1fr\) auto/);
+});
+
+test('public panel media URL enables review and page review is a separate action', () => {
+  const pictures = fs.readFileSync(path.join(appRoot, 'app/studio/project-pictures.tsx'), 'utf8');
+  const api = fs.readFileSync(path.join(appRoot, 'server/server.mjs'), 'utf8');
+  const engine = fs.readFileSync(path.join(appRoot, 'server/engine.mjs'), 'utf8');
+  assert.match(api, /url:media\(displayFile\)/);
+  assert.match(pictures, /disabled=\{disabled \|\| !panel\.url\}/);
+  assert.match(pictures, /action\('review-image', \{key\}\)/);
+  assert.match(pictures, /action\('review-page', \{pageNumber: page\.number\}\)/);
+  assert.match(engine, /export function reviewPage\(/);
+  assert.match(api, /action==='review-page'\)reviewPage\(p,b\.pageNumber\)/);
+  assert.match(engine, /function reviewPageQaOnly\(/);
+  assert.match(engine, /qa\(p,pageFile,JSON\.stringify\(pageQaDefinition\(definition\)\)/);
+});
+
+test('completed browser lease does not become the current global warning', () => {
+  const status = fs.readFileSync(path.join(appRoot, 'app/studio/workflow-status.tsx'), 'utf8');
+  assert.match(status, /project\.pending\?\.ownedTabState/);
+  assert.match(status, /const taskLeaseRelevant = \[/);
 });
 
 test('formal panel decision keeps its explanation separated from high-contrast actions', () => {

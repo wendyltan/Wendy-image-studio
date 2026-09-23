@@ -741,6 +741,38 @@ export function repairPageLayout(p,pageNumber){
     else {p.status='attention';activity(p,`第 ${number} 页排版失败：仍有排版问题，请查看后再次调整。`,number,p.plan.pages.length,'页面');}
   });
 }
+function reviewPageQaOnly(p,pageNumber){
+  verifyApproval(p);if(p.pending)throw new Error('请先完成这次原图找回，再校对成稿。');
+  const number=Number(pageNumber),page=p.pages?.find(item=>Number(item.number)===number),definition=p.plan?.pages?.find(item=>Number(item.number)===number);
+  if(!page||!definition||Number(page.projectVersion)!==Number(p.version)||!page.file)throw new Error('这一页没有当前版本中可校对的成稿。');
+  const pageFile=inside(projectDir(p.id),page.file),artifact=(p.artifacts||[]).find(item=>item.id===`page:${number}`&&item.file===page.file&&item.valid!==false);
+  if(!artifact||!fs.existsSync(pageFile))throw new Error('成稿文件或来源记录已变化，请先重新排版。');
+  return job(p,'page-review',async signal=>{
+    activity(p,`准备校对第 ${number} 页现有成稿`,number,p.pages.length,'页面');
+    const before=await verifyImage(pageFile);if(!integrityMatches(page.integrity||artifact.integrity,before))throw new Error('成稿文件完整性核对失败，文件保持不变。');
+    for(const [index] of definition.panels.entries()){
+      const key=`${number}-${index+1}`,record=p.panels?.[key],expected=(page.sourceIntegrity||[]).find(item=>item.key===key);
+      if(!record?.file||!expected||record.file!==expected.file)throw new Error(`第 ${number} 页的分镜来源记录不完整，请先重新排版。`);
+      const sourceFile=inside(projectDir(p.id),record.file),actual=await verifyImage(sourceFile);
+      if(actual.sha256!==expected.sha256||!integrityMatches(record.integrity,actual))throw new Error(`第 ${number} 页的分镜来源已变化，请先重新排版。`);
+    }
+    const task=beginTask(p,'review',`第 ${number} 页成稿`,{artifact:page.file,source:'manual_page_review'});
+    activity(p,`正在校对第 ${number} 页（保留现有 PNG）`,number,p.pages.length,'页面');
+    try{
+      const report=await qa(p,pageFile,JSON.stringify(pageQaDefinition(definition)),imageRefs(p,[...new Set(definition.panels.flatMap(item=>item.references))]),signal,'1080×1440最终漫画页');
+      const after=await verifyImage(pageFile);if(after.sha256!==before.sha256)throw new Error('校对期间成稿文件发生变化，已停止更新校对状态。');
+      page.qa=report;delete page.nextStep;
+      if(!report.pass){page.nextStep='查看或修订';invalidateArtifacts(p,['story:audit','export:bundle']);p.storyQA=null;p.bundle=null;p.accepted=false;p.acceptance=null;}
+      finishTask(p,task,'completed',{artifact:pageFile,qa:report.pass?'passed':'needs_review'});
+      p.status=report.pass?'paused':'attention';p.error=null;p.message=report.pass?`第 ${number} 页已校对。`:`第 ${number} 页校对未通过，请查看建议。`;
+      saveProject(p);activity(p,report.pass?`第 ${number} 页校对完成，成稿文件与哈希未改变。`:`第 ${number} 页校对完成，发现需要查看的问题。`,number,p.pages.length,'页面');return page;
+    }catch(error){
+      if(signal.aborted){finishTask(p,task,'review_failed',{artifact:pageFile,error:String(error.message||error)});saveProject(p);throw error;}
+      finishTask(p,task,'review_failed',{artifact:pageFile,error:String(error.message||error)});p.status='attention';p.message=`第 ${number} 页校对未完成，成稿文件仍保留。`;saveProject(p);throw error;
+    }
+  });
+}
+export function reviewPage(p,pageNumber){return reviewPageQaOnly(p,pageNumber);}
 export function unifyPageLayouts(p){
   verifyApproval(p);if(p.pending)throw new Error('有一张原图结果尚未确认，暂不能统一页面排版。');if(p.accepted)throw new Error('已收下的成品请先建立新版本再调整。');
   const numbers=(p.pages||[]).map(page=>Number(page.number)).filter(Number.isFinite).sort((a,b)=>a-b);if(numbers.length<2)throw new Error('至少需要两页成稿才能统一全篇排版。');

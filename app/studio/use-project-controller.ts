@@ -313,6 +313,7 @@ export function useProjectController({
             'retry-missing',
             'recover-image',
             'review-image',
+            'review-page',
             'resume',
             'repair-page-layout',
             'unify-page-layouts',

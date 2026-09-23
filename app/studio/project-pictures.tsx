@@ -33,8 +33,10 @@ export function ProjectPictures({
   setChecks: (value: string[]) => void;
   allChecks: string[];
 }) {
-  const qaAction = (qa: { pass: boolean | null; status?: string }) =>
-    qa.pass === true ? '重新校对' : qa.pass === null ? '校对这一格' : '查看校对结果';
+  const qaAction = (qa: { pass: boolean | null; status?: string }, page: boolean) => {
+    const initial = qa.pass === null || ['deferred', 'unavailable'].includes(qa.status || '');
+    return page ? (initial ? '校对本页' : '重新校对') : initial ? '校对这一格' : '重新校对';
+  };
   return (
     <>
       <div className="section-intro section-intro-actions">
@@ -88,16 +90,23 @@ export function ProjectPictures({
                     </a>
                   )}
                   {!project.accepted && (
-                    <div className="page-layout-action">
+                    <div className="page-card-actions">
                       <button
                         className="primary"
+                        disabled={disabled}
+                        onClick={() => action('review-page', {pageNumber: page.number})}
+                      >
+                        <Check />
+                        {qaAction(page.qa, true)}
+                      </button>
+                      <button
+                        className="secondary page-layout-button"
                         disabled={disabled}
                         onClick={() => action('repair-page-layout', {pageNumber: page.number})}
                       >
                         <RotateCcw />
                         重排本页
                       </button>
-                      <small>只调整版式与文字，不重新生图</small>
                     </div>
                   )}
                   <button
@@ -137,36 +146,20 @@ export function ProjectPictures({
                     decoding="async"
                   />
                 </button>
-                <div>
-                  <span>分镜 {key}</span>
+                <div className="panel-card-meta">
+                  <div className="panel-card-heading"><span>分镜 {key}</span><QaBadge qa={panel.qa} /></div>
                   <div className="panel-review-row">
-                    <QaBadge qa={panel.qa} />
                     <button
                       className="primary"
-                      disabled={disabled || !panel.file}
+                      disabled={disabled || !panel.url}
                       onClick={() => action('review-image', {key})}
                     >
                       <Check />
-                      {qaAction(panel.qa)}
+                      {qaAction(panel.qa, false)}
                     </button>
+                    <button className="secondary" aria-label={`修改分镜 ${key}`} title={`修改分镜 ${key}`} onClick={() => setEdit({key, title: `分镜 ${key}`})}><Pencil />修改</button>
                   </div>
-                  <button
-                    className="secondary"
-                    aria-label={`修改分镜 ${key}`}
-                    title={`修改分镜 ${key}`}
-                    onClick={() => setEdit({key, title: `分镜 ${key}`})}
-                  >
-                    <Pencil />
-                  </button>
-                  <button
-                    className="tertiary-action"
-                    aria-label={`将分镜 ${key} 提炼为素材`}
-                    title={`将分镜 ${key} 提炼为素材`}
-                    onClick={() => analyze('panel', key)}
-                  >
-                    <Leaf />
-                    提炼为素材
-                  </button>
+                  <button className="tertiary-action" aria-label={`将分镜 ${key} 提炼为素材`} title={`将分镜 ${key} 提炼为素材`} onClick={() => analyze('panel', key)}><Leaf />提炼为素材</button>
                 </div>
               </div>
             ))}

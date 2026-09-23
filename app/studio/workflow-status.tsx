@@ -120,11 +120,21 @@ export function WorkflowStatus({
   const webText = project.pending?.webState
     ? webStateLabels[project.pending.webState] || '网页后台处理中'
     : '';
+  const taskLeaseRelevant = [
+    'running',
+    'unknown_result',
+    'not_accepted',
+    'artifact_saved_unchecked',
+    'review_required',
+    'review_failed',
+  ].includes(task?.status || '');
   const ownedTabState =
     project.pending?.ownedTabState ||
-    task?.ownedTabState ||
-    (typeof task?.webTimings?.ownedTabState === 'string'
-      ? task.webTimings.ownedTabState
+    (taskLeaseRelevant
+      ? task?.ownedTabState ||
+        (typeof task?.webTimings?.ownedTabState === 'string'
+          ? task.webTimings.ownedTabState
+          : '')
       : '');
   const ownedTabLabels: Record<string, string> = {
     not_created: '专用标签页尚未创建',
