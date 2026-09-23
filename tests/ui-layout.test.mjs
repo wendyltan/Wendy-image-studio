@@ -57,6 +57,20 @@ test('source storyboard cards keep mixed-ratio images at natural card height', (
   assert.doesNotMatch(image, /aspect-ratio/);
 });
 
+test('page and storyboard cards expose one clear action hierarchy with accessible routes', () => {
+  const pictures = fs.readFileSync(path.join(appRoot, 'app/studio/project-pictures.tsx'), 'utf8');
+  assert.match(pictures, /aria-label=\{`点击查看第 \$\{page\.number\} 页大图`\}/);
+  assert.match(pictures, /className="primary"[\s\S]*?重排本页/);
+  assert.match(pictures, /只调整版式与文字，不重新生图/);
+  assert.match(pictures, /\{!project\.accepted && \([\s\S]*?repair-page-layout/);
+  assert.match(pictures, /className="panel-review-row"[\s\S]*?<QaBadge qa=\{panel\.qa\} \/>[\s\S]*?className="primary"[\s\S]*?action\('review-image', \{key\}\)/);
+  assert.match(pictures, /className="tertiary-action"[\s\S]*?提炼为素材/);
+  assert.match(css, /\.inline-actions \.primary,[\s\S]*?min-height:42px/);
+  assert.match(css, /\.tertiary-action:focus-visible/);
+  assert.match(css, /\.source-grid \.panel-review-row\{grid-column:1\/-1;display:flex/);
+  assert.match(css, /\.source-grid>div>div\{display:grid;grid-template-columns:1fr 1fr/);
+});
+
 test('formal panel decision keeps its explanation separated from high-contrast actions', () => {
   assert.match(studioSources, /className="approval-card panel-decision-card"/);
   assert.match(studioSources, /<h2>正式分镜需要你来决定<\/h2>/);

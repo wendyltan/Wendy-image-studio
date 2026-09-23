@@ -33,6 +33,8 @@ export function ProjectPictures({
   setChecks: (value: string[]) => void;
   allChecks: string[];
 }) {
+  const qaAction = (qa: { pass: boolean | null; status?: string }) =>
+    qa.pass === true ? '重新校对' : qa.pass === null ? '校对这一格' : '查看校对结果';
   return (
     <>
       <div className="section-intro section-intro-actions">
@@ -61,6 +63,7 @@ export function ProjectPictures({
             <div className="image-card" key={page.number}>
               <button
                 className="image-button"
+                aria-label={`点击查看第 ${page.number} 页大图`}
                 onClick={() =>
                   setZoom({url: page.url, title: `第 ${page.number} 页`})
                 }
@@ -84,24 +87,27 @@ export function ProjectPictures({
                       保存
                     </a>
                   )}
-                  <button onClick={() => analyze('page', page.number || 0)}>
+                  {!project.accepted && (
+                    <div className="page-layout-action">
+                      <button
+                        className="primary"
+                        disabled={disabled}
+                        onClick={() => action('repair-page-layout', {pageNumber: page.number})}
+                      >
+                        <RotateCcw />
+                        重排本页
+                      </button>
+                      <small>只调整版式与文字，不重新生图</small>
+                    </div>
+                  )}
+                  <button
+                    className="tertiary-action"
+                    aria-label={`将第 ${page.number} 页提炼为长期参考素材`}
+                    onClick={() => analyze('page', page.number || 0)}
+                  >
                     <Leaf />
                     提炼为素材
                   </button>
-                  {!page.qa.pass &&
-                    ['重新排版', '重新排字'].includes(page.nextStep || '') && (
-                      <button
-                        disabled={disabled}
-                        onClick={() =>
-                          action('repair-page-layout', {
-                            pageNumber: page.number,
-                          })
-                        }
-                      >
-                        <RotateCcw />
-                        修复本页排版
-                      </button>
-                    )}
                 </div>
               </div>
             </div>
@@ -121,6 +127,7 @@ export function ProjectPictures({
               <div key={key}>
                 <button
                   className="image-button"
+                  aria-label={`点击查看分镜 ${key} 大图`}
                   onClick={() => setZoom({url: panel.url, title: `分镜 ${key}`})}
                 >
                   <img
@@ -132,8 +139,19 @@ export function ProjectPictures({
                 </button>
                 <div>
                   <span>分镜 {key}</span>
-                  <QaBadge qa={panel.qa} />
+                  <div className="panel-review-row">
+                    <QaBadge qa={panel.qa} />
+                    <button
+                      className="primary"
+                      disabled={disabled || !panel.file}
+                      onClick={() => action('review-image', {key})}
+                    >
+                      <Check />
+                      {qaAction(panel.qa)}
+                    </button>
+                  </div>
                   <button
+                    className="secondary"
                     aria-label={`修改分镜 ${key}`}
                     title={`修改分镜 ${key}`}
                     onClick={() => setEdit({key, title: `分镜 ${key}`})}
@@ -141,11 +159,13 @@ export function ProjectPictures({
                     <Pencil />
                   </button>
                   <button
+                    className="tertiary-action"
                     aria-label={`将分镜 ${key} 提炼为素材`}
                     title={`将分镜 ${key} 提炼为素材`}
                     onClick={() => analyze('panel', key)}
                   >
                     <Leaf />
+                    提炼为素材
                   </button>
                 </div>
               </div>
@@ -180,7 +200,7 @@ export function ProjectPictures({
             onClick={() => action('accept', {checks})}
           >
             <Check />
-            我已检查，收下成品
+            进入成品
           </button>
         </div>
       )}

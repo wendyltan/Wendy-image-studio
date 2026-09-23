@@ -61,6 +61,18 @@ test('composition keeps the 1080x1440 canvas, caption box, and footer page numbe
   assert.notEqual(crypto.createHash('sha256').update(fs.readFileSync(first)).digest('hex'),crypto.createHash('sha256').update(fs.readFileSync(second)).digest('hex'));
 });
 
+test('caption wrapping keeps Latin words together and bounds overlong tokens',()=>{
+  const script='import importlib.util,sys; s=importlib.util.spec_from_file_location("compose",sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(*m.wrap(sys.argv[2],int(sys.argv[3]),24),sep=chr(10))';
+  const run=(text,width)=>execFileSync(B.python(),['-c',script,path.join(path.resolve(import.meta.dirname,'..'),'server/compose.py'),text,String(width)],{encoding:'utf8'}).trimEnd().split('\n');
+  assert.deepEqual(run('routine',100),['routine']);
+  const mixed=run('固定的 routine，对我这个 i 人来说',120);
+  assert(mixed.some(line=>line.includes('routine')));
+  const long=run('中文 extraordinarilylongwordwithoutbreaks 和 abc-def',140);
+  assert(long.some(line=>line.includes('abc-def')));
+  const measured=execFileSync(B.python(),['-c','from PIL import ImageFont; import sys; f=ImageFont.truetype("/System/Library/Fonts/STHeiti Light.ttc",24); print(max((f.getlength(x) for x in sys.stdin.read().splitlines()),default=0))'],{input:long.join('\n'),encoding:'utf8'});
+  assert(Number(measured)<=140);
+});
+
 test('old page records are stale while the new composition version is current',()=>{
   const project={plan:{pages:[{number:1,panels:[{}]}]},panels:{'1-1':{file:'v1/source.png'}},artifacts:[
     {id:'image:第1页-第1格',file:'v1/source.png',valid:true},

@@ -1,5 +1,5 @@
 """Deterministic Chinese lettering, screen compositing, and page export."""
-import sys, json, math, zipfile, hashlib
+import sys, json, math, zipfile, hashlib, re
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter
 FONT='/System/Library/Fonts/STHeiti Light.ttc'
@@ -9,11 +9,20 @@ def font(size): return ImageFont.truetype(FONT,size)
 def medium(size): return ImageFont.truetype(FONT_MEDIUM,size)
 def wrap(text,width,size=24):
     f=font(size); lines=[]
+    token_pattern=re.compile(r"[A-Za-z0-9]+(?:['’\-][A-Za-z0-9]+)*")
     for paragraph in text.split('\n'):
-        line=''
-        for char in paragraph:
-            if line and f.getlength(line+char)>width: lines.append(line); line=char
-            else: line+=char
+        line='';units=[];position=0
+        for match in token_pattern.finditer(paragraph):
+            units.extend(paragraph[position:match.start()]);units.append(match.group());position=match.end()
+        units.extend(paragraph[position:])
+        for unit in units:
+            if line and f.getlength(line+unit)>width:
+                lines.append(line);line=''
+            if f.getlength(unit)>width:
+                for char in unit:
+                    if line and f.getlength(line+char)>width:lines.append(line);line=''
+                    line+=char
+            else:line+=unit
         lines.append(line)
     return lines if text else []
 def boxes(page):
@@ -40,9 +49,15 @@ def geometry(page,hints=None):
         if len(lines)>6: raise ValueError('文案过长，请减少文字或改用更大的分镜。')
         out.append({'box':list(box),'width':w-2,'height':h-2,'lines':lines,'ratio':round((w-2)/(h-2),4)})
     return out
-def rounded_paste(canvas,im,box,radius=23):
-    x,y,w,h=box;im=ImageOps.fit(im,(w-2,h-2),method=Image.Resampling.LANCZOS)
-    mask=Image.new('L',(w-2,h-2),0);ImageDraw.Draw(mask).rounded_rectangle((0,0,w-3,h-3),radius=max(3,radius-1),fill=255)
+def rounded_paste(canvas,im,box,radius=23,object_fit='cover'):
+    x,y,w,h=box;inner=(w-2,h-2)
+    if object_fit=='contain':
+        fitted=ImageOps.contain(im,inner,method=Image.Resampling.LANCZOS)
+        im=Image.new('RGB',inner,BG)
+        im.paste(fitted,((inner[0]-fitted.width)//2,(inner[1]-fitted.height)//2))
+    else:
+        im=ImageOps.fit(im,inner,method=Image.Resampling.LANCZOS)
+    mask=Image.new('L',inner,0);ImageDraw.Draw(mask).rounded_rectangle((0,0,w-3,h-3),radius=max(3,radius-1),fill=255)
     canvas.paste(im,(x+1,y+1),mask)
 def caption_anchor(panel,index,override=None):
     if override in {'top-left','top-right','bottom-left','bottom-right'}: return override
@@ -63,13 +78,15 @@ def caption_box(canvas,panel,lines,box,index,anchor=None):
     for i,line in enumerate(lines):ld.text((bx+18,by+9+i*line_h),line,font=f,fill=(65,49,40,255))
     canvas.paste(layer,(0,0),layer)
 def compose(spec):
-    page=spec['page'];hints=spec.get('layoutHints') or {};anchors=hints.get('captionAnchors') or [];canvas=Image.new('RGB',(1080,1440),BG);d=ImageDraw.Draw(canvas)
+    page=spec['page'];hints=spec.get('layoutHints') or {};anchors=hints.get('captionAnchors') or [];fit_modes=hints.get('objectFitByPanel') or [];canvas=Image.new('RGB',(1080,1440),BG);d=ImageDraw.Draw(canvas)
     for index,(p,g,file) in enumerate(zip(page['panels'],geometry(page,hints),spec['images'])):
         im=ImageOps.exif_transpose(Image.open(file)).convert('RGB');w,h=g['width'],g['height']
         discrepancy=abs((im.width/im.height)/(w/h)-1)
         # Small edge trimming is covered by the prompt's 8% safe area. Never distort or pad.
         if discrepancy>.18:raise ValueError(f'原图比例不适合分镜（目标 {w}:{h}），请重新生成合适比例的画面。')
-        x,y,bw,bh=g['box'];rounded_paste(canvas,im,(x,y,bw,bh));d.rounded_rectangle((x,y,x+bw,y+bh),radius=23,outline=BORDER,width=2)
+        x,y,bw,bh=g['box'];object_fit=fit_modes[index] if index<len(fit_modes) else 'cover'
+        if object_fit not in {'cover','contain'}:raise ValueError('不支持的图片容器适配方式。')
+        rounded_paste(canvas,im,(x,y,bw,bh),object_fit=object_fit);d.rounded_rectangle((x,y,x+bw,y+bh),radius=23,outline=BORDER,width=2)
         caption_box(canvas,p,g['lines'],(x,y,bw,bh),index,anchors[index] if index<len(anchors) else None)
     d=ImageDraw.Draw(canvas);num=f"{page['number']:02d}";nf=font(16)
     d.rounded_rectangle((1004,1389,1058,1427),radius=16,fill='#f7f1e7',outline='#a58c78',width=1)

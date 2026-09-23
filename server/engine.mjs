@@ -728,12 +728,17 @@ export function repairPageLayout(p,pageNumber){
   verifyApproval(p);if(p.pending)throw new Error('有一张原图结果尚未确认，暂不能调整页面排版。');if(p.accepted)throw new Error('已收下的成品请先建立新版本再调整。');
   const number=Number(pageNumber),page=p.plan.pages.find(item=>item.number===number),current=p.pages.find(item=>item.number===number);
   if(!page||!current)throw new Error('这一页还没有可调整的成稿。');if(page.panels.some((_,index)=>!p.panels[`${number}-${index+1}`]?.file))throw new Error('这一页的原始分镜还不完整。');
-  return job(p,'revising',async signal=>{
-    activity(p,`正在只调整第 ${number} 页的文字框位置，不会重新生图…`,number,p.plan.pages.length,'页面');
+  // Page reflow is an entirely local job.  Keep it out of the generic
+  // revising/image phase so browser leases and image-worker state can never
+  // be consulted by this path.
+  return job(p,'page-layout',async signal=>{
+    activity(p,`准备排版第 ${number} 页（本地，不重新生图）`,number,p.plan.pages.length,'页面');
     invalidatePagePresentation(p,number,'layout-repaired');p.pageLayouts=p.pageLayouts||{};p.pageLayouts[number]=repairedLayoutHints(page,current.qa,p.pageLayouts[number]);saveProject(p);
+    activity(p,`正在合成第 ${number} 页（本地排版器）`,number,p.plan.pages.length,'页面');
     const result=await composePage(p,page,signal);p.error=null;
-    if(result.qa.pass){p.status='paused';activity(p,`第 ${number} 页排版已修复并通过检查；原始分镜没有重新生成。`,number,p.plan.pages.length,'页面');}
-    else {p.status='attention';activity(p,`第 ${number} 页已换用新的文字框位置，但仍有排版问题，请查看后再次调整。`,number,p.plan.pages.length,'页面');}
+    activity(p,`正在校验第 ${number} 页成稿`,number,p.plan.pages.length,'页面');
+    if(result.qa.pass){p.status='paused';activity(p,`第 ${number} 页排版完成；原始分镜没有重新生成。`,number,p.plan.pages.length,'页面');}
+    else {p.status='attention';activity(p,`第 ${number} 页排版失败：仍有排版问题，请查看后再次调整。`,number,p.plan.pages.length,'页面');}
   });
 }
 export function unifyPageLayouts(p){
