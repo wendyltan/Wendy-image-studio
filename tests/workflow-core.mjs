@@ -193,6 +193,45 @@ test('page layout repair and whole-story unification never regenerate source ima
   await E.confirmPageLayout(layout,{pageNumber:1,projectVersion:layout.version,contentHash});
   assert.equal(unconfirmed.layoutVerification.manualConfirmationRequired,false);assert.ok(unconfirmed.layoutVerification.confirmedAt);assert.equal(unconfirmed.layoutVerification.confirmedFileSha256,unconfirmed.integrity.sha256);assert.equal(unconfirmed.qa.manualReviewRequired,false);assert.equal(unconfirmed.qa.status,'human_confirmed_layout');assert.deepEqual(unconfirmed.layoutVerification.beforeQa,verificationBefore.beforeQa);assert.deepEqual(unconfirmed.layoutVerification.afterQa,verificationBefore.afterQa);assert.equal(E.pageIsCurrent(layout,unconfirmed),true);
 });
+test('legacy manual layout confirmation remains explicit and requires current source evidence',async()=>{
+  let layout=E.createProject({...brief,idea:'旧页面人工确认门禁'});layout.plan=structuredClone(plan);layout.version=1;layout.approved={version:1,hash:W.digest(layout.plan)};layout.samplesApproved=true;layout.status='paused';E.saveProject(layout);
+  E.generatePages(layout);layout=await done(layout.id);const page=layout.pages[0],artifact=layout.artifacts.find(item=>item.id==='page:1');
+  page.qa={...page.qa,pass:true,status:'manual_layout_review',manualReviewRequired:true};delete page.layoutVerification;delete page.projectVersion;delete page.sourceIntegrity;delete artifact.projectVersion;delete artifact.sourceIntegrity;
+  const contentHash=W.digest({artifactId:'page:1',file:page.file,at:page.at||artifact.at||null});
+  const sourceHash=page.integrity.sha256;
+  await assert.rejects(E.confirmPageLayout(layout,{pageNumber:1,projectVersion:layout.version,contentHash:'stale'}),/内容已更新/);
+  assert.equal(page.qa.manualReviewRequired,true);assert.equal(page.integrity.sha256,sourceHash);
+  const sourceArtifact=layout.artifacts.find(item=>item.id==='image:第1页-第1格'),sourceFile=sourceArtifact.file;sourceArtifact.file+='-mismatch';
+  await assert.rejects(E.confirmPageLayout(layout,{pageNumber:1,projectVersion:layout.version,contentHash}),/当前分镜 artifact 不完整/);sourceArtifact.file=sourceFile;
+  await E.confirmPageLayout(layout,{pageNumber:1,projectVersion:layout.version,contentHash});
+  assert.equal(page.qa.manualReviewRequired,false);assert.equal(page.qa.status,'human_confirmed_layout');assert.equal(page.layoutVerification.confirmedFileSha256,sourceHash);
+});
+test('panel revision only freezes same-page originals when continuity is explicitly requested',async()=>{
+  const p=E.createProject({...brief,idea:'局部修订连续性附件选择'});p.version=1;p.plan=structuredClone(plan);p.approved={version:1,hash:W.digest(p.plan)};
+  assert.deepEqual(E.revisionContinuityKeys(p,'1-1','只改人物表情，不涉及其他画面'),[]);
+  p.plan.pages[0].panels=[structuredClone(panel),structuredClone(panel),structuredClone(panel)];
+  p.plan.pages[0].layout='montage';
+  p.approved.hash=W.digest(p.plan);
+  assert.deepEqual(E.revisionContinuityKeys(p,'1-3','请和同页前两格保持椅子款式一致'),['1-1','1-2']);
+  const root=E.projectDir(p.id),source=W.inside(W.REFS,W.FACE[0]),sha=sha256File(source),at=new Date().toISOString();fs.mkdirSync(path.join(root,'v1','素材'),{recursive:true});
+  p.panels={};p.artifacts=[];
+  for(const key of ['1-1','1-2','1-3']){const file=path.join(root,'v1','素材',`${key}.png`);fs.copyFileSync(source,file);const relative=path.relative(root,file),integrity={sha256:sha256File(file),sizeBytes:fs.statSync(file).size};p.panels[key]={key,file:relative,basePrompt:panel.prompt,integrity,qa:{pass:true,status:'passed',issueDetails:[]},at};p.artifacts.push({id:`image:第1页-第${key.split('-')[1]}格`,kind:'image',file:relative,valid:true,integrity,at});}
+  E.saveProject(p);E.reviseImage(p,'1-3','请和同页前两格保持椅子款式一致');const revised=await done(p.id);
+  assert.equal(revised.revisionNotes.at(-1).continuityAttachments.length,2);
+  const note=revised.revisionNotes.at(-1);for(const item of note.continuityAttachments){assert.equal(sha256File(W.inside(root,item.file)),item.sha256);assert.equal(sha256File(path.join(root,'v1','参考',item.reference)),item.sha256);}
+  const run=fs.readdirSync(path.join(root,'.制作记录')).map(name=>path.join(root,'.制作记录',name)).find(dir=>dir.includes('1-3-局部修订')),request=JSON.parse(fs.readFileSync(path.join(run,'request.json'),'utf8'));
+  assert.equal(request.referenceNames.length,3);assert(request.referenceNames.includes(note.continuityAttachments[0].reference));assert(request.referenceNames.includes(note.continuityAttachments[1].reference));assert.equal(request.referenceFiles.length,6);
+  const remotePrompt=fs.readFileSync(path.join(run,'prompt.txt'),'utf8');assert.match(remotePrompt,/编辑基图/);assert.match(remotePrompt,/末尾追加的 2 张同页参考/);assert.match(remotePrompt,/椅子款式与书房环境连续性/);assert.match(remotePrompt,/不要拼接或合成多格/);
+  revised.currentTask={id:'failed-continuity-revision',kind:'image',target:'第1页-第3格',status:'failed_no_output',errorCode:'no-output',providerInvocations:0};revised.lastFailure={kind:'no-output',definiteNoOutput:true,key:'第1页-第3格',attempts:0};revised.status='attention';
+  E.retryMissingImage(revised,'1-3');const retried=await done(p.id);assert.equal(retried.currentTask.target,'第1页-第3格',retried.error||retried.message);
+  const retryDirs=fs.readdirSync(path.join(root,'.制作记录')).map(name=>path.join(root,'.制作记录',name)).filter(dir=>fs.existsSync(path.join(dir,'request.json'))),retryRequests=retryDirs.map(dir=>({dir,request:JSON.parse(fs.readFileSync(path.join(dir,'request.json'),'utf8'))})).filter(item=>item.request.target==='第1页-第3格'),retryRun=retryRequests.at(-1),retryRequest=retryRun?.request;
+  assert(retryRequest);assert(retryRequest.referenceNames.includes(note.continuityAttachments[0].reference));assert(retryRequest.referenceNames.includes(note.continuityAttachments[1].reference));assert.equal(retryRequest.referenceFiles.length,6);assert.match(fs.readFileSync(path.join(retryRun.dir,'prompt.txt'),'utf8'),/末尾追加的 2 张同页参考/);
+  const newestNote=retried.revisionNotes.at(-1),snapshotPath=path.join(root,'v1','参考',newestNote.continuityAttachments[0].reference),snapshotBytes=fs.readFileSync(snapshotPath);fs.chmodSync(snapshotPath,0o644);fs.copyFileSync(W.inside(W.REFS,W.FACE[1]),snapshotPath);fs.chmodSync(snapshotPath,0o444);
+  retried.currentTask={id:'tampered-continuity-revision',kind:'image',target:'第1页-第3格',status:'failed_no_output',errorCode:'no-output',providerInvocations:0};retried.lastFailure={kind:'no-output',definiteNoOutput:true,key:'第1页-第3格',attempts:0};E.retryMissingImage(retried,'1-3');const tampered=await done(p.id);assert.match(tampered.error,/哈希已变化/);
+  fs.chmodSync(snapshotPath,0o644);fs.writeFileSync(snapshotPath,snapshotBytes);fs.chmodSync(snapshotPath,0o444);
+  const restored=E.readProject(p.id),restoredNote=restored.revisionNotes.at(-1);restoredNote.projectVersion=99;restored.currentTask={id:'stale-continuity-revision',kind:'image',target:'第1页-第3格',status:'failed_no_output',errorCode:'no-output',providerInvocations:0};restored.lastFailure={kind:'no-output',definiteNoOutput:true,key:'第1页-第3格',attempts:0};E.retryMissingImage(restored,'1-3');const rejected=await done(p.id);assert.match(rejected.error,/其他作品版本/);
+  const legacy=E.readProject(p.id),legacyNote=legacy.revisionNotes.at(-1);delete legacyNote.projectVersion;delete legacyNote.continuityAttachments;delete legacyNote.baseSha256;legacy.currentTask={id:'legacy-no-base-sha',kind:'image',target:'第1页-第3格',status:'failed_no_output',errorCode:'no-output',providerInvocations:0};legacy.lastFailure={kind:'no-output',definiteNoOutput:true,key:'第1页-第3格',attempts:0};E.retryMissingImage(legacy,'1-3');const rejectedLegacy=await done(p.id);assert.match(rejectedLegacy.error,/SHA-256/);
+});
 test('panel revision invalidates stale page before QA resume and export',async()=>{
   let revised=E.createProject({...brief,idea:'正式分镜修订失效边界测试',workflowPreset:'careful'});E.planProject(revised);revised=await done(revised.id);E.approvePlan(revised,W.digest(revised.plan));revised=await done(revised.id);E.approveSamples(revised,revised.approved.hash);revised=await done(revised.id);
   assert.equal(revised.status,'ready');

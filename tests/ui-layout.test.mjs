@@ -114,11 +114,12 @@ test('page and storyboard cards expose one clear action hierarchy with accessibl
   assert.match(pictures, /修改分镜 \{panelKey\}/);
   assert.match(
     pictures,
-    /action\('confirm-page-layout', \{[\s\S]*?projectVersion: page\.projectVersion,[\s\S]*?contentHash: page\.contentHash/,
+    /action\('confirm-page-layout', \{[\s\S]*?projectVersion: project\.version,[\s\S]*?contentHash: page\.contentHash/,
   );
-  assert.match(pictures, /若仍有遮挡，请不要确认，可先重新校对并保留问题记录/);
+  assert.match(pictures, /page\.qa\.manualReviewRequired === true[\s\S]*?确认这一页排版/);
+  assert.match(pictures, /待人工复核：请先查看页面大图/);
   assert.match(pictures, /分镜校对只检查这一张原图/);
-  assert.match(pictures, /已重排，待人工确认遮挡是否解决/);
+  assert.match(pictures, /核对本页当前文件及分镜来源无误/);
   assert.match(pictures, /className="tertiary-action"[\s\S]*?提炼为素材/);
   assert.match(css, /\.inline-actions \.primary,[\s\S]*?min-height:42px/);
   assert.match(css, /\.tertiary-action:focus-visible/);

@@ -191,9 +191,11 @@ export function ProjectPictures({
                   />
                 </h3>
                 <p>{page.qa.summary}</p>
-                {page.layoutVerification?.manualConfirmationRequired && (
+                {(page.layoutVerification?.manualConfirmationRequired ||
+                  (page.qa.manualReviewRequired === true &&
+                    page.qa.status === 'manual_layout_review')) && (
                   <p className="muted">
-                    已重排，待人工确认遮挡是否解决。可点上方成稿查看大图；若仍有遮挡，请不要确认，可先重新校对并保留问题记录。系统不会自动重排或生图。
+                    待人工复核：请先查看页面大图，确认文字未遮挡主体，并核对本页当前文件及分镜来源无误；只有确认后再点击下方按钮。系统不会自动重排或生图。
                   </p>
                 )}
                 {sourceIssueGroups(page.number, page.qa.issueDetails || []).map(
@@ -249,19 +251,21 @@ export function ProjectPictures({
                         <Check />
                         {qaAction(page.qa, true)}
                       </button>
-                      {page.layoutVerification?.manualConfirmationRequired &&
+                      {(page.layoutVerification?.manualConfirmationRequired ||
+                        (page.qa.manualReviewRequired === true &&
+                          page.qa.status === 'manual_layout_review')) &&
                         page.qa.pass === true && (
                           <button
                             className="primary"
                             disabled={
                               disabled ||
                               !page.contentHash ||
-                              page.projectVersion === undefined
+                              project.version === undefined
                             }
                             onClick={() =>
                               action('confirm-page-layout', {
                                 pageNumber: page.number,
-                                projectVersion: page.projectVersion,
+                                projectVersion: project.version,
                                 contentHash: page.contentHash,
                               })
                             }

@@ -596,6 +596,61 @@ function layoutOnlyRevision(note){
   const hasImageChange=/(?:人物|脸|五官|发型|头发|服装|动作|手|脚|姿势|视线|表情|场景|背景|物件|泳包|杯子|电脑|光线|画面|构图|比例|安全区|噪点|颗粒|颜色|色彩)/.test(text);
   return hasLayout&&!hasImageChange;
 }
+function continuityRequested(note,qaRecord){
+  const explicit=/(?:同页|同一页|前[一二三四五六七八九十两\d]+格|上一格|前一格|连续性|同款|保持.{0,10}一致|一致.{0,10}(?:椅子|座椅|物件|场景))/u;
+  return explicit.test(String(note||''))||(qaRecord?.issueDetails||[]).some(issue=>issue?.category==='continuity'&&explicit.test(String(issue.description||'')));
+}
+export function revisionContinuityKeys(p,key,note){
+  const match=/^(\d+)-(\d+)$/.exec(String(key));if(!match)return [];
+  const pageNumber=Number(match[1]),panelNumber=Number(match[2]),record=p.panels?.[key];
+  if(panelNumber<2||!continuityRequested(note,record?.qa))return [];
+  const siblings=p.plan?.pages?.[pageNumber-1]?.panels||[];
+  return Array.from({length:panelNumber-1},(_,index)=>`${pageNumber}-${index+1}`).filter((_,index)=>Boolean(siblings[index]));
+}
+function freezeRevisionContinuityRefs(p,keys){
+  const names=[],evidence=[];
+  for(const key of keys){
+    const record=p.panels?.[key],artifact=currentImageArtifact(p,key);
+    if(!record?.file||!artifact||artifact.file!==record.file)throw new Error(`同页连续性参考 ${key} 已不是当前有效分镜，请先恢复当前原图。`);
+    const source=inside(projectDir(p.id),record.file),sha256=checksum(source);
+    if(record.integrity?.sha256!==sha256||(artifact.integrity?.sha256&&artifact.integrity.sha256!==sha256))throw new Error(`同页连续性参考 ${key} 的原图哈希不匹配，请先恢复当前原图。`);
+    const name=`同页连续性/${key}-${sha256.slice(0,16)}${path.extname(source)||'.png'}`,target=inside(path.join(versionDir(p),'参考'),name);
+    fs.mkdirSync(path.dirname(target),{recursive:true});
+    if(fs.existsSync(target)){if(checksum(target)!==sha256)throw new Error(`同页连续性参考 ${key} 的冻结副本哈希不匹配。`);}
+    else fs.copyFileSync(source,target);
+    fs.chmodSync(target,0o444);
+    names.push(name);evidence.push({key,file:record.file,sha256,reference:name,artifactId:artifact.id,projectVersion:p.version});
+  }
+  return {names,evidence};
+}
+function revisionRetryContinuityRefs(p,panelKey,revision){
+  if(revision?.projectVersion!==undefined&&Number(revision.projectVersion)!==Number(p.version))throw new Error('这条局部修订属于其他作品版本，不能沿用其同页参考图。');
+  const keys=revisionContinuityKeys(p,panelKey,revision?.note);
+  if(!keys.length)return [];
+  let evidence=revision.continuityAttachments;
+  if(!Array.isArray(evidence)||!evidence.length){
+    const prefix=`v${p.version}${path.sep}`;
+    if(typeof revision.baseFile!=='string'||!revision.baseFile.split('/').join(path.sep).startsWith(prefix)||typeof revision.baseSha256!=='string'||!/^[a-f0-9]{64}$/i.test(revision.baseSha256))throw new Error('旧修订缺少可证明的当前版本基图路径或 SHA-256，不能安全补建同页参考。');
+    if(checksum(inside(projectDir(p.id),revision.baseFile))!==revision.baseSha256)throw new Error('旧修订基图哈希已变化，不能补建同页参考。');
+    const frozen=freezeRevisionContinuityRefs(p,keys);evidence=frozen.evidence;revision.continuityAttachments=evidence;revision.projectVersion=p.version;saveProject(p);
+  }
+  if(evidence.length!==keys.length||keys.some((key,index)=>evidence[index]?.key!==key))throw new Error('这条修订的同页参考附件身份不完整，不能安全重试。');
+  for(const item of evidence){
+    if(Number(item.projectVersion)!==Number(p.version)||item.artifactId!==artifactIdForImageKey(item.key))throw new Error('同页参考附件属于其他作品版本或分镜，不能安全重试。');
+    const record=p.panels?.[item.key],artifact=currentImageArtifact(p,item.key);
+    if(!record?.file||record.file!==item.file||artifact?.file!==item.file)throw new Error(`同页参考 ${item.key} 的当前来源身份已变化，不能安全重试。`);
+    const source=inside(projectDir(p.id),item.file),snapshot=inside(path.join(versionDir(p),'参考'),item.reference);
+    if(checksum(source)!==item.sha256||record.integrity?.sha256!==item.sha256||(artifact.integrity?.sha256&&artifact.integrity.sha256!==item.sha256)||!fs.existsSync(snapshot)||checksum(snapshot)!==item.sha256)throw new Error(`同页参考 ${item.key} 的原图或冻结副本哈希已变化，不能安全重试。`);
+  }
+  return evidence.map(item=>item.reference);
+}
+function withContinuityAttachmentRoles(prompt,key,note,count){
+  if(!count)return prompt;
+  const match=/^(\d+)-(\d+)$/.exec(String(key));if(!match)return prompt;
+  const page=Number(match[1]),panel=Number(match[2]),names=Array.from({length:count},(_,index)=>`第 ${page} 页第 ${index+1} 格`).join('、');
+  const scope=/(?:书椅|椅子|座椅|书房)/u.test(String(note||''))?'仅用于核对椅子款式与书房环境连续性':'仅用于核对同页连续性';
+  return `${prompt}\n附件用途说明：第 1 张是第 ${page} 页第 ${panel} 格的编辑基图。末尾追加的 ${count} 张同页参考依次为${names}，${scope}；其余固定参考附件仅按原用途参考。请保留本格其他内容并只执行本次修改目标，不要拼接或合成多格，不要把参考图改画成目标内容。`;
+}
 /* Image file inspection, orphan evidence, and explicit recovery live in
  * image-recovery.mjs. Keep the engine's aliases here for the public workflow. */
 export function sampleProject(p){verifyApproval(p);return job(p,'sampling',async signal=>{
@@ -932,10 +987,13 @@ export async function confirmPageLayout(p,{pageNumber,projectVersion,contentHash
   verifyApproval(p);if(p.pending||active.has(p.id)||hasLiveWork(p.id))throw new Error('当前作品仍有任务运行，暂不能确认页面排版。');
   const number=Number(pageNumber),page=p.pages?.find(item=>Number(item.number)===number),artifact=(p.artifacts||[]).find(item=>item.id===`page:${number}`&&item.file===page?.file);
   if(!page||!artifact)throw new Error('这一页没有可确认的当前成稿。');
-  if(Number(projectVersion)!==Number(p.version)||Number(page.projectVersion)!==Number(p.version)||Number(artifact.projectVersion)!==Number(p.version))throw new Error('作品版本已变化，请重新打开当前成稿后再确认。');
+  const legacyPageVersion=page.projectVersion===undefined||page.projectVersion===null;
+  const legacyArtifactVersion=artifact.projectVersion===undefined||artifact.projectVersion===null;
+  if(Number(projectVersion)!==Number(p.version)||(!legacyPageVersion&&Number(page.projectVersion)!==Number(p.version))||(!legacyArtifactVersion&&Number(artifact.projectVersion)!==Number(p.version)))throw new Error('作品版本已变化，请重新打开当前成稿后再确认。');
   const expectedContentHash=digest({artifactId:`page:${number}`,file:page.file,at:page.at||artifact.at||null});
   if(String(contentHash||'')!==expectedContentHash)throw new Error('成稿内容已更新，请重新查看当前页面后再确认。');
-  if(page.qa?.pass!==true||page.layoutVerification?.manualConfirmationRequired!==true)throw new Error('只有校对通过且明确标记待人工确认的重排页面，才能进行此确认。');
+  const manualGate=page.layoutVerification?.manualConfirmationRequired===true||(page.qa?.manualReviewRequired===true&&page.qa?.status==='manual_layout_review');
+  if(page.qa?.pass!==true||!manualGate)throw new Error('只有校对通过且明确标记待人工确认的页面，才能进行此确认。');
   const evidence=await validatePageReviewEvidence(p,number);
   if(evidence.integrity.sha256!==page.integrity?.sha256)throw new Error('成稿文件已变化，请重新打开页面后再确认。');
   const confirmedAt=new Date().toISOString();
@@ -999,8 +1057,10 @@ export function reviseImage(p,key,note,options={}){
   const revisionPrompt=buildRevisionPrompt(prompt,note,{key,baseFile});
   return job(p,'revising',async signal=>{
     activity(p,'正在按你的说明修改这一张，原版本会保留；只传本次修改差异…');p.accepted=false;
-    p.revisionNotes.push({key,note:note.trim(),mode:'image-delta',basePrompt:prompt,baseFile,baseSha256,selectedBy:revisionBase.selectedBy,at:new Date().toISOString()});
-    const result=await generate(p,key+'-局部修订',revisionPrompt,refs,signal,prior,true,'原始分镜',1,{basePrompt:prompt,revisionDelta:note.trim(),revisionBase});
+    const continuityKeys=panel?revisionContinuityKeys(p,key,note):[],continuity=continuityKeys.length?freezeRevisionContinuityRefs(p,continuityKeys):{names:[],evidence:[]};
+    const revisionRefs=[...refs,...continuity.names],remoteRevisionPrompt=withContinuityAttachmentRoles(revisionPrompt,key,note,continuity.names.length);
+    p.revisionNotes.push({key,note:note.trim(),mode:'image-delta',projectVersion:p.version,basePrompt:prompt,baseFile,baseSha256,selectedBy:revisionBase.selectedBy,...(continuity.evidence.length?{continuityAttachments:continuity.evidence}:{}),at:new Date().toISOString()});
+    const result=await generate(p,key+'-局部修订',remoteRevisionPrompt,revisionRefs,signal,prior,true,'原始分镜',1,{basePrompt:prompt,revisionDelta:note.trim(),revisionBase});
     if(sample){p.samples[+sample[1]-1]=result;p.samplesApproved=false;p.status=p.samples.length===2&&p.samples.every(q=>q.qa.pass)?'samples_review':'attention';}
     else {p.panels[key]=result;const pageId=+panel[1];if(result.qa.pass)await addScreen(p,key,p.plan.pages[pageId-1].panels[+panel[2]-1],signal);if(result.qa.pass)await composePage(p,p.plan.pages[pageId-1],signal);p.status='paused';}
     saveProject(p);if(!result.qa.pass)throw new Error(result.qa.issues.join('；'));activity(p,sample?'样张已更新，请重新确认。':'这一格已修好并更新页面，可以继续制作与整篇校对。');
@@ -1055,10 +1115,11 @@ export function retryMissingImage(p,target,{allowUnknownResult=false}={}){
       const basePrompt=String(panelRevision.basePrompt||panel.prompt||prompt),revisionDelta=String(panelRevision.note||'').trim();if(!revisionDelta)throw new Error('原修订说明缺失，请重新提交这次修改。');revisionMeta={basePrompt,revisionDelta,revisionBase:{file:selectedBase,sha256:checksum(prior),selectedBy:panelRevision.selectedBy||'previous-stable-base',selectedAt:new Date().toISOString()}};
     }
     const finalPrompt=panelRevision?buildRevisionPrompt(revisionMeta.basePrompt,revisionMeta.revisionDelta,{key:panelKey,baseFile:revisionMeta.revisionBase.file}):prompt;
+    const retryContinuityRefs=panelRevision?revisionRetryContinuityRefs(p,panelKey,panelRevision):[],remoteFinalPrompt=withContinuityAttachmentRoles(finalPrompt,panelKey,panelRevision?.note,retryContinuityRefs.length);
     // A user-confirmed single-panel retry is an explicit review boundary. It
     // must run visual QA even when the project predates workflowPreset or was
     // created in quick/balanced mode; batch settings never waive this check.
-    const result=await generate(p,`第${pageNumber}页-第${panelNumber}格`,finalPrompt,panel.references,signal,prior,true,'原始分镜',Math.max(1,Number(failure.attempts||0)+1),revisionMeta);
+    const result=await generate(p,`第${pageNumber}页-第${panelNumber}格`,remoteFinalPrompt,[...panel.references,...retryContinuityRefs],signal,prior,true,'原始分镜',Math.max(1,Number(failure.attempts||0)+1),revisionMeta);
     p.panels[panelKey]=result;p.accepted=false;p.status='paused';const totalPanels=p.plan.pages.reduce((total,item)=>total+item.panels.length,0);activity(p,`${state.target||target} 已重新生成并保存；本次不会继续生成其他分镜。`,Object.keys(p.panels).length,totalPanels,'分镜');
   });
 }
