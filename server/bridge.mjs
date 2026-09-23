@@ -149,6 +149,11 @@ function browserToolCallInfo(event,{dir,cleanupCallUsed=false,runIdOverride=null
   if(!isBrowserNamespace||!isBrowserTool)return null;
   const type=String(event?.type||'').toLowerCase();
   const source=String(item.arguments?.code||item.arguments?.command||'');
+  // cua_repl requires its first call after a reset to initialize the runtime
+  // with one standalone getState(). It reads surface metadata but performs no
+  // browser action, so give exactly one such call a separately audited slot.
+  // Repeated getState calls are charged to the normal bootstrap budget.
+  const runtimeInitialization= /^\s*await\s+cua\.getState\(\)\s*;?\s*$/.test(source);
   // A CUA namespace can also be used by the executor to run a local manifest
   // helper.  That helper is an accounting/state write, not a browser action;
   // do not spend a browser slot on a call which contains no CUA/tab operation.
@@ -170,7 +175,7 @@ function browserToolCallInfo(event,{dir,cleanupCallUsed=false,runIdOverride=null
   const ownedTabMatches=Boolean(leaseOwnedTabId&&sourceOwnedTabId&&leaseOwnedTabId===sourceOwnedTabId);
   const cleanupCandidate=fixedCleanup&&closeLike;
   const cleanupAuthorized=cleanupCandidate&&lease?.state==='closing'&&leaseRunMatches&&sourceRunMatches&&ownedTabMatches&&!cleanupCallUsed;
-  return {id:String(item.id||event?.item_id||event?.id||''),phase:type.includes('started')?'started':type.includes('completed')?'completed':'other',kind:cleanupAuthorized?'cleanup':cleanupCandidate?'deferred_cleanup':'business',stage:browserToolBusinessStage(source),closeLike,fixedCleanup,cleanupCandidate,leaseState:lease?.state||null,leaseRunMatches,sourceRunMatches,ownedTabMatches,ownedTabId:leaseOwnedTabId||null};
+  return {id:String(item.id||event?.item_id||event?.id||''),phase:type.includes('started')?'started':type.includes('completed')?'completed':'other',kind:runtimeInitialization?'initialization':cleanupAuthorized?'cleanup':cleanupCandidate?'deferred_cleanup':'business',stage:browserToolBusinessStage(source),closeLike,fixedCleanup,cleanupCandidate,leaseState:lease?.state||null,leaseRunMatches,sourceRunMatches,ownedTabMatches,ownedTabId:leaseOwnedTabId||null};
 }
 
 function eventContainsSubmissionIntent(event){
@@ -483,7 +488,7 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
     let buf='',last='',error='',settled=false,timedOut=false,usage=null;
     const capturedEvents=[];
     let runtimeError=null;
-    let browserToolCalls=0,browserBusinessCalls=0,browserCleanupCalls=0,submissionIntentObserved=false,budgetFailure=null,anonymousCallSequence=0;
+    let browserToolCalls=0,browserBusinessCalls=0,browserCleanupCalls=0,browserInitializationCalls=0,submissionIntentObserved=false,budgetFailure=null,anonymousCallSequence=0;
     const browserBusinessStageCounts={};
     const browserToolCallIds=new Set();
     const deferredCleanupCallIds=new Set(),anonymousActiveCallIds=[];
@@ -498,7 +503,7 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
     const finish=(err,result,{responseText='',exitCode=null}={})=>{
       if(settled)return;settled=true;clearTimeout(timer);signal?.removeEventListener('abort',abort);log.end();
       try{compactResponseFile(resultPath);}catch{}
-      saveExecution({state:err?'failed':'completed',endedAt:new Date().toISOString(),exitCode,durationMs:Math.max(0,Date.now()-Date.parse(startedAt)),error:err?String(err.message||err).slice(0,500):null,browserToolCallCount:browserToolCalls,browserBusinessCallCount:browserBusinessCalls,browserCleanupCallCount:browserCleanupCalls,browserToolCallBudget:BROWSER_TOOL_BUSINESS_CALL_BUDGET,browserToolCleanupBudget:BROWSER_TOOL_CLEANUP_CALL_BUDGET,browserToolStageBudgets:BROWSER_TOOL_STAGE_BUDGETS,browserBusinessStageCounts,browserToolBudgetExceeded:Boolean(budgetFailure),submissionIntentObserved});
+      saveExecution({state:err?'failed':'completed',endedAt:new Date().toISOString(),exitCode,durationMs:Math.max(0,Date.now()-Date.parse(startedAt)),error:err?String(err.message||err).slice(0,500):null,browserToolCallCount:browserToolCalls,browserBusinessCallCount:browserBusinessCalls,browserInitializationCallCount:browserInitializationCalls,browserCleanupCallCount:browserCleanupCalls,browserToolCallBudget:BROWSER_TOOL_BUSINESS_CALL_BUDGET,browserToolCleanupBudget:BROWSER_TOOL_CLEANUP_CALL_BUDGET,browserToolStageBudgets:BROWSER_TOOL_STAGE_BUDGETS,browserBusinessStageCounts,browserToolBudgetExceeded:Boolean(budgetFailure),submissionIntentObserved});
       // The CUA executor is the only component allowed to close its tab.  If
       // it exited before writing verified close evidence, persist an explicit
       // unconfirmed/orphaned lease instead of claiming that the tab vanished.
@@ -526,7 +531,9 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
     const registerBrowserToolCall=(callKey,kind,event,stageHint=null,{deferTermination=false}={})=>{
       if(browserToolCallIds.has(callKey))return;
       browserToolCallIds.add(callKey);browserToolCalls+=1;
-      if(kind==='cleanup')browserCleanupCalls+=1;else {
+      const effectiveKind=kind==='initialization'&&browserInitializationCalls>0?'business':kind;
+      if(effectiveKind==='initialization')browserInitializationCalls+=1;
+      if(effectiveKind==='cleanup')browserCleanupCalls+=1;else if(effectiveKind!=='initialization'){
         browserBusinessCalls+=1;
         const stage=stageHint||browserToolBusinessStage(event?.item?.arguments?.code||event?.item?.arguments?.command||'');
         browserBusinessStageCounts[stage]=(browserBusinessStageCounts[stage]||0)+1;

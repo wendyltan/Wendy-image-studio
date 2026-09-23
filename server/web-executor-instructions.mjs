@@ -54,7 +54,7 @@ export function chatGptWebImagePrompt({outputFile,manifestFile,prompt,remoteProm
 - 参考文件必须作为彼此独立的附件上传并逐项确认。不得用截图代替附件。
 - 完成后必须下载网页生成的原始图片。网页截图、屏幕截图和程序绘制图片都不能作为结果。
 - 除写入下列目标图片和执行记录外，不修改本地文件。
-- CUA 输出必须保持紧凑：每次浏览器 CUA 调用可能自动附带截图并进入执行器上下文。父进程按阶段设置有限业务预算：bootstrap（创建专用 tab、记录句柄、导航/登录/聊天模式/创建图片入口）最多 3 次，upload（上传、核验附件、填入 remotePrompt）最多 2 次，submit（ready、submission-intent 后的一次发送和正向确认）最多 1 次，wait_download（等待生成与 pageAssets 原图下载）最多 2 次；业务总上限 8 次。另保留 1 个独立 cleanup/close 槽位；cleanup 槽位不计入业务槽，但只接受同时满足以下审计条件的最后清理调用：仍持有本次 owned tab、脚本包含固定标记 ${BROWSER_CLEANUP_MARKER}、已先写入 owned-tab 的 closing 阶段、并在同一 finally/固定收尾路径调用同一句柄的 close。普通业务脚本即使出现 close() 也按业务调用计数，不能伪装成 cleanup；cleanup 只能使用一次。推荐业务调用为：bootstrap 2–3 次；upload 1–2 次；submit 1 次；wait_download 1–2 次。不要为每个按钮或每个附件单独发起 CUA 调用。禁止调用 getScreenshot()、getAXStateAndScreenshot() 或 domSnapshot()。需要读取 DOM 时，只在当前脚本变量中调用 tab.getAXState({emit:false})，解析成布尔值、附件名称数组、数量、发送按钮状态、当前 URL 和错误摘要，再通过 nodeRepl.write(JSON.stringify(summary)) 返回；任何中间输出不得包含 AX 原文、页面截图、data:image/base64、完整侧边栏或提示词，单次摘要不超过 4KB。必须把导航、创建图片入口、路径 A/B、setFiles、附件核验和填词合并到尽可能少的 CUA 调用；通过 ready 后把 submission-intent 与紧接着的一次发送/正向确认合并到同一个最短 CUA 调用。完整截图/base64 不属于状态证据，禁止写入事件、回复或下一轮上下文。
+- CUA 输出必须保持紧凑：每次浏览器 CUA 调用可能自动附带截图并进入执行器上下文。运行时首次初始化只允许一次独立、精确的 await cua.getState()；它被单独记账，不消耗业务预算，重复调用仍按 bootstrap 计数。父进程按阶段设置有限业务预算：bootstrap（创建专用 tab、记录句柄、导航/登录/聊天模式/创建图片入口）最多 3 次，upload（上传、核验附件、填入 remotePrompt）最多 2 次，submit（ready、submission-intent 后的一次发送和正向确认）最多 1 次，wait_download（等待生成与 pageAssets 原图下载）最多 2 次；业务总上限 8 次。另保留 1 个独立 cleanup/close 槽位；cleanup 槽位不计入业务槽，但只接受同时满足以下审计条件的最后清理调用：仍持有本次 owned tab、脚本包含固定标记 ${BROWSER_CLEANUP_MARKER}、已先写入 owned-tab 的 closing 阶段、并在同一 finally/固定收尾路径调用同一句柄的 close。普通业务脚本即使出现 close() 也按业务调用计数，不能伪装成 cleanup；cleanup 只能使用一次。推荐业务调用为：bootstrap 2–3 次；upload 1–2 次；submit 1 次；wait_download 1–2 次。不要为每个按钮或每个附件单独发起 CUA 调用。禁止调用 getScreenshot()、getAXStateAndScreenshot() 或 domSnapshot()。需要读取 DOM 时，只在当前脚本变量中调用 tab.getAXState({emit:false})，解析成布尔值、附件名称数组、数量、发送按钮状态、当前 URL 和错误摘要，再通过 nodeRepl.write(JSON.stringify(summary)) 返回；任何中间输出不得包含 AX 原文、页面截图、data:image/base64、完整侧边栏或提示词，单次摘要不超过 4KB。必须把导航、创建图片入口、路径 A/B、setFiles、附件核验和填词合并到尽可能少的 CUA 调用；通过 ready 后把 submission-intent 与紧接着的一次发送/正向确认合并到同一个最短 CUA 调用。完整截图/base64 不属于状态证据，禁止写入事件、回复或下一轮上下文。
 
 失败阶段矩阵（必须按阶段写入完整字段，不得省略）：
 - 通用失败命令模板（必须替换为对应阶段的 typed 值）：${commands.failed}
@@ -124,10 +124,10 @@ export function ownedTabCleanupPrompt({manifestFile,runId,requestId,ownedTabId} 
 - cleanup 前必须用 ${commands.ownedTabStage('closing', resolvedTabId)} 写入 closing；不要把任何其他 tab 标记为 closing。
 - 只在同一个返回句柄上执行 await tab.close()。只有 close() 返回成功后，才执行 ${commands.ownedTabCleanup('closed', resolvedTabId, '', 'exact-owned-tab-close-returned')}；不得凭 getTab 不存在、超时、锁屏或猜测写成 closed。
 - 如果 getTab 失败、Chrome 被锁定或 close 抛错，只执行 ${commands.ownedTabCleanup('cleanup_pending', resolvedTabId, '<真实原因>', '')}，保留 orphaned/cleanup_pending，供解锁后再次 cleanup-only；不要导航、重试创建 tab 或操作任何其他 tab。
-- 本次必须只有一个 cleanup CUA 调用，且脚本必须包含固定标记 ${BROWSER_CLEANUP_MARKER}。不输出截图、DOM、base64 或其他页面内容。
+- 本次必须只有一个 cleanup CUA 调用，且脚本必须包含固定标记 ${BROWSER_CLEANUP_MARKER}，并把标记写成 JavaScript 注释；不要把它作为表达式执行。不输出截图、DOM、base64 或其他页面内容。
 
 固定 cleanup CUA 脚本结构（把真实错误写入 cleanup helper）：
-${BROWSER_CLEANUP_MARKER}
+// ${BROWSER_CLEANUP_MARKER}
 const tab = await cua.getTab(${JSON.stringify(resolvedTabId)}, {browser:"chrome"});
 try { await tab.close(); } catch (error) { /* 调用 cleanup_pending helper 并停止 */ }
 

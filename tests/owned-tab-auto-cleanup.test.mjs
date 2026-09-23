@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {autoRecoverOwnedTabCleanup} from '../server/chatgpt-web-provider.mjs';
+import {ownedTabCleanupPrompt} from '../server/web-executor-instructions.mjs';
 import {ensureOwnedTabLease,finalizeOwnedTabLease,markOwnedTabCleanup,markOwnedTabStage,reserveOwnedTabCreate,readOwnedTabLease} from '../server/owned-tab-lease.mjs';
 
 function fixture(){
@@ -37,6 +38,15 @@ test('automatic cleanup uses an isolated executor directory and the exact lease 
   const record=JSON.parse(fs.readFileSync(path.join(run.dir,'cleanup-recovery.json'),'utf8'));
   assert.equal(record.ok,true);
   assert.equal(record.ownedTabId,'tab-owned');
+});
+
+test('cleanup marker is emitted as a harmless JavaScript comment',()=>{
+  const prompt=ownedTabCleanupPrompt({manifestFile:'/tmp/fixture/web-generation.json',runId:'fixture-run',requestId:'11111111-1111-4111-8111-111111111111',ownedTabId:'tab-owned'});
+  const script=prompt.slice(prompt.indexOf('WENDI_OWNED_TAB_CLEANUP_V1'));
+  assert.match(script,/\/\/ WENDI_OWNED_TAB_CLEANUP_V1/);
+  assert.doesNotMatch(script,/^WENDI_OWNED_TAB_CLEANUP_V1$/m);
+  assert.match(script,/cua\.getTab\("tab-owned", \{browser:"chrome"\}\)/);
+  assert.match(script,/await tab\.close\(\)/);
 });
 
 test('a non-orphaned lease does not start cleanup-only',async()=>{
