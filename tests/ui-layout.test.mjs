@@ -106,6 +106,7 @@ test('login failures tell the user to log in manually and retry only the existin
   assert.match(status,/附件上传 0、发送 0/);
   assert.match(status,/不会自动登录、自动重试或创建新请求/);
   assert.match(status,/webFailureMessages\[String\(task\?\.errorCode \|\| project\.lastFailure\?\.kind/);
+  assert.match(status,/noOutput\s*\?\s*webFailureMessages\[webFailureCode\]\s*\|\|/);
 });
 
 test('public panel media URL enables review and page review is a separate action', () => {

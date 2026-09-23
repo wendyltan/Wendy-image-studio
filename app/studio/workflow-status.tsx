@@ -411,13 +411,14 @@ export function WorkflowStatus({
           )}
           <span>
             {noOutput
-              ? panelDecisionPrimary
-                ? '本次修改未取得新图，上一版原图仍保留。'
-                : postUploadPreSubmit
-                  ? `已观察到 ${attachmentObserved}/${attachmentExpected} 个附件，发送前失败，未发送消息；上一版原图仍保留。`
-                  : uploadUnavailable
-                  ? '附件上传没有完成，未上传附件、未发送消息；上一版原图仍保留。'
-                  : '本次没有取得图片，可重试这一张。'
+              ? webFailureMessages[webFailureCode] ||
+                (panelDecisionPrimary
+                  ? '本次修改未取得新图，上一版原图仍保留。'
+                  : postUploadPreSubmit
+                    ? `已观察到 ${attachmentObserved}/${attachmentExpected} 个附件，发送前失败，未发送消息；上一版原图仍保留。`
+                    : uploadUnavailable
+                    ? '附件上传没有完成，未上传附件、未发送消息；上一版原图仍保留。'
+                    : '本次没有取得图片，可重试这一张。')
               : statusMessage}
             <small>
               <Clock /> 已用时{' '}
