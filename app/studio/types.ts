@@ -30,7 +30,7 @@ export type Picture = {
   url: string;
   contentHash?: string;
   projectVersion?: number;
-  integrity?: { sha256?: string };
+  integrity?: { sha256?: string; width?: number; height?: number };
   nextStep?: string;
   layoutHints?: { style?: string; captionAnchors?: string[] };
   layoutVerification?: {

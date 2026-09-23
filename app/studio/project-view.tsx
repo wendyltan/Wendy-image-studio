@@ -8,16 +8,13 @@ import {
   Leaf,
 } from 'lucide-react';
 import type { FailureClassification, Plan, Picture, Project } from './types';
+import { panelCoverFitNote } from './panel-decision';
 import { ProjectPictures } from './project-pictures';
 import { ProjectPlan } from './project-plan';
 import { ProjectSamples } from './project-samples';
-import {
-  ModelUsagePanel,
-  WorkflowStatus,
-} from './workflow-status';
+import { ModelUsagePanel, WorkflowStatus } from './workflow-status';
 import {
   NoOutputCard,
-  PanelDecisionCard,
   RecoveryCard,
   ReviewCard,
   UnknownResultCard,
@@ -91,9 +88,12 @@ export function ProjectView({
     (item): item is { key: string; title: string; image: Picture } =>
       item !== null &&
       ((item.image.qa.pass === null &&
-        ['pending', 'unavailable', 'recovered_pending_review', 'manual_review'].includes(
-          item.image.qa.status || '',
-        )) ||
+        [
+          'pending',
+          'unavailable',
+          'recovered_pending_review',
+          'manual_review',
+        ].includes(item.image.qa.status || '')) ||
         (item.image.qa.pass === false &&
           item.key === project.panelDecision?.panelKey)),
   );
@@ -103,8 +103,8 @@ export function ProjectView({
     : null;
   const panelDecisionRequired = Boolean(
     panelDecisionTarget &&
-      project.panelDecision?.state === 'required' &&
-      !project.busy,
+    project.panelDecision?.state === 'required' &&
+    !project.busy,
   );
   // One recovery/decision card is the primary action. Unknown results keep
   // their safety boundary; a known missing result yields to an existing panel
@@ -120,6 +120,10 @@ export function ProjectView({
           : project.pending && !project.busy
             ? 'recovery'
             : null;
+  const decisionCoverFitNote =
+    panelDecisionTarget && panelDecisionKey
+      ? panelCoverFitNote(project.plan, panelDecisionKey, panelDecisionTarget)
+      : null;
   return (
     <>
       <div className="steps">
@@ -162,7 +166,7 @@ export function ProjectView({
         disabled={disabled}
         action={action}
         noOutput={noOutput}
-        panelDecisionPrimary={primaryCard === 'panel'}
+        panelDecisionPrimary={panelDecisionRequired}
         recoveryPending={Boolean(project.imageRetry)}
         now={now}
         failureClassification={failureClassification}
@@ -182,21 +186,28 @@ export function ProjectView({
         <ReviewCard target={reviewable} disabled={disabled} action={action} />
       )}
       {primaryCard === 'panel' && panelDecisionTarget && panelDecisionKey && (
-        <PanelDecisionCard
-          project={project}
-          panelKey={panelDecisionKey}
-          image={panelDecisionTarget}
-          disabled={disabled}
-          action={action}
-          previousAttemptNoOutput={noOutput}
-          onEdit={(repairPrompt) => {
-            setEditNote(repairPrompt || '');
-            setEdit({
-              key: panelDecisionKey,
-              title: `分镜 ${panelDecisionKey}`,
-            });
-          }}
-        />
+        <div
+          className={`panel-decision-strip${decisionCoverFitNote ? ' low-attention' : ' urgent'}`}
+        >
+          <span>
+            {decisionCoverFitNote
+              ? `分镜 ${panelDecisionKey} 待你确认 · 比例差在本地裁切容差内`
+              : `分镜 ${panelDecisionKey} 有未解决的校对问题，等待你决定`}
+          </span>
+          <button
+            className="secondary"
+            onClick={() => {
+              setView('pictures');
+              window.setTimeout(() => {
+                document
+                  .getElementById(`source-panel-${panelDecisionKey}`)
+                  ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              }, 80);
+            }}
+          >
+            查看原图与决定
+          </button>
+        </div>
       )}
       {project.metrics && <ModelUsagePanel project={project} />}
       <div className="tabs">
@@ -262,6 +273,9 @@ export function ProjectView({
           checks={checks}
           setChecks={setChecks}
           allChecks={allChecks}
+          panelDecisionKey={panelDecisionRequired ? panelDecisionKey : null}
+          decisionCoverFitNote={decisionCoverFitNote}
+          previousAttemptNoOutput={noOutput}
         />
       )}
     </>

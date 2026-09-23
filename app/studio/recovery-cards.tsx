@@ -1,9 +1,4 @@
-import {
-  Check,
-  FolderOpen,
-  Pencil,
-  RotateCcw,
-} from 'lucide-react';
+import { Check, FolderOpen, Pencil, RotateCcw } from 'lucide-react';
 import type { Picture, Project } from './types';
 
 export type ProjectAction = (name: string, body?: unknown) => void;
@@ -43,8 +38,10 @@ export function NoOutputCard({
   const uploadUnavailable =
     project.lastFailure?.kind === 'browser-upload-unavailable' ||
     project.currentTask?.errorCode === 'browser-upload-unavailable';
-  const attachmentExpected = project.currentTask?.attachmentExpectedCount ?? null;
-  const attachmentObserved = project.currentTask?.attachmentObservedCount ?? null;
+  const attachmentExpected =
+    project.currentTask?.attachmentExpectedCount ?? null;
+  const attachmentObserved =
+    project.currentTask?.attachmentObservedCount ?? null;
   const postUploadPreSubmit =
     attachmentExpected !== null &&
     attachmentObserved === attachmentExpected &&
@@ -64,19 +61,19 @@ export function NoOutputCard({
           {quotaSnapshotStop
             ? '额度检查未完成，原分镜仍保留'
             : postUploadPreSubmit
-            ? '附件已核实，但发送前失败，上一版原图仍保留'
-            : uploadUnavailable
-            ? '附件上传未完成，上一版原图仍保留'
-            : '本次没有取得图片，可重试这一张'}
+              ? '附件已核实，但发送前失败，上一版原图仍保留'
+              : uploadUnavailable
+                ? '附件上传未完成，上一版原图仍保留'
+                : '本次没有取得图片，可重试这一张'}
         </h3>
         <p>
           {quotaSnapshotStop
             ? `${target} 本次修改停在额度检查：5 小时额度只返回旧快照，附件上传 0、发送 0，原图未变化。系统不会自动重试；先确认额度已刷新，再由你决定是否发起新的单格修改。`
             : postUploadPreSubmit
-            ? `${target} 已观察到 ${attachmentObserved}/${attachmentExpected} 个附件，发送前失败，未发送消息，也未生成新图。系统不会自行重发；修复发送阶段后可只重试这一张。`
-            : uploadUnavailable
-            ? `${target} 的附件入口没有打开浏览器文件选择器；本次未上传附件、未发送消息，也未生成新图。系统不会自行重试，修复附件入口后可只重试这一张。`
-            : `${target} 没有保存到本地，也没有可找回的原图。系统不会自行重试；重新生成会发起一次新的生图并消耗创作额度。`}
+              ? `${target} 已观察到 ${attachmentObserved}/${attachmentExpected} 个附件，发送前失败，未发送消息，也未生成新图。系统不会自行重发；修复发送阶段后可只重试这一张。`
+              : uploadUnavailable
+                ? `${target} 的附件入口没有打开浏览器文件选择器；本次未上传附件、未发送消息，也未生成新图。系统不会自行重试，修复附件入口后可只重试这一张。`
+                : `${target} 没有保存到本地，也没有可找回的原图。系统不会自行重试；重新生成会发起一次新的生图并消耗创作额度。`}
         </p>
       </div>
       <div>
@@ -193,6 +190,7 @@ export function PanelDecisionCard({
   disabled,
   action,
   previousAttemptNoOutput = false,
+  coverFitNote = null,
   onEdit,
 }: {
   project: Project;
@@ -201,6 +199,7 @@ export function PanelDecisionCard({
   disabled: boolean;
   action: ProjectAction;
   previousAttemptNoOutput?: boolean;
+  coverFitNote?: string | null;
   onEdit: (repairPrompt?: string) => void;
 }) {
   const revision = project.revision ?? project.version,
@@ -211,22 +210,31 @@ export function PanelDecisionCard({
       )
       .map((issue) => String(issue.id)),
     ready = Boolean(project.planHash && image.artifactId && image.contentHash);
-  return (
-    <div className="approval-card panel-decision-card">
-      <h2>正式分镜需要你来决定</h2>
-      {previousAttemptNoOutput ? (
-        <p>
-          本次修改未取得新图，上一版原图仍保留。请查看上一版原图和问题，再决定是否采用。
-        </p>
-      ) : (
-        <p>
-          第 {panelKey.split('-')[0]} 页第 {panelKey.split('-')[1]} 格的模型质检没有通过。
-          请先查看原图和问题，再选择采用当前图片或修改这一张。
-        </p>
-      )}
-      {image.qa.issues.length > 0 && (
-        <small>检查问题：{image.qa.issues.join('；')}</small>
-      )}
+  const content = (
+    <>
+      <p>
+        {previousAttemptNoOutput &&
+          '本次修改未取得新图，上一版原图仍保留。'}{' '}
+        {coverFitNote ||
+          (previousAttemptNoOutput
+            ? '请查看原图和问题，再决定是否采用。'
+            : `第 ${panelKey.split('-')[0]} 页第 ${panelKey.split('-')[1]} 格的模型质检没有通过。请查看原图和问题，再决定是否采用或修改。`)}
+      </p>
+      <div className="panel-decision-review">
+        <img
+          src={image.url}
+          alt={`分镜 ${panelKey} 当前保留的原图`}
+          loading="lazy"
+          decoding="async"
+        />
+        <div>
+          <strong>原图质检记录</strong>
+          <p>{image.qa.summary}</p>
+          {image.qa.issues.length > 0 && (
+            <small>检查问题：{image.qa.issues.join('；')}</small>
+          )}
+        </div>
+      </div>
       <div className="inline-actions">
         <button
           className="primary"
@@ -262,7 +270,24 @@ export function PanelDecisionCard({
           {previousAttemptNoOutput ? '继续修改这一张' : '修改这一张'}
         </button>
       </div>
-      {!ready && <small>当前图片版本信息尚未刷新，请重新打开这篇作品后再决定。</small>}
+      {!ready && (
+        <small>当前图片版本信息尚未刷新，请重新打开这篇作品后再决定。</small>
+      )}
+    </>
+  );
+  return coverFitNote ? (
+    <details className="panel-decision-card compact">
+      <summary>
+        {previousAttemptNoOutput
+          ? '修改未取得新图 · 查看原图与决定'
+          : `分镜 ${panelKey} 待你决定 · 查看原图与质检`}
+      </summary>
+      <div className="panel-decision-content">{content}</div>
+    </details>
+  ) : (
+    <div className="approval-card panel-decision-card urgent">
+      <h3>分镜 {panelKey} 需要你来决定</h3>
+      {content}
     </div>
   );
 }

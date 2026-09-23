@@ -2,15 +2,20 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
+import ts from 'typescript';
 
 const appRoot = path.resolve(import.meta.dirname, '..');
 const page = fs.readFileSync(path.join(appRoot, 'app/page.tsx'), 'utf8');
 const studioSources = [
   page,
   fs.readFileSync(path.join(appRoot, 'app/studio/project-view.tsx'), 'utf8'),
+  fs.readFileSync(path.join(appRoot, 'app/studio/panel-decision.ts'), 'utf8'),
   fs.readFileSync(path.join(appRoot, 'app/studio/project-plan.tsx'), 'utf8'),
   fs.readFileSync(path.join(appRoot, 'app/studio/project-samples.tsx'), 'utf8'),
-  fs.readFileSync(path.join(appRoot, 'app/studio/project-pictures.tsx'), 'utf8'),
+  fs.readFileSync(
+    path.join(appRoot, 'app/studio/project-pictures.tsx'),
+    'utf8',
+  ),
   fs.readFileSync(path.join(appRoot, 'app/studio/workflow-status.tsx'), 'utf8'),
   fs.readFileSync(path.join(appRoot, 'app/studio/recovery-cards.tsx'), 'utf8'),
   fs.readFileSync(path.join(appRoot, 'app/studio/visuals.tsx'), 'utf8'),
@@ -29,6 +34,15 @@ const studioSources = [
   ),
 ].join('\n');
 const css = fs.readFileSync(path.join(appRoot, 'app/globals.css'), 'utf8');
+const panelDecisionModule = { exports: {} };
+new Function(
+  'exports',
+  ts.transpile(
+    fs.readFileSync(path.join(appRoot, 'app/studio/panel-decision.ts'), 'utf8'),
+    { module: ts.ModuleKind.CommonJS },
+  ),
+)(panelDecisionModule.exports);
+const { panelCoverFitNote } = panelDecisionModule.exports;
 
 function rule(selector) {
   const start = css.indexOf(`${selector}{`);
@@ -58,39 +72,84 @@ test('source storyboard cards keep mixed-ratio images at natural card height', (
 });
 
 test('page and storyboard cards expose one clear action hierarchy with accessible routes', () => {
-  const pictures = fs.readFileSync(path.join(appRoot, 'app/studio/project-pictures.tsx'), 'utf8');
-  assert.match(pictures, /aria-label=\{`点击查看第 \$\{page\.number\} 页大图`\}/);
+  const pictures = fs.readFileSync(
+    path.join(appRoot, 'app/studio/project-pictures.tsx'),
+    'utf8',
+  );
+  assert.match(
+    pictures,
+    /aria-label=\{`点击查看第 \$\{page\.number\} 页大图`\}/,
+  );
   assert.match(pictures, /qaAction\(page\.qa, true\)/);
-  assert.match(pictures, /className="secondary page-layout-button"[\s\S]*?重排本页/);
-  assert.match(pictures, /\{!project\.accepted && \([\s\S]*?repair-page-layout/);
-  assert.match(pictures, /className="panel-card-heading"[\s\S]*?<QaBadge qa=\{panel\.qa\} \/>[\s\S]*?className="panel-review-row"[\s\S]*?className="primary"[\s\S]*?action\('review-image', \{key\}\)/);
-  assert.match(pictures, /\['regenerate', 'recompose'\]\.includes\(issue\.repairAction/);
+  assert.match(
+    pictures,
+    /className="secondary page-layout-button"[\s\S]*?重排本页/,
+  );
+  assert.match(
+    pictures,
+    /\{!project\.accepted && \([\s\S]*?repair-page-layout/,
+  );
+  assert.match(
+    pictures,
+    /className="panel-card-heading"[\s\S]*?<QaBadge qa=\{panel\.qa\} \/>[\s\S]*?className="panel-review-row"[\s\S]*?className="primary"[\s\S]*?action\('review-image',\s*\{\s*key\s*\}\)/,
+  );
+  assert.match(
+    pictures,
+    /\['regenerate', 'recompose'\]\.includes\(issue\.repairAction/,
+  );
   assert.match(pictures, /一二三四五六七八九十两/);
   assert.match(pictures, /const sourceIssueGroups =/);
   assert.match(pictures, /const layoutCue = \/文字框/);
   assert.match(pictures, /座椅\|椅子/);
-  assert.match(pictures, /groups\.set\(panelKey, \[\.\.\.\(groups\.get\(panelKey\) \|\| \[\]\), issue\]\)/);
+  assert.match(
+    pictures,
+    /groups\.set\(panelKey, \[\.\.\.\(groups\.get\(panelKey\) \|\| \[\]\), issue\]\)/,
+  );
   assert.match(pictures, /descriptions\.join\('；'\)/);
-  assert.match(pictures, /descriptions\.map\(\(description\) => `- \$\{description\}`\)/);
-  assert.match(pictures, /setEditNote\(`成稿校对指出以下分镜问题/);
+  assert.match(
+    pictures,
+    /descriptions\s*\.map\(\(description\)\s*=> `- \$\{description\}`\)/,
+  );
+  assert.match(pictures, /setEditNote\(\s*`成稿校对指出以下分镜问题/);
   assert.match(pictures, /修改分镜 \{panelKey\}/);
-  assert.match(pictures, /action\('confirm-page-layout', \{[\s\S]*?projectVersion: page\.projectVersion,[\s\S]*?contentHash: page\.contentHash/);
+  assert.match(
+    pictures,
+    /action\('confirm-page-layout', \{[\s\S]*?projectVersion: page\.projectVersion,[\s\S]*?contentHash: page\.contentHash/,
+  );
   assert.match(pictures, /若仍有遮挡，请不要确认，可先重新校对并保留问题记录/);
   assert.match(pictures, /分镜校对只检查这一张原图/);
   assert.match(pictures, /已重排，待人工确认遮挡是否解决/);
   assert.match(pictures, /className="tertiary-action"[\s\S]*?提炼为素材/);
   assert.match(css, /\.inline-actions \.primary,[\s\S]*?min-height:42px/);
   assert.match(css, /\.tertiary-action:focus-visible/);
-  assert.match(css, /\.source-grid>div>\.panel-card-meta\{display:flex;flex-direction:column/);
-  assert.match(css, /\.source-grid \.panel-review-row\{display:grid;grid-template-columns:minmax\(0,1fr\) auto/);
-  assert.match(css, /\.page-issue-route\{display:grid;gap:10px;margin:14px 0 16px/);
-  assert.match(css, /\.page-card-actions\{display:grid;grid-template-columns:minmax\(0,1fr\)/);
+  assert.match(
+    css,
+    /\.source-grid>div>\.panel-card-meta\{display:flex;flex-direction:column/,
+  );
+  assert.match(
+    css,
+    /\.source-grid \.panel-review-row\{display:grid;grid-template-columns:minmax\(0,1fr\) auto/,
+  );
+  assert.match(
+    css,
+    /\.page-issue-route\{display:grid;gap:10px;margin:14px 0 16px/,
+  );
+  assert.match(
+    css,
+    /\.page-card-actions\{display:grid;grid-template-columns:minmax\(0,1fr\)/,
+  );
   assert.match(css, /@media\(max-width:760px\)\{\.page-issue-route/);
 });
 
 test('pre-submission quota pause explains the zero-upload state and does not retry automatically', () => {
-  const cards = fs.readFileSync(path.join(appRoot, 'app/studio/recovery-cards.tsx'), 'utf8');
-  const status = fs.readFileSync(path.join(appRoot, 'app/studio/workflow-status.tsx'), 'utf8');
+  const cards = fs.readFileSync(
+    path.join(appRoot, 'app/studio/recovery-cards.tsx'),
+    'utf8',
+  );
+  const status = fs.readFileSync(
+    path.join(appRoot, 'app/studio/workflow-status.tsx'),
+    'utf8',
+  );
   assert.match(cards, /quotaSnapshotStop/);
   assert.match(cards, /附件上传 0、发送 0，原图未变化/);
   assert.match(cards, /系统不会自动重试/);
@@ -98,62 +157,121 @@ test('pre-submission quota pause explains the zero-upload state and does not ret
   assert.match(status, /5\\s\*小时创作额度\.\*旧快照/);
 });
 
-test('login failures tell the user to log in manually and retry only the existing image',()=>{
-  const engine=fs.readFileSync(path.join(appRoot,'server/engine.mjs'),'utf8');
-  const status=fs.readFileSync(path.join(appRoot,'app/studio/workflow-status.tsx'),'utf8');
-  assert.match(engine,/CHATGPT_LOGIN_REQUIRED.{0,70}chatgpt-login-required/);
-  assert.match(status,/请在 Chrome 登录 ChatGPT/);
-  assert.match(status,/附件上传 0、发送 0/);
-  assert.match(status,/不会自动登录、自动重试或创建新请求/);
-  assert.match(status,/webFailureMessages\[String\(task\?\.errorCode \|\| project\.lastFailure\?\.kind/);
-  assert.match(status,/noOutput\s*\?\s*webFailureMessages\[webFailureCode\]\s*\|\|/);
+test('login failures tell the user to log in manually and retry only the existing image', () => {
+  const engine = fs.readFileSync(
+    path.join(appRoot, 'server/engine.mjs'),
+    'utf8',
+  );
+  const status = fs.readFileSync(
+    path.join(appRoot, 'app/studio/workflow-status.tsx'),
+    'utf8',
+  );
+  assert.match(engine, /CHATGPT_LOGIN_REQUIRED.{0,70}chatgpt-login-required/);
+  assert.match(status, /请在 Chrome 登录 ChatGPT/);
+  assert.match(status, /附件上传 0、发送 0/);
+  assert.match(status, /不会自动登录、自动重试或创建新请求/);
+  assert.match(
+    status,
+    /webFailureMessages\[String\(task\?\.errorCode \|\| project\.lastFailure\?\.kind/,
+  );
+  assert.match(
+    status,
+    /noOutput\s*\?\s*webFailureMessages\[webFailureCode\]\s*\|\|/,
+  );
 });
 
 test('public panel media URL enables review and page review is a separate action', () => {
-  const pictures = fs.readFileSync(path.join(appRoot, 'app/studio/project-pictures.tsx'), 'utf8');
+  const pictures = fs.readFileSync(
+    path.join(appRoot, 'app/studio/project-pictures.tsx'),
+    'utf8',
+  );
   const api = fs.readFileSync(path.join(appRoot, 'server/server.mjs'), 'utf8');
-  const engine = fs.readFileSync(path.join(appRoot, 'server/engine.mjs'), 'utf8');
+  const engine = fs.readFileSync(
+    path.join(appRoot, 'server/engine.mjs'),
+    'utf8',
+  );
   assert.match(api, /url:media\(displayFile\)/);
-  assert.match(api, /action==='confirm-page-layout'\)await confirmPageLayout\(p,\{pageNumber:b\.pageNumber,projectVersion:b\.projectVersion,contentHash:b\.contentHash\}\)/);
+  assert.match(
+    api,
+    /action==='confirm-page-layout'\)await confirmPageLayout\(p,\{pageNumber:b\.pageNumber,projectVersion:b\.projectVersion,contentHash:b\.contentHash\}\)/,
+  );
   assert.match(pictures, /disabled=\{disabled \|\| !panel\.url\}/);
-  assert.match(pictures, /action\('review-image', \{key\}\)/);
-  assert.match(pictures, /action\('review-page', \{pageNumber: page\.number\}\)/);
+  assert.match(pictures, /action\('review-image',\s*\{\s*key\s*\}\)/);
+  assert.match(
+    pictures,
+    /action\('review-page',\s*\{\s*pageNumber: page\.number\s*\}\)/,
+  );
   assert.match(engine, /export function reviewPage\(/);
   assert.match(api, /action==='review-page'\)reviewPage\(p,b\.pageNumber\)/);
   assert.match(engine, /function reviewPageQaOnly\(/);
-  assert.match(engine, /qa\(p,pageFile,JSON\.stringify\(pageQaDefinition\(definition\)\)/);
+  assert.match(
+    engine,
+    /qa\(p,pageFile,JSON\.stringify\(pageQaDefinition\(definition\)\)/,
+  );
 });
 
 test('local page preflight remains pending manual review until page QA runs', () => {
-  const pictures = fs.readFileSync(path.join(appRoot, 'app/studio/project-pictures.tsx'), 'utf8');
-  const visuals = fs.readFileSync(path.join(appRoot, 'app/studio/visuals.tsx'), 'utf8');
-  assert.match(pictures, /pageReviewPending=\{[\s\S]*?page\.qa\.manualReviewRequired === true[\s\S]*?page\.qa\.status === 'local_deterministic_preflight'/);
-  assert.match(pictures, /qa\.manualReviewRequired === true \|\| qa\.status === 'local_deterministic_preflight'/);
+  const pictures = fs.readFileSync(
+    path.join(appRoot, 'app/studio/project-pictures.tsx'),
+    'utf8',
+  );
+  const visuals = fs.readFileSync(
+    path.join(appRoot, 'app/studio/visuals.tsx'),
+    'utf8',
+  );
+  assert.match(
+    pictures,
+    /pageReviewPending=\{[\s\S]*?page\.qa\.manualReviewRequired === true[\s\S]*?page\.qa\.status === 'local_deterministic_preflight'/,
+  );
+  assert.match(
+    pictures,
+    /qa\.manualReviewRequired === true \|\|\s*qa\.status === 'local_deterministic_preflight'/,
+  );
   assert.match(pictures, /qaAction\(page\.qa, true\)/);
   assert.match(pictures, /qaAction\(panel\.qa, false\)/);
   assert.match(visuals, /pageReviewPending[\s\S]*?待人工复核/);
 });
 
 test('completed browser lease does not become the current global warning', () => {
-  const status = fs.readFileSync(path.join(appRoot, 'app/studio/workflow-status.tsx'), 'utf8');
-  const server = fs.readFileSync(path.join(appRoot, 'server/server.mjs'), 'utf8');
+  const status = fs.readFileSync(
+    path.join(appRoot, 'app/studio/workflow-status.tsx'),
+    'utf8',
+  );
+  const server = fs.readFileSync(
+    path.join(appRoot, 'server/server.mjs'),
+    'utf8',
+  );
   assert.match(status, /project\.pending\?\.ownedTabState/);
   assert.match(status, /const taskLeaseRelevant = \[/);
-  assert.match(server,/function terminalTaskWebManifest\(p,task,lastFailure\)/);
-  assert.match(server,/request\.taskId!==task\.id\|\|request\.projectId!==p\.id/);
-  assert.match(server,/terminalManifest\.ownedTabState==='closed_verified'\|\|terminalManifest\.cleanupStatus==='closed'/);
+  assert.match(
+    server,
+    /function terminalTaskWebManifest\(p,task,lastFailure\)/,
+  );
+  assert.match(
+    server,
+    /request\.taskId!==task\.id\|\|request\.projectId!==p\.id/,
+  );
+  assert.match(
+    server,
+    /terminalManifest\.ownedTabState==='closed_verified'\|\|terminalManifest\.cleanupStatus==='closed'/,
+  );
 });
 
-test('formal panel decision keeps its explanation separated from high-contrast actions', () => {
-  assert.match(studioSources, /className="approval-card panel-decision-card"/);
-  assert.match(studioSources, /<h2>正式分镜需要你来决定<\/h2>/);
-  assert.match(studioSources, /className="inline-actions"/);
+test('formal panel decision stays beside its source image and collapses when local cover can absorb a tiny ratio gap', () => {
+  assert.match(studioSources, /className="panel-decision-card compact"/);
+  assert.match(studioSources, /panel-decision-card urgent/);
+  assert.match(studioSources, /panel-decision-strip/);
+  assert.match(studioSources, /source-panel-\$\{key\}/);
+  assert.match(studioSources, /查看原图与决定/);
+  assert.match(studioSources, /原图质检记录/);
+  assert.match(studioSources, /采用上一版/);
+  assert.match(studioSources, /继续修改这一张/);
+  assert.match(studioSources, /panelCoverFitNote/);
+  assert.match(studioSources, /differencePercent > 1/);
 
-  const decisionActions = rule('.panel-decision-card>.inline-actions');
   assert.match(
-    decisionActions,
-    /margin-top:\s*(?:1[8-9]|2\d)px/,
-    'the decision actions need a visible vertical gap after the explanation',
+    css,
+    /\.panel-decision-content \.inline-actions[^{]*\{[^}]*margin-top:10px/,
   );
 
   assert.match(
@@ -177,6 +295,42 @@ test('formal panel decision keeps its explanation separated from high-contrast a
     css,
     /\.primary:disabled,\.secondary:disabled,\.danger-button:disabled\{/,
     'disabled button states must remain explicit',
+  );
+});
+
+test('small aspect warnings require file identity evidence and use the actual image dimensions', () => {
+  const plan = { pages: [{ number: 2, layout: 'trio', panels: [{}, {}, {}] }] };
+  const image = {
+    integrity: { sha256: 'a'.repeat(64), width: 1193, height: 1319 },
+    qa: {
+      issues: ['rounded QA dimensions'],
+      issueDetails: [{ category: 'aspect_ratio' }],
+    },
+  };
+  assert.match(panelCoverFitNote(plan, '2-3', image), /0\.02%/);
+  assert.equal(
+    panelCoverFitNote(plan, '2-3', {
+      ...image,
+      integrity: { ...image.integrity, sha256: '' },
+    }),
+    null,
+  );
+  assert.equal(
+    panelCoverFitNote(plan, '2-3', {
+      ...image,
+      integrity: { ...image.integrity, width: 1400 },
+    }),
+    null,
+  );
+  assert.equal(
+    panelCoverFitNote(plan, '2-3', {
+      ...image,
+      qa: {
+        issues: ['ratio', 'hand'],
+        issueDetails: [{ category: 'aspect_ratio' }, { category: 'anatomy' }],
+      },
+    }),
+    null,
   );
 });
 
@@ -255,15 +409,12 @@ test('terminal workflow timing freezes safely and marks unreached browser stages
   assert.match(studioSources, /stageFallbackEnd/);
 });
 
-test('recovery and panel decisions render through one primary card priority', () => {
+test('recovery and panel decisions use a compact locator while retaining the one-primary-action priority', () => {
   assert.match(studioSources, /const primaryCard = unknownResult/);
   assert.match(studioSources, /primaryCard === 'panel'/);
+  assert.match(studioSources, /panelDecisionPrimary=\{panelDecisionRequired\}/);
   assert.match(studioSources, /previousAttemptNoOutput=\{noOutput\}/);
   assert.match(studioSources, /本次修改未取得新图，上一版原图仍保留/);
-  assert.match(
-    studioSources,
-    /panelDecisionPrimary=\{primaryCard === 'panel'\}/,
-  );
   assert.match(studioSources, /采用上一版/);
   assert.match(studioSources, /继续修改这一张/);
   assert.match(

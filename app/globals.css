@@ -90,3 +90,23 @@ body{font-size:14px}.topbar{gap:24px}.quota-mini{display:flex;align-items:center
 .page-layout-button{font-size:12px}
 .finished-grid .inline-actions .tertiary-action{min-height:38px;align-self:stretch;justify-content:flex-start;margin-top:2px}
 @media(max-width:760px){.page-issue-route{margin:12px 0 15px;padding:11px}.page-card-actions{gap:9px}.page-card-actions>.primary,.page-card-actions>.secondary{min-height:48px}}
+
+.panel-decision-strip{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:-7px 0 18px;padding:9px 12px;border:1px solid #dfe5d7;border-radius:8px;background:#f5f7f1;color:#647558;font-size:12px;line-height:1.5}
+.panel-decision-strip.urgent{border-color:#e6c8b5;background:#fbf1e9;color:#875a43}
+.panel-decision-strip button{min-height:36px;padding:7px 10px;font-size:11px}
+.panel-decision-card{width:100%;margin-top:4px;border:1px solid #dfe5d7;border-radius:8px;background:#f8f9f5;color:#657458}
+.panel-decision-card.compact>summary{padding:10px 12px;font-size:11px;line-height:1.5}
+.panel-decision-card.compact>summary:after{content:'查看';font-size:10px;color:#8b987e}
+.panel-decision-card.compact[open]>summary:after{content:'收起'}
+.panel-decision-card.urgent{padding:13px;border-color:#e6c8b5;background:#fbf5ef;color:#875a43}
+.panel-decision-card.urgent h3{margin-bottom:6px}
+.panel-decision-content{padding:0 12px 12px}
+.panel-decision-content>p,.panel-decision-card.urgent>p{font-size:11px;line-height:1.7;color:#6c735f}
+.panel-decision-review{display:flex;align-items:flex-start;gap:12px;margin:10px 0;padding:10px;border:1px solid #e5e6dd;border-radius:7px;background:#fffdf8}
+.panel-decision-review img{display:block;width:68px;height:82px;object-fit:cover;border-radius:4px;border:1px solid #e5e1d8;flex:none}
+.panel-decision-review>div{min-width:0;flex:1}
+.panel-decision-review strong{font-size:11px;color:#69785c}
+.panel-decision-review p,.panel-decision-review small{display:block;margin-top:4px;font-size:10px;line-height:1.6;color:#858779;overflow-wrap:anywhere}
+.panel-decision-content .inline-actions,.panel-decision-card.urgent .inline-actions{gap:8px;margin-top:10px}
+.panel-decision-content .inline-actions button,.panel-decision-card.urgent .inline-actions button{min-height:42px}
+@media(max-width:640px){.panel-decision-strip{align-items:stretch;flex-direction:column;gap:7px;margin-top:-4px;font-size:11px}.panel-decision-strip button{width:100%;min-height:42px}.panel-decision-content .inline-actions,.panel-decision-card.urgent .inline-actions{display:grid;grid-template-columns:1fr}.panel-decision-content .inline-actions button,.panel-decision-card.urgent .inline-actions button{width:100%;min-height:46px}}
