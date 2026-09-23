@@ -741,21 +741,47 @@ export function repairPageLayout(p,pageNumber){
     else {p.status='attention';activity(p,`第 ${number} 页排版失败：仍有排版问题，请查看后再次调整。`,number,p.plan.pages.length,'页面');}
   });
 }
+export async function validatePageReviewEvidence(p,pageNumber){
+  const number=Number(pageNumber),page=p.pages?.find(item=>Number(item.number)===number),definition=p.plan?.pages?.find(item=>Number(item.number)===number);
+  if(!page||!definition||!page.file)throw new Error('这一页没有可校对的成稿。');
+  const artifact=(p.artifacts||[]).find(item=>item.id===`page:${number}`);
+  if(!artifact||artifact.valid!==true||artifact.file!==page.file)throw new Error('成稿文件或来源记录已变化，请先重新排版。');
+  if(page.projectVersion!==undefined&&page.projectVersion!==null&&Number(page.projectVersion)!==Number(p.version))throw new Error('这一页属于其他作品版本，不能校对。');
+  if(artifact.projectVersion!==undefined&&artifact.projectVersion!==null&&Number(artifact.projectVersion)!==Number(p.version))throw new Error('成稿记录属于其他作品版本，不能校对。');
+  const normalizedPageFile=path.normalize(page.file),expectedVersionDir=`v${p.version}`;
+  if(normalizedPageFile.split(path.sep)[0]!==expectedVersionDir)throw new Error('无法确认成稿属于当前作品版本，请人工恢复来源记录后再校对。');
+  const expectedIds=definition.panels.map((_,index)=>artifactIdForImageKey(`${number}-${index+1}`));
+  const sameIds=(values)=>Array.isArray(values)&&values.length===expectedIds.length&&expectedIds.every(id=>values.includes(id));
+  if(!sameIds(page.dependsOn)||!sameIds(artifact.dependsOn))throw new Error(`无法证明第 ${number} 页成稿与当前分镜来源一致。请重新排版或人工恢复来源记录后再校对。`);
+  const pageFile=inside(projectDir(p.id),page.file);
+  if(!fs.existsSync(pageFile))throw new Error('成稿文件不存在，请人工恢复文件后再校对。');
+  const expectedPageIntegrity=page.integrity||artifact.integrity;
+  if(!expectedPageIntegrity)throw new Error('缺少成稿完整性记录，请人工恢复来源记录后再校对。');
+  const pageActual=await verifyImage(pageFile);
+  if(!integrityMatches(expectedPageIntegrity,pageActual))throw new Error('成稿文件完整性核对失败，文件保持不变。');
+  const recordedSources=Array.isArray(page.sourceIntegrity)&&page.sourceIntegrity.length?page.sourceIntegrity:artifact.sourceIntegrity;
+  const sourceEntries=Array.isArray(recordedSources)&&recordedSources.length?recordedSources:null;
+  if(sourceEntries&&sourceEntries.length!==expectedIds.length)throw new Error(`第 ${number} 页的分镜来源完整性记录不完整，请人工恢复来源记录后再校对。`);
+  for(const [index] of definition.panels.entries()){
+    const key=`${number}-${index+1}`,id=expectedIds[index],record=p.panels?.[key],currentArtifact=(p.artifacts||[]).find(item=>item.id===id&&item.file===record?.file);
+    if(!record?.file||!currentArtifact||currentArtifact.valid!==true)throw new Error(`第 ${number} 页的当前分镜 artifact 不完整，请重新排版或人工恢复来源记录后再校对。`);
+    const sourceFile=inside(projectDir(p.id),record.file);
+    if(!fs.existsSync(sourceFile))throw new Error(`第 ${number} 页的当前分镜文件不存在，请人工恢复后再校对。`);
+    const actual=await verifyImage(sourceFile),expected=sourceEntries?.[index];
+    if(!integrityMatches(record.integrity,actual)||!integrityMatches(currentArtifact.integrity,actual))throw new Error(`第 ${number} 页的当前分镜完整性核对失败，请重新排版或人工恢复来源记录后再校对。`);
+    if(expected&&(expected.key!==key||expected.file!==record.file||expected.sha256!==actual.sha256||!integrityMatches(expected,actual)))throw new Error(`第 ${number} 页的分镜来源已变化，请先重新排版。`);
+  }
+  return {pageNumber:number,pageFile,legacySourceIntegrity:!sourceEntries,integrity:pageActual};
+}
 function reviewPageQaOnly(p,pageNumber){
   verifyApproval(p);if(p.pending)throw new Error('请先完成这次原图找回，再校对成稿。');
   const number=Number(pageNumber),page=p.pages?.find(item=>Number(item.number)===number),definition=p.plan?.pages?.find(item=>Number(item.number)===number);
-  if(!page||!definition||Number(page.projectVersion)!==Number(p.version)||!page.file)throw new Error('这一页没有当前版本中可校对的成稿。');
-  const pageFile=inside(projectDir(p.id),page.file),artifact=(p.artifacts||[]).find(item=>item.id===`page:${number}`&&item.file===page.file&&item.valid!==false);
-  if(!artifact||!fs.existsSync(pageFile))throw new Error('成稿文件或来源记录已变化，请先重新排版。');
+  if(!page||!definition)throw new Error('这一页没有当前版本中可校对的成稿。');
+  const artifact=(p.artifacts||[]).find(item=>item.id===`page:${number}`),pageFile=page.file?inside(projectDir(p.id),page.file):null;
+  if(!pageFile)throw new Error('这一页没有当前版本中可校对的成稿。');
   return job(p,'page-review',async signal=>{
     activity(p,`准备校对第 ${number} 页现有成稿`,number,p.pages.length,'页面');
-    const before=await verifyImage(pageFile);if(!integrityMatches(page.integrity||artifact.integrity,before))throw new Error('成稿文件完整性核对失败，文件保持不变。');
-    for(const [index] of definition.panels.entries()){
-      const key=`${number}-${index+1}`,record=p.panels?.[key],expected=(page.sourceIntegrity||[]).find(item=>item.key===key);
-      if(!record?.file||!expected||record.file!==expected.file)throw new Error(`第 ${number} 页的分镜来源记录不完整，请先重新排版。`);
-      const sourceFile=inside(projectDir(p.id),record.file),actual=await verifyImage(sourceFile);
-      if(actual.sha256!==expected.sha256||!integrityMatches(record.integrity,actual))throw new Error(`第 ${number} 页的分镜来源已变化，请先重新排版。`);
-    }
+    const evidence=await validatePageReviewEvidence(p,number),before=evidence.integrity;
     const task=beginTask(p,'review',`第 ${number} 页成稿`,{artifact:page.file,source:'manual_page_review'});
     activity(p,`正在校对第 ${number} 页（保留现有 PNG）`,number,p.pages.length,'页面');
     try{

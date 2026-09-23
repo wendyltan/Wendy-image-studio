@@ -167,6 +167,14 @@ test('planning, frozen approval, samples gate and production',async()=>{
 test('page layout repair and whole-story unification never regenerate source images',async()=>{
   let layout=E.createProject({...brief,idea:'本地排版修复不重新生图'});layout.plan=structuredClone(plan);layout.version=1;layout.approved={version:1,hash:W.digest(layout.plan)};layout.samplesApproved=true;layout.status='paused';E.saveProject(layout);
   E.generatePages(layout);layout=await done(layout.id);assert.equal(layout.status,'ready');
+  const legacy=structuredClone(layout);delete legacy.pages[0].projectVersion;delete legacy.pages[0].sourceIntegrity;const legacyPageArtifact=legacy.artifacts.find(item=>item.id==='page:1');delete legacyPageArtifact.projectVersion;delete legacyPageArtifact.sourceIntegrity;
+  assert.equal((await E.validatePageReviewEvidence(legacy,1)).legacySourceIntegrity,true);
+  legacy.pages[0].projectVersion=99;await assert.rejects(E.validatePageReviewEvidence(legacy,1),/其他作品版本/);delete legacy.pages[0].projectVersion;
+  legacy.pages[0].integrity.sha256='0'.repeat(64);await assert.rejects(E.validatePageReviewEvidence(legacy,1),/完整性核对失败/);legacy.pages[0].integrity.sha256=layout.pages[0].integrity.sha256;
+  legacy.pages[0].sourceIntegrity=structuredClone(layout.pages[0].sourceIntegrity);legacy.pages[0].sourceIntegrity[0].sha256='0'.repeat(64);await assert.rejects(E.validatePageReviewEvidence(legacy,1),/分镜来源已变化/);delete legacy.pages[0].sourceIntegrity;
+  legacyPageArtifact.sourceIntegrity=structuredClone(layout.pages[0].sourceIntegrity);legacyPageArtifact.sourceIntegrity[0].sha256='0'.repeat(64);await assert.rejects(E.validatePageReviewEvidence(legacy,1),/分镜来源已变化/);delete legacyPageArtifact.sourceIntegrity;
+  const legacyPanelArtifact=legacy.artifacts.find(item=>item.id==='image:第1页-第1格');legacyPanelArtifact.file+='-mismatch';await assert.rejects(E.validatePageReviewEvidence(legacy,1),/当前分镜 artifact 不完整/);
+  legacy.pages[0].dependsOn.pop();await assert.rejects(E.validatePageReviewEvidence(legacy,1),/分镜来源一致/);
   const reviewPageFile=layout.pages[0].file,reviewPageHash=sha256File(W.inside(E.projectDir(layout.id),reviewPageFile)),reviewImageTasks=layout.tasks.filter(task=>task.kind==='image').length,reviewCalls=callCount();
   E.reviewPage(layout,1);layout=await done(layout.id);assert.equal(layout.status,'paused');assert.equal(layout.pages[0].file,reviewPageFile);assert.equal(sha256File(W.inside(E.projectDir(layout.id),reviewPageFile)),reviewPageHash);assert.equal(layout.tasks.filter(task=>task.kind==='image').length,reviewImageTasks);assert.equal(callCount(),reviewCalls+1);
   const savedSourceHash=layout.pages[0].sourceIntegrity[0].sha256;layout.pages[0].sourceIntegrity[0].sha256='0'.repeat(64);E.saveProject(layout);E.reviewPage(layout,1);layout=await done(layout.id);assert.match(layout.error,/分镜来源已变化/);assert.equal(layout.pages[0].file,reviewPageFile);layout.pages[0].sourceIntegrity[0].sha256=savedSourceHash;E.saveProject(layout);
