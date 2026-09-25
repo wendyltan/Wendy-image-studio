@@ -273,7 +273,7 @@ export function ProjectView({
           checks={checks}
           setChecks={setChecks}
           allChecks={allChecks}
-          panelDecisionKey={panelDecisionRequired ? panelDecisionKey : null}
+          panelDecisionKey={panelDecisionRequired ? panelDecisionKey ?? null : null}
           decisionCoverFitNote={decisionCoverFitNote}
           previousAttemptNoOutput={noOutput}
         />

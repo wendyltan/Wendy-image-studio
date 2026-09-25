@@ -121,6 +121,11 @@ test('an unavailable hidden IAB stops before any provider submission',async()=>{
   assert.equal(failed.pending,null);assert.equal(failed.lastFailure.kind,'browser-unavailable');assert.equal(failed.lastFailure.attempts,0);
   assert.equal(failed.currentTask.providerInvocations,0);assert.equal(failed.currentTask.status,'failed_no_output');assert.match(failed.message,/未提交图片请求/);
   delete process.env.WENDI_TEST_NO_IMAGE_ONCE;delete process.env.WENDI_TEST_NO_IMAGE_TEXT;
+  const legacyDir=path.join(E.projectDir(failed.id),'.制作记录',failed.lastFailure.diagnostics.runId);
+  const browserRecord=path.join(legacyDir,'web-generation.json');
+  fs.writeFileSync(browserRecord,JSON.stringify({state:'failed'}));
+  assert.throws(()=>E.retryMissingImage(failed,'样张-1'),/身份不匹配/);
+  fs.unlinkSync(browserRecord);
   E.retryMissingImage(failed,'样张-1');failed=await done(failed.id);assert.equal(failed.currentTask.attempt,2);assert.equal(failed.progress.current,1);assert.equal(failed.progress.total,2);
 });
 test('an unavailable Chrome focus capability stops before any provider submission',async()=>{

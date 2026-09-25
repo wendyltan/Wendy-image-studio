@@ -22,6 +22,38 @@ function fixture() {
   return {dir, runId: path.basename(dir), requestId: crypto.randomUUID()};
 }
 
+function appendReadinessEvent(run, {overrides = {}, sourceChecks = {}, eventType = 'item.completed', itemType = 'mcp_tool_call', truncated = false, compactSummary = false, omitEvidence = false, source = '// WENDI_BROWSER_READINESS_GATE_V1\nawait tab.goto("https://chatgpt.com/");'} = {}) {
+  const evidence = {
+    marker: 'WENDI_BROWSER_READY_V1', schemaVersion: 1, ready: true,
+    ownedTabId: 'tab-fixture', runId: run.runId,
+    currentUrl: 'https://chatgpt.com/', expectedUrl: 'https://chatgpt.com/',
+    imageCreationPath: 'chat-composer',
+    checks: {targetUrlMatches: true, loginRequired: false, profileLoaded: true, chatModeActive: true, composerEnabled: true, attachmentEntryEnabled: true, imageCreationAvailable: true},
+    ...overrides,
+  };
+  const event = {
+    type: eventType,
+    ...(truncated ? {truncated: true} : {}),
+    item: {
+      id: 'item-readiness', type: itemType, server: 'cua_repl', tool: 'js',
+      ...(compactSummary ? {code: `${source.slice(0,800)}…[truncated]`} : {arguments: {code: source}}),
+      ...(!omitEvidence ? {browserReadinessEvidence: {
+        complete: true, source: 'cua_completed_result',
+        sourceChecks: {gateMarkerPresent: true, gotoCount: 1, createTabCount: 0, checkCount: 0, axReadCount: 1, urlReadCount: 1, getTabCount: 0, setFilesCount: 0, clickCount: 0, pasteCount: 0, setValueCount: 0, typeTextCount: 0, pressKeyCount: 0, ownedHandleReferencePresent: true, ...sourceChecks},
+        ...evidence,
+      }} : {}),
+    },
+  };
+  fs.appendFileSync(path.join(run.dir, 'events.jsonl'), `${JSON.stringify(event)}\n`);
+  if (eventType === 'item.completed' && itemType === 'mcp_tool_call') {
+    fs.writeFileSync(path.join(run.dir, 'browser-readiness-latest.json'), JSON.stringify({
+      schemaVersion: 1, source: 'bridge_cua_completed_item', eventType,
+      itemId: 'item-readiness', server: 'cua_repl', tool: 'js',
+      browserReadinessEvidence: omitEvidence ? null : event.item.browserReadinessEvidence,
+    }));
+  }
+}
+
 test('owned tab session names are unique per run/request and never reuse the old group name', () => {
   const one = ownedTabSessionName('run-a', crypto.randomUUID());
   const two = ownedTabSessionName('run-b', crypto.randomUUID());
@@ -87,10 +119,41 @@ test('stage transitions expose upload and send boundaries and reject regressions
   ensureOwnedTabLease(run);
   reserveOwnedTabCreate(run);
   markOwnedTabStage({...run, state: 'created', ownedTabId: 'tab-fixture'});
+  appendReadinessEvent(run);
   markOwnedTabStage({...run, state: 'uploading'});
   markOwnedTabStage({...run, state: 'uploaded'});
   assert.equal(readOwnedTabLease(run.dir, run).state, 'uploaded');
   assert.throws(() => markOwnedTabStage({...run, state: 'created'}), error => error.code === 'OWNED_TAB_STAGE_REGRESSION');
+});
+
+test('uploading requires fresh complete readiness from this run own CUA bootstrap result', () => {
+  const run = fixture();
+  ensureOwnedTabLease(run);
+  reserveOwnedTabCreate(run);
+  markOwnedTabStage({...run, state: 'created', ownedTabId: 'tab-fixture'});
+  assert.throws(() => markOwnedTabStage({...run, state: 'uploading'}), error => error.code === 'OWNED_TAB_READINESS_REQUIRED');
+
+  appendReadinessEvent(run, {eventType: 'agent_message'});
+  assert.throws(() => markOwnedTabStage({...run, state: 'uploading'}), error => error.code === 'OWNED_TAB_READINESS_REQUIRED');
+  appendReadinessEvent(run, {truncated: true, omitEvidence: true});
+  assert.throws(() => markOwnedTabStage({...run, state: 'uploading'}), error => error.code === 'OWNED_TAB_READINESS_REQUIRED');
+  appendReadinessEvent(run, {overrides: {ownedTabId: 'tab-someone-else'}});
+  assert.throws(() => markOwnedTabStage({...run, state: 'uploading'}), error => error.code === 'OWNED_TAB_READINESS_REQUIRED');
+  appendReadinessEvent(run, {overrides: {runId: 'another-run'}});
+  assert.throws(() => markOwnedTabStage({...run, state: 'uploading'}), error => error.code === 'OWNED_TAB_READINESS_REQUIRED');
+  appendReadinessEvent(run, {overrides: {ready: false, checks: {targetUrlMatches: true, loginRequired: false, profileLoaded: false, chatModeActive: false, composerEnabled: false, attachmentEntryEnabled: false, imageCreationAvailable: false}}});
+  assert.throws(() => markOwnedTabStage({...run, state: 'uploading'}), error => error.code === 'OWNED_TAB_READINESS_REQUIRED');
+  appendReadinessEvent(run, {sourceChecks: {gotoCount: 2}, source: '// WENDI_BROWSER_READINESS_GATE_V1\nawait tab.goto("https://chatgpt.com/"); await tab.goto("https://chatgpt.com/c/other");'});
+  assert.throws(() => markOwnedTabStage({...run, state: 'uploading'}), error => error.code === 'OWNED_TAB_READINESS_REQUIRED');
+  appendReadinessEvent(run, {sourceChecks: {setFilesCount: 1}, source: '// WENDI_BROWSER_READINESS_GATE_V1\nawait tab.goto("https://chatgpt.com/"); await chooser.setFiles(files);'});
+  assert.throws(() => markOwnedTabStage({...run, state: 'uploading'}), error => error.code === 'OWNED_TAB_READINESS_REQUIRED');
+  appendReadinessEvent(run, {sourceChecks: {checkCount: 2}});
+  assert.throws(() => markOwnedTabStage({...run, state: 'uploading'}), error => error.code === 'OWNED_TAB_READINESS_REQUIRED');
+  appendReadinessEvent(run, {sourceChecks: {checkCount: 1}, truncated: true, compactSummary: true});
+  const uploading = markOwnedTabStage({...run, state: 'uploading'});
+  assert.equal(uploading.browserReadiness.ready, true);
+  assert.equal(uploading.browserReadiness.runId, run.runId);
+  assert.equal(uploading.browserReadiness.ownedTabId, 'tab-fixture');
 });
 
 test('created and verified close both require the reserved real handle', () => {
@@ -145,6 +208,7 @@ test('a downloaded run still records verified cleanup evidence', () => {
   ensureOwnedTabLease(run);
   reserveOwnedTabCreate(run);
   markOwnedTabStage({...run, state: 'created', ownedTabId: 'tab-downloaded'});
+  appendReadinessEvent(run, {overrides: {ownedTabId: 'tab-downloaded'}});
   for (const state of ['uploading', 'uploaded', 'sent', 'generating', 'downloaded']) {
     markOwnedTabStage({...run, state});
   }

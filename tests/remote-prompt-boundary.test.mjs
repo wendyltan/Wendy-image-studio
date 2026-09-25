@@ -70,7 +70,7 @@ test('menu fallback waits for the chooser only after clicking 从电脑上传',(
     referenceFiles:['/tmp/01.png','/tmp/02.png'],
   });
   const route=instruction.slice(instruction.indexOf('路径 B：'),instruction.indexOf('setFiles 后'));
-  const parentClick=route.indexOf('点击唯一“添加文件等”');
+  const parentClick=route.indexOf('点击唯一“添加文件等内容”');
   const reread=route.indexOf('重新读取当前 DOM');
   const childWaiter=route.indexOf('重新创建一个全新的有界 waiter');
   const childClick=route.indexOf('点击菜单项并等待');

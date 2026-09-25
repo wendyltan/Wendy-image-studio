@@ -11,7 +11,16 @@ import {
 } from 'react';
 import type { Picture } from './types';
 
-export function qaLabel(qa: Picture['qa']) {
+export function qaLabel(
+  qa: Picture['qa'],
+  decision?: Picture['decision'],
+) {
+  if (
+    decision?.action === 'adopt_recovered' &&
+    qa.status === 'manual_review' &&
+    qa.pass !== true
+  )
+    return { className: 'deferred', text: '已人工采用 · 待校对' };
   if (qa.status === 'deferred')
     return { className: 'deferred', text: '待检查/未校对' };
   if (qa.pass === true) return { className: 'good', text: '已校对' };
@@ -20,14 +29,16 @@ export function qaLabel(qa: Picture['qa']) {
 
 export function QaBadge({
   qa,
+  decision,
   pageReviewPending = false,
 }: {
   qa: Picture['qa'];
+  decision?: Picture['decision'];
   pageReviewPending?: boolean;
 }) {
   const state = pageReviewPending
     ? { className: 'deferred', text: '待人工复核' }
-    : qaLabel(qa);
+    : qaLabel(qa, decision);
   return <span className={'qa-label ' + state.className}>{state.text}</span>;
 }
 

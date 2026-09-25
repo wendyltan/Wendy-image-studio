@@ -68,6 +68,7 @@ export default function Studio() {
     setZoom,
     edit,
     setEdit,
+    editError,
     editNote,
     setEditNote,
     story,
@@ -847,6 +848,7 @@ export default function Studio() {
         setZoom={setZoom}
         edit={edit}
         setEdit={setEdit}
+        editError={editError}
         editNote={editNote}
         setEditNote={setEditNote}
         action={action}

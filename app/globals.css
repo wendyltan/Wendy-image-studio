@@ -110,3 +110,5 @@ body{font-size:14px}.topbar{gap:24px}.quota-mini{display:flex;align-items:center
 .panel-decision-content .inline-actions,.panel-decision-card.urgent .inline-actions{gap:8px;margin-top:10px}
 .panel-decision-content .inline-actions button,.panel-decision-card.urgent .inline-actions button{min-height:42px}
 @media(max-width:640px){.panel-decision-strip{align-items:stretch;flex-direction:column;gap:7px;margin-top:-4px;font-size:11px}.panel-decision-strip button{width:100%;min-height:42px}.panel-decision-content .inline-actions,.panel-decision-card.urgent .inline-actions{display:grid;grid-template-columns:1fr}.panel-decision-content .inline-actions button,.panel-decision-card.urgent .inline-actions button{width:100%;min-height:46px}}
+
+.edit-dialog-error{margin:0 0 16px!important;color:#9a584d!important;background:#f6e8e5;border-color:#e8cbc5}

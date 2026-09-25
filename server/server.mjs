@@ -6,7 +6,7 @@ import {execFile,spawn} from 'node:child_process';
 import {APP,ROOT,REFS,CHECKS,inside,digest} from './workflow.mjs';
 import {connectionStatus,appServerSnapshot,normalizeRateLimits} from './bridge.mjs';
 import {WEB_IMAGE_PROVIDER,readWebManifest,webWorkerStatus} from './chatgpt-web-provider.mjs';
-import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,decidePanel,rejectPanel,resume,reviseImage,repairPageLayout,confirmPageLayout,reviewPage,unifyPageLayouts,recoverImage,adoptNativeDownload,reviewImage,retryMissingImage,imageRetryState,accept,recover,projectDir,syncRunningProject,refreshQuotaPauses,hasLiveWork} from './engine.mjs';
+import {active,listProjects,readProject,saveProject,createProject,planProject,approvePlan,approveSamples,decideSamples,decidePanel,adoptRecoveredPanel,rejectPanel,resume,reviseImage,repairPageLayout,confirmPageLayout,reviewPage,unifyPageLayouts,recoverImage,adoptNativeDownload,reviewImage,retryMissingImage,imageRetryState,assertRetryOwnedTabClosureAcknowledgment,accept,recover,projectDir,syncRunningProject,refreshQuotaPauses,hasLiveWork} from './engine.mjs';
 import {CATEGORIES,listDocuments,listAssets,discoverArchiveStories,archiveStory,stageUpload,readCandidate,inspectStagedCandidate,saveManualAsset,searchAssets,analyzeAsset,saveAssetProposal,applyAssetProposal,saveDocument,suggestDocument,deleteProjectFolder,deleteArchiveStory} from './library.mjs';
 import {applyProjectStorageCleanup,reportDownloadsRedundancy,reportProjectStorage} from './storage-hygiene.mjs';
 import {classifyFailure} from './failure-classifier.mjs';
@@ -199,9 +199,10 @@ function retryCommand(p,b){
   const records=Array.isArray(p.retryCommands)?p.retryCommands:[];
   const existing=records.find(record=>record.key===key);
   const target=existing?.target||imageRetryState(p)?.target||'';
-  const fingerprint=digest({target,confirmNoImage:b.confirmNoImage===true,confirmUnknownResult:b.confirmUnknownResult===true});
-  if(existing){if(existing.fingerprint!==fingerprint)throw new Error('这次重试标识已经用于另一张图片，请刷新后重试。');return {key,target,existing};}
-  return {key,target,fingerprint,existing:null};
+  const confirmOwnedTabClosed=b.confirmOwnedTabClosed===true,ownedTabId=String(b.ownedTabId||'').trim()||null;
+  const fingerprint=digest({target,confirmNoImage:b.confirmNoImage===true,confirmUnknownResult:b.confirmUnknownResult===true,...(confirmOwnedTabClosed||ownedTabId?{confirmOwnedTabClosed,ownedTabId}:{})});
+  if(existing){if(existing.fingerprint!==fingerprint)throw new Error('这次重试标识已经用于另一张图片，请刷新后重试。');return {key,target,existing,confirmOwnedTabClosed,ownedTabId};}
+  return {key,target,fingerprint,existing:null,confirmOwnedTabClosed,ownedTabId};
 }
 const server=http.createServer(async(req,res)=>{
   res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','no-referrer');res.setHeader('X-Frame-Options','DENY');
@@ -314,6 +315,12 @@ const server=http.createServer(async(req,res)=>{
         catch(error){p.previewDecisionCommands=p.previewDecisionCommands.filter(record=>record.key!==input.idempotencyKey);saveProject(p);throw error;}
         return send(res,{...publicProject(p),idempotent:false,command:{key:input.idempotencyKey,acceptedAt:new Date().toISOString(),continueProduction:input.continueProduction}});
       }
+      if(action==='recovered-panel-adoption'){
+        if(b.continueProduction!==false)throw new Error('采用恢复原图只记录人工决定；必须明确 continueProduction=false。');
+        const panelKey=String(b.panelKey||''),existing=p.panels?.[panelKey]?.userDecision;
+        if(existing?.action==='adopt_recovered'&&existing.projectVersion===Number(b.projectVersion)&&existing.taskId===String(b.taskId||'')&&existing.requestId===String(b.requestId||'')&&existing.artifactId===String(b.artifactId||'')&&existing.integritySha256===String(b.expectedSha256||''))return send(res,{...publicProject(p),idempotent:true});
+        await adoptRecoveredPanel(p,b);return send(res,{...publicProject(p),idempotent:false});
+      }
       if(action==='panel-decision'){
         const duplicate=duplicatePanelDecision(p,b);if(duplicate)return send(res,{...publicProject(p),idempotent:true,command:{key:duplicate.key,acceptedAt:duplicate.existing.at}});
         const input=panelDecisionInput(p,b),fingerprint=panelDecisionFingerprint(input);p.panelDecisionCommands=Array.isArray(p.panelDecisionCommands)?p.panelDecisionCommands:[];p.panelDecisionCommands.push({key:input.idempotencyKey,fingerprint,at:new Date().toISOString(),revision:p.revision,panelKey:input.panelKey,artifactId:input.artifactId,decision:input.decision,acknowledgedIssueIds:input.acknowledgedIssueIds,continueProduction:input.continueProduction});p.panelDecisionCommands=p.panelDecisionCommands.slice(-80);saveProject(p);
@@ -333,11 +340,12 @@ const server=http.createServer(async(req,res)=>{
         if(active.has(p.id)||hasLiveWork(p.id))throw new Error('这篇仍在制作或等待执行，请稍候。');
         const retryState=imageRetryState(p),confirmed=retryState?.certainty==='confirmed_missing'&&b.confirmNoImage===true,unknownApproved=retryState?.certainty==='unknown_result'&&b.confirmUnknownResult===true;
         if(!retryState||retryState.target!==command.target||(!confirmed&&!unknownApproved))throw new Error(retryState?.certainty==='unknown_result'?'请明确确认仍要重新生成这张结果未知的图片。':'请先确认没有生成图片。');
+        const ownedTabAcknowledgment=assertRetryOwnedTabClosureAcknowledgment(p,command.target,{confirmOwnedTabClosed:command.confirmOwnedTabClosed,ownedTabId:command.ownedTabId});
         p.retryCommands=Array.isArray(p.retryCommands)?p.retryCommands:[];
         const decision=unknownApproved?'retry_unknown_result':'confirmed_missing';
-        p.retryCommands.push({key:command.key,fingerprint:command.fingerprint,target:command.target,decision,at:new Date().toISOString()});p.retryCommands=p.retryCommands.slice(-80);
+        p.retryCommands.push({key:command.key,fingerprint:command.fingerprint,target:command.target,decision,...(ownedTabAcknowledgment?{ownedTabClosureAcknowledgement:{decision:'user_ack',...ownedTabAcknowledgment,at:new Date().toISOString()}}:{}),at:new Date().toISOString()});p.retryCommands=p.retryCommands.slice(-80);
         p.revisionNotes.push({key:command.target||'当前图片',note:unknownApproved?'用户知晓结果仍无法确认，明确允许只重新生成这一张':'用户确认本次没有取得图片，允许只重新生成这一张',at:new Date().toISOString()});saveProject(p);
-        try{retryMissingImage(p,command.target,{allowUnknownResult:unknownApproved});}catch(error){p.retryCommands=p.retryCommands.filter(record=>record.key!==command.key);saveProject(p);throw error;}
+        try{retryMissingImage(p,command.target,{allowUnknownResult:unknownApproved,confirmOwnedTabClosed:command.confirmOwnedTabClosed,ownedTabId:command.ownedTabId});}catch(error){p.retryCommands=p.retryCommands.filter(record=>record.key!==command.key);saveProject(p);throw error;}
         return send(res,{...publicProject(p),idempotent:false,command:{key:command.key,acceptedAt:new Date().toISOString()}});
       }
       if(active.has(p.id))throw new Error('这篇仍在制作，请稍候。');

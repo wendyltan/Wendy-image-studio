@@ -1,11 +1,28 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import vm from 'node:vm';
 import { test } from 'node:test';
 import ts from 'typescript';
+import {
+  buildRevisionPrompt,
+  normalizeChangeList,
+} from '../server/revision-prompt.mjs';
 
 const appRoot = path.resolve(import.meta.dirname, '..');
 const page = fs.readFileSync(path.join(appRoot, 'app/page.tsx'), 'utf8');
+const projectPicturesSource = fs.readFileSync(
+  path.join(appRoot, 'app/studio/project-pictures.tsx'),
+  'utf8',
+);
+const studioDialogsSource = fs.readFileSync(
+  path.join(appRoot, 'app/studio/studio-dialogs.tsx'),
+  'utf8',
+);
+const projectControllerSource = fs.readFileSync(
+  path.join(appRoot, 'app/studio/use-project-controller.ts'),
+  'utf8',
+);
 const studioSources = [
   page,
   fs.readFileSync(path.join(appRoot, 'app/studio/project-view.tsx'), 'utf8'),
@@ -35,14 +52,130 @@ const studioSources = [
 ].join('\n');
 const css = fs.readFileSync(path.join(appRoot, 'app/globals.css'), 'utf8');
 const panelDecisionModule = { exports: {} };
-new Function(
-  'exports',
+vm.runInNewContext(
   ts.transpile(
     fs.readFileSync(path.join(appRoot, 'app/studio/panel-decision.ts'), 'utf8'),
     { module: ts.ModuleKind.CommonJS },
   ),
-)(panelDecisionModule.exports);
+  { exports: panelDecisionModule.exports },
+);
 const { panelCoverFitNote } = panelDecisionModule.exports;
+const revisionPrefillModule = { exports: {} };
+vm.runInNewContext(
+  ts.transpile(
+    fs.readFileSync(
+      path.join(appRoot, 'app/studio/revision-prefill.ts'),
+      'utf8',
+    ),
+    { module: ts.ModuleKind.CommonJS },
+  ),
+  { exports: revisionPrefillModule.exports },
+);
+const { sourcedPageRepairPrompt } = revisionPrefillModule.exports;
+const visualsModule = { exports: {} };
+vm.runInNewContext(
+  ts.transpile(
+    fs.readFileSync(path.join(appRoot, 'app/studio/visuals.tsx'), 'utf8'),
+    { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.React },
+  ),
+  { exports: visualsModule.exports, require: () => ({}) },
+);
+const { qaLabel } = visualsModule.exports;
+
+test('adopted recovered storyboard image stays explicitly awaiting proofing', () => {
+  const manualReview = { pass: null, status: 'manual_review', summary: '', issues: [] };
+  assert.equal(
+    qaLabel(manualReview, { action: 'adopt_recovered' }).text,
+    '已人工采用 · 待校对',
+  );
+  assert.equal(qaLabel(manualReview).text, '待修订');
+  assert.equal(
+    qaLabel({ ...manualReview, pass: true }, { action: 'adopt_recovered' }).text,
+    '已校对',
+  );
+});
+
+test('finished-card repair route uses a sourced single target and keeps failures in the dialog', () => {
+  const oldPrefill = [
+    '成稿校对指出以下分镜问题：',
+    '- 咖啡机出液口不对',
+    '',
+    '请只修改第 5 页第 1 格，逐项修复以上问题；保留该格其他内容。',
+  ].join('\n');
+  assert.throws(
+    () => normalizeChangeList(oldPrefill),
+    (error) => error.code === 'UNRESOLVED_REVIEW_CRITIQUE',
+    'the old finished-card prefill must reproduce the fail-closed critique error',
+  );
+  assert.match(
+    projectPicturesSource,
+    /page\.qa\.repairPrompt/,
+    'a unique issue must be able to use the page QA repair prompt as its source',
+  );
+  assert.match(
+    studioDialogsSource,
+    /editError[\s\S]*role="alert"/,
+    'revision failures must be visible inside the edit dialog',
+  );
+  assert.match(
+    projectControllerSource,
+    /name === 'revise-image'[\s\S]*setEditError/,
+    'revision failures must stay attached to the open edit dialog',
+  );
+});
+
+test('finished-card repair prefill is executable only for one sourced issue', () => {
+  const issue = {
+    description: '咖啡机出液口不对',
+    repairAction: 'regenerate',
+  };
+  const group = { panelKey: '5-1', issues: [issue] };
+  const repairPrompt = '修正咖啡机出液口：双出液嘴、两股独立液流、杯柄朝右。';
+  const selected = sourcedPageRepairPrompt([group], [issue], repairPrompt);
+  assert.equal(selected, repairPrompt);
+  const prompt = buildRevisionPrompt(
+    `单幅 3:2\n故事与连续性要求：${JSON.stringify({
+      scene: '原木厨房咖啡角',
+      characters: '温蒂',
+      creatorPrompt: '日系生活插画',
+    })}`,
+    selected,
+    { key: '5-1' },
+  );
+  assert.match(prompt, /双出液嘴/);
+  assert.match(prompt, /两股独立液流/);
+  assert.equal(
+    sourcedPageRepairPrompt(
+      [group, { panelKey: '5-2', issues: [{ description: '人物动作僵硬' }] }],
+      [issue, { description: '人物动作僵硬', repairAction: 'regenerate' }],
+      repairPrompt,
+    ),
+    '',
+    'a page prompt must not be assumed to cover multiple issue groups',
+  );
+  assert.equal(
+    sourcedPageRepairPrompt(
+      [{ issues: [issue, { description: '人物动作僵硬' }] }],
+      [issue],
+      repairPrompt,
+    ),
+    '',
+    'a page prompt must not be assumed to cover multiple defects',
+  );
+  assert.equal(sourcedPageRepairPrompt([group], [issue], ''), '');
+  assert.equal(
+    sourcedPageRepairPrompt(
+      [group],
+      [
+        issue,
+        { description: '排版文字遮挡主体', repairAction: 'recompose' },
+      ],
+      repairPrompt,
+    ),
+    '',
+    'a hidden layout issue must prevent page-level repair prompt reuse',
+  );
+});
 
 function rule(selector) {
   const start = css.indexOf(`${selector}{`);
@@ -91,7 +224,7 @@ test('page and storyboard cards expose one clear action hierarchy with accessibl
   );
   assert.match(
     pictures,
-    /className="panel-card-heading"[\s\S]*?<QaBadge qa=\{panel\.qa\} \/>[\s\S]*?className="panel-review-row"[\s\S]*?className="primary"[\s\S]*?action\('review-image',\s*\{\s*key\s*\}\)/,
+    /className="panel-card-heading"[\s\S]*?<QaBadge qa=\{panel\.qa\} decision=\{panel\.decision\} \/>[\s\S]*?className="panel-review-row"[\s\S]*?className="primary"[\s\S]*?action\('review-image',\s*\{\s*key\s*\}\)/,
   );
   assert.match(
     pictures,
@@ -110,7 +243,11 @@ test('page and storyboard cards expose one clear action hierarchy with accessibl
     pictures,
     /descriptions\s*\.map\(\(description\)\s*=> `- \$\{description\}`\)/,
   );
-  assert.match(pictures, /setEditNote\(\s*`成稿校对指出以下分镜问题/);
+  assert.match(pictures, /sourcedPageRepairPrompt\([\s\S]*page\.qa\.repairPrompt/);
+  assert.match(
+    pictures,
+    /setEditNote\(\s*singleIssueRepairPrompt\s*\|\|\s*`成稿校对指出以下分镜问题/,
+  );
   assert.match(pictures, /修改分镜 \{panelKey\}/);
   assert.match(
     pictures,
@@ -271,6 +408,21 @@ test('orphaned and cleanup-pending tabs remain explicitly unconfirmed', () => {
   assert.match(status, /\['close_unconfirmed', 'cleanup_pending', 'orphaned'\]/);
   assert.match(status, /pendingCleanupState === 'cleanup_pending'/);
   assert.doesNotMatch(status, /orphaned:\s*'[^']*已关闭并核实/);
+});
+
+test('retry UI requires a separate tab-closure acknowledgement and sends the exact id', () => {
+  const recovery = fs.readFileSync(
+    path.join(appRoot, 'app/studio/recovery-cards.tsx'),
+    'utf8',
+  );
+  const server = fs.readFileSync(path.join(appRoot, 'server/server.mjs'), 'utf8');
+  assert.match(recovery, /confirmOwnedTabClosed:\s*true/);
+  assert.match(recovery, /ownedTabId:\s*oldOwnedTabId/);
+  assert.match(recovery, /这只记录人工确认，不会标记系统已核实关闭/);
+  assert.match(recovery, /oldOwnedTabName/);
+  assert.match(recovery, /oldOwnedTabId\.slice\(-6\)/);
+  assert.match(server, /decision:'user_ack'/);
+  assert.match(server, /confirmOwnedTabClosed,ownedTabId/);
 });
 
 test('formal panel decision stays beside its source image and collapses when local cover can absorb a tiny ratio gap', () => {

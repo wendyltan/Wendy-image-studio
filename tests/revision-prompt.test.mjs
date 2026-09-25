@@ -77,6 +77,57 @@ test('unstructured legacy revision input falls back to safe anchors, never the f
   assert.doesNotMatch(keep,/动作|姿势|站姿|视线|出液|portafilter|液流|咖啡机/);
 });
 
+test('page QA critique becomes positive corrections instead of instructions to reproduce the cited defects',()=>{
+  const note=`成稿校对指出以下分镜问题：\n- 前两格使用米色高背软包木脚书椅，第三格变成黑色带轮办公椅；冻结要求明确为同一书房、同一软包书椅。\n- 人物身体和脸部略朝向观者，电脑仅露背壳，导致“背靠书椅、松松看着电脑方向、安闲等待”的叙事不如前两格明确；未构成明显正视镜头，但建议加强侧面或三分之二侧面关系。\n\n请只修改第 2 页第 3 格，逐项修复以上问题；保留该格其他人物、场景、动作、构图和风格，不改动其他分镜。`;
+  const changes=normalizeChangeList(note);
+  assert.deepEqual(changes,[
+    '将第三格中的黑色带轮办公椅替换为与前两格一致的米色高背软包木脚书椅。',
+    '让人物身体与脸部呈现侧面或三分之二侧面，以“背靠书椅、松松看着电脑方向、安闲等待”清楚表达原定动作和视线；避免正视镜头。',
+  ]);
+  const prompt=buildRevisionPrompt(basePrompt,note,{key:'2-3'}),mustChange=prompt.slice(prompt.indexOf('必须修改：'),prompt.indexOf('必须保持：'));
+  assert.match(mustChange,/替换为与前两格一致的米色高背软包木脚书椅/);
+  assert.match(mustChange,/侧面或三分之二侧面/);
+  assert.doesNotMatch(mustChange,/变成黑色带轮办公椅|保留该格其他|不改动其他分镜|场景、动作、构图和风格/);
+  assert.match(prompt,/未涉及的背景物件与器具保持原图不变/);
+});
+
+test('unrecognized QA findings fail closed before an empty or misleading edit prompt can be built',()=>{
+  const note='成稿校对指出以下分镜问题：\n- 手部比例不协调，手指结构看起来过于僵硬。';
+  assert.throws(()=>buildRevisionPrompt(basePrompt,note,{key:'2-3'}),error=>error.code==='UNRESOLVED_REVIEW_CRITIQUE'&&/没有提交生图/.test(error.message));
+  assert.throws(()=>normalizeChangeList('成稿校对指出以下分镜问题：\n- 椅子颜色不一致，需要替换为米色软包椅。\n- 画面透视略显平面。'),error=>error.code==='UNRESOLVED_REVIEW_CRITIQUE');
+  assert.deepEqual(normalizeChangeList('具体修复方向：将第三格黑色办公椅替换为米色软包椅。'),['具体修复方向：将第三格黑色办公椅替换为米色软包椅']);
+});
+
+test('critique bullet does not silently drop a second explicit defect target',()=>{
+  const note='画面校对指出以下问题：\n- 建议改为蓝色上衣；右手多了一根手指，需要删除多余手指。';
+  const changes=normalizeChangeList(note);
+  assert.match(changes.join('\n'),/蓝色上衣/);
+  assert.match(changes.join('\n'),/删除多余手指/);
+  const prompt=buildRevisionPrompt(basePrompt,note,{key:'5-1'});
+  const mustChange=prompt.slice(prompt.indexOf('必须修改：'),prompt.indexOf('必须保持：'));
+  assert.match(mustChange,/蓝色上衣/);
+  assert.match(mustChange,/删除多余手指/);
+});
+
+test('critique bullet converts every supported suggestion, including a target introduced by 将',()=>{
+  const note='画面校对指出以下问题：\n- 建议改为蓝色上衣；建议调整为短袖；建议将背景改为室内。';
+  assert.deepEqual(normalizeChangeList(note),[
+    '将相关内容改为蓝色上衣，只改变该问题所需的局部。',
+    '将相关内容调整为短袖，只改变该问题所需的局部。',
+    '将背景改为室内，只改变该问题所需的局部。',
+  ]);
+});
+
+test('critique parser keeps a recognized target from masking an unrelated trailing defect',()=>{
+  const note='画面校对指出以下问题：\n- 建议改为蓝色上衣；画面透视略显平面。';
+  assert.throws(()=>normalizeChangeList(note),error=>error.code==='UNRESOLVED_REVIEW_CRITIQUE'&&error.unresolvedParts.some(part=>/透视/.test(part)));
+});
+
+test('critique keep clauses are removed while the explicit target remains',()=>{
+  const note='画面校对指出以下问题：\n- 建议改为蓝色上衣，保持人物姿势和背景不变。';
+  assert.deepEqual(normalizeChangeList(note),['将相关内容改为蓝色上衣，只改变该问题所需的局部。']);
+});
+
 test('structured fallback anchors are narrow and omit changed categories', () => {
   const prompt=buildRevisionPrompt('人物身份：温蒂；服装：浅杏短袖与浅棕裙；场景：原木厨房；光线：下午柔光；构图：单幅；风格：细腻生活插画。内部路径 /Volumes/secret.png','服装需要修改');
   assert.match(prompt,/人物身份：温蒂/);

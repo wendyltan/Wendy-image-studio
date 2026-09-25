@@ -11,6 +11,16 @@ import {chatGptWebImagePrompt} from '../server/web-executor-instructions.mjs';
 const names=['01-wendi.png','02-face.png'];
 const complete={schemaVersion:1,source:'browser-upload',uploadMethod:'direct-button-testid',chooserEventObserved:true,chooserAttachedBeforeClick:true,attachmentExpected:2,attachmentObserved:2,attachmentNames:names,attachmentPending:false,sendEnabled:true,failureStage:null};
 
+test('generated upload instructions require full AX snapshots for menu and attachment polling',()=>{
+  const instruction=chatGptWebImagePrompt({outputFile:'/tmp/out.png',manifestFile:'/tmp/run/web-generation.json',prompt:'fixture',referenceFiles:[],requestId:'11111111-1111-4111-8111-111111111111',runId:'run-fixture'});
+  const upload=instruction.slice(instruction.indexOf('- 附件入口只有两条'),instruction.indexOf('- upload-evidence.json'));
+  assert.equal((upload.match(/tab\.getAXState\(\{emit:false,disableDiffing:true\}\)/g)||[]).length,2);
+  assert.doesNotMatch(instruction,/tab\.getAXState\(\{emit:false\}\)/);
+  const routeB=upload.slice(upload.indexOf('路径 B：'),upload.indexOf('父菜单点击'));
+  assert.match(routeB,/添加文件等内容/);
+  assert.match(routeB,/添加照片和文件/);
+});
+
 test('structured upload evidence accepts a complete ordered attachment gate',()=>{
   const result=validateUploadEvidence(complete,{expectedCount:2,expectedNames:names,requireComplete:true});
   assert.equal(result.ok,true);
@@ -61,7 +71,14 @@ test('route A timeout plus route B 5/5 evidence unlocks ready, intent, and exact
   const commands=buildManifestCommands(manifestFile,{requestId:identity.requestId,sessionName:'🎨 温蒂生图-fallback'});
   const instruction=chatGptWebImagePrompt({outputFile:identity.outputFile,manifestFile,prompt:'fixture',referenceFiles:names5});
   assert(instruction.indexOf(commands.ready)<instruction.indexOf(commands.submissionIntent));
-  assert.match(instruction,/紧接着的一个独立、最短 CUA 动作中点击一次/);
+  assert.match(instruction,/click exactly once/);
+  assert.match(instruction,/之后绝不再点击发送/);
+  assert.match(instruction,/user-message baseline[\s\S]*globalThis\.__wendiUserBaseline/);
+  assert.match(instruction,/有界轮询，最长 45 秒、每 2 秒一次/);
+  assert.match(instruction,/本次冻结的完整 remotePrompt/);
+  assert.match(instruction,/本次新 user message/);
+  assert.match(instruction,/不要把输入框是否清空、composer placeholder 是否变化[\s\S]*当作发送成功或失败证据/);
+  assert.doesNotMatch(instruction,/至少确认输入框已清空并出现本次新的用户消息/);
   assert.doesNotMatch(instruction,/A 的 timeout[^\n]*失败/);
   const sent=patchManifest({stage:'submitted',manifestFile,args:{conversationUrl:'https://chatgpt.com/c/fallback',submissionConfirmedBy:'fixture-positive-browser-evidence'}}).manifest;
   assert.equal(sent.state,'submitted');assert.equal(sent.submitted,true);assert.equal(sent.submissionIntent,true);

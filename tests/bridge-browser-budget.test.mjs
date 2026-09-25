@@ -28,9 +28,18 @@ const emit=(index,code='noop')=>{const item=makeItem(index,code);console.log(JSO
 const emitStarted=(index,code='noop')=>{const item=makeItem(index,code);console.log(JSON.stringify({type:'item.started',item}));return item;};
 const emitCompleted=item=>console.log(JSON.stringify({type:'item.completed',item}));
 const emitIntentHelper=index=>{const item={id:'item_'+index,type:'command_execution',command:'node run-manifest.mjs submission-intent --manifest-file fixture/web-generation.json',aggregated_output:'{"ok":true,"submissionIntent":true}'};console.log(JSON.stringify({type:'item.started',item}));console.log(JSON.stringify({type:'item.completed',item}));};
-const calls=mode==='initialization-budget'?['init','create','navigation','entry','upload','upload','intent-helper','submit','download','download']:mode==='repeated-initialization'?['init','init','create','navigation','entry']:mode==='four-business-close'?['bootstrap','bootstrap','bootstrap','upload','close']:mode==='close-abuse'?['bootstrap','bootstrap','bootstrap','abuse','business']:mode==='lifecycle-classification'?['diagnostic-ax','entry-diagnostic','upload','submit','download','close']:mode==='single-select-upload'?['duplicate-action']:mode==='duplicate-upload'?['upload','duplicate-action']:mode==='duplicate-create'?['duplicate-action']:mode==='pre-intent'?['bootstrap','bootstrap','bootstrap','upload','upload','upload']:mode==='post-intent'||mode==='post-intent-delayed'?['bootstrap','bootstrap','bootstrap','intent-helper','submit','submit']:mode==='intent-and-send'?['bootstrap','bootstrap','bootstrap','upload','intent-helper','submit']:['business','business','business','business','business'];
+const emitFalseIntentHelper=index=>{const item={id:'item_'+index,type:'command_execution',command:'node run-manifest.mjs failed --submission-intent false',aggregated_output:'{"ok":true,"stage":"failed","submissionIntent":false}'};console.log(JSON.stringify({type:'item.started',item}));console.log(JSON.stringify({type:'item.completed',item}));};
+const calls=mode==='initialization-budget'?['init','create','navigation','entry','upload','upload','intent-helper','submit','download','download']:mode==='repeated-initialization'?['init','init','create','navigation','entry']:mode==='four-business-close'?['bootstrap','bootstrap','bootstrap','upload','close']:mode==='implicit-cleanup'?['bootstrap','bootstrap','bootstrap','upload','implicit-close']:mode==='implicit-close-abuse'?['bootstrap','bootstrap','bootstrap','upload','abuse']:mode==='marked-close-abuse'?['bootstrap','bootstrap','bootstrap','upload','abuse']:mode==='close-abuse'?['bootstrap','bootstrap','bootstrap','abuse','business']:mode==='lifecycle-classification'?['diagnostic-ax','entry-diagnostic','upload','submit','download','close']:mode==='single-select-upload'?['duplicate-action']:mode==='duplicate-upload'?['upload','duplicate-action']:mode==='duplicate-create'?['duplicate-action']:mode==='pre-intent'?['bootstrap','bootstrap','bootstrap','upload','upload','upload']:mode==='post-intent'||mode==='post-intent-delayed'?['bootstrap','bootstrap','bootstrap','intent-helper','submit','submit']:mode==='intent-and-send'?['bootstrap','bootstrap','bootstrap','upload','intent-helper','submit']:mode==='false-intent-helper'?['bootstrap','bootstrap','bootstrap','false-intent-helper']:['business','business','business','business','business'];
+if(mode.startsWith('readiness-marker-oversized')){
+  const evidence={marker:'WENDI_BROWSER_READY_V1',schemaVersion:1,ready:true,runId,ownedTabId:'tab-fixture',currentUrl:'https://chatgpt.com/',expectedUrl:'https://chatgpt.com/',imageCreationPath:'chat-composer',checks:{targetUrlMatches:true,loginRequired:false,profileLoaded:true,chatModeActive:true,composerEnabled:true,attachmentEntryEnabled:true,imageCreationAvailable:true}};
+  const code='/* '+'X'.repeat(950)+' */ // WENDI_BROWSER_READINESS_GATE_V1\\n globalThis.__wendiOwnedTab; globalThis.__wendiOwnedTabId; await tab.goto("https://chatgpt.com/"); const currentUrl=await tab.url(); await chatMode.check(); const ax=await tab.getAXState({emit:false});';
+  const item={id:'readiness',type:'mcp_tool_call',server:'cua_repl',tool:'js',arguments:{timeout_ms:30000,code},result:{content:[{type:'text',text:'WENDI_BROWSER_READY_V1:'+JSON.stringify(evidence)}],_meta:{browser_use:{largeDiagnostic:'D'.repeat(12000),screenshot:{pageUrl:'https://chatgpt.com/',tabId:'tab-fixture',url:'data:image/png;base64,'+'A'.repeat(12000)}}}}};
+  console.log(JSON.stringify({type:'item.completed',item}));
+  if(mode==='readiness-marker-oversized-followed-by-unready')console.log(JSON.stringify({type:'item.completed',item:{id:'readiness-unready',type:'mcp_tool_call',server:'cua_repl',tool:'js',arguments:{code:'const ax=await tab.getAXState({emit:false});'},result:{content:[{type:'text',text:'no readiness marker'}]}}}));
+  await new Promise(resolve=>setTimeout(resolve,200));process.exit(0);
+}
 let index=0;
-const next=()=>{const kind=calls[index];if(!kind){setTimeout(()=>{fs.writeFileSync(after,'1');process.exit(0)},800);return;}index+=1;if(kind!=='close'){const leaseFile=path.join(dir,'owned-tab-lease.json');const lease=JSON.parse(fs.readFileSync(leaseFile,'utf8'));lease.state=(kind==='upload'?'uploading':kind==='submit'?'uploaded':kind==='download'?'generating':'created');fs.writeFileSync(leaseFile,JSON.stringify(lease));if(mode==='lifecycle-classification'){const manifestFile=path.join(dir,'web-generation.json');let manifest={state:'accepted',submissionIntent:false,submitted:false};try{manifest=JSON.parse(fs.readFileSync(manifestFile,'utf8'))}catch{};if(kind==='submit')manifest.state='ready';if(kind==='download'){manifest.state='submitted';manifest.submissionIntent=true;manifest.submitted=true}fs.writeFileSync(manifestFile,JSON.stringify(manifest))}}if((index===5||index===6)&&kind==='business' || (mode==='pre-intent'&&index===6))fs.writeFileSync(fifth,'1');if(kind==='close'){const leaseFile=path.join(dir,'owned-tab-lease.json');const lease=JSON.parse(fs.readFileSync(leaseFile,'utf8'));lease.state='closing';fs.writeFileSync(leaseFile,JSON.stringify(lease));fs.writeFileSync(closed,'1');fs.writeFileSync(after,'1');emit(index,marker+'; await tab.close(); --run-id "'+runId+'" --owned-tab-id "tab-fixture" --state closing;');setTimeout(()=>process.exit(0),120);return;}if(kind==='abuse')emit(index,marker+'; await tab.close(); --run-id "'+runId+'" --owned-tab-id "tab-fixture" --state closing;');else if(kind==='intent-helper')emitIntentHelper(index);else if(kind==='submit'&&mode==='post-intent-delayed'&&index===6){const item=emitStarted(index,'const send=tab.playwright.getByRole("button",{name:/发送提示词/}); await send.click();');setTimeout(()=>{emitCompleted(item);fs.writeFileSync(delayed,'1');next();},700);return;}else if(kind==='submit')emit(index,'const send=tab.playwright.getByRole("button",{name:/发送提示词/}); await send.click();');else if(kind==='duplicate-action'&&mode==='duplicate-upload')emit(index,'await chooser.setFiles(files); await chooser.setFiles(files);');else if(kind==='duplicate-action'&&mode==='duplicate-create')emit(index,'await cua.createBrowserTab("chrome",undefined,{sessionName:"one"}); await cua.createBrowserTab("chrome",undefined,{sessionName:"two"});');else if(kind==='upload'){uploadCallNumber+=1;emit(index,uploadCallNumber===1?'await chooser.setFiles(files); const send=tab.playwright.getByRole("button",{name:/发送提示词/}); const sendEnabled=await send.isEnabled();':'const observed=await tab.getAXState({emit:false}); const sendEnabled=/send/.test(String(observed));')}else if(kind==='init')emit(index,'await cua.getState()');else if(kind==='create')emit(index,'globalThis.__wendiOwnedTab=await cua.createBrowserTab("chrome",undefined,{sessionName:"fixture"})');else if(kind==='navigation')emit(index,'await tab.goto("https://chatgpt.com"); await tab.getAXState({emit:false})');else if(kind==='entry')emit(index,'login chat mode composer 创建图片');else if(kind==='download')emit(index,'const inventory=await pageAssets.list()');else if(kind==='diagnostic-ax')emit(index,'const ax=await tab.getAXState({emit:false}); const copy="prompt-textarea composer uploading"; return {ax,copy};');else if(kind==='entry-diagnostic')emit(index,'const ax=await tab.getAXState({emit:false}); const hasComposer=/prompt-textarea|composer/.test(String(ax));');else emit(index,kind==='business'?'noop':kind);setTimeout(next,60)};
+const next=()=>{const kind=calls[index];if(!kind){setTimeout(()=>{fs.writeFileSync(after,'1');process.exit(0)},800);return;}index+=1;if(kind!=='close'){const leaseFile=path.join(dir,'owned-tab-lease.json');const lease=JSON.parse(fs.readFileSync(leaseFile,'utf8'));lease.state=(kind==='upload'?'uploading':kind==='submit'?'uploaded':kind==='download'?'generating':kind==='implicit-close'||(mode==='implicit-close-abuse'&&kind==='abuse')||(mode==='marked-close-abuse'&&kind==='abuse')?'closing':'created');fs.writeFileSync(leaseFile,JSON.stringify(lease));if(mode==='lifecycle-classification'){const manifestFile=path.join(dir,'web-generation.json');let manifest={state:'accepted',submissionIntent:false,submitted:false};try{manifest=JSON.parse(fs.readFileSync(manifestFile,'utf8'))}catch{};if(kind==='submit')manifest.state='ready';if(kind==='download'){manifest.state='submitted';manifest.submissionIntent=true;manifest.submitted=true}fs.writeFileSync(manifestFile,JSON.stringify(manifest))}}if((index===5||index===6)&&kind==='business' || (mode==='pre-intent'&&index===6))fs.writeFileSync(fifth,'1');if(kind==='close'){const leaseFile=path.join(dir,'owned-tab-lease.json');const lease=JSON.parse(fs.readFileSync(leaseFile,'utf8'));lease.state='closing';fs.writeFileSync(leaseFile,JSON.stringify(lease));fs.writeFileSync(closed,'1');fs.writeFileSync(after,'1');emit(index,'/* '+marker+' --run-id "'+runId+'" --owned-tab-id "tab-fixture" --state closing */ const tab=globalThis.__wendiOwnedTab; let closed=false; try { await tab.close(); closed=true; } finally { nodeRepl.write(JSON.stringify({cleanupStatus:closed?"closed":"close_failed",ownedTabId:globalThis.__wendiOwnedTabId})); }');setTimeout(()=>process.exit(0),120);return;}if(kind==='implicit-close'){fs.writeFileSync(closed,'1');fs.writeFileSync(after,'1');emit(index,'let tab=globalThis.__wendiOwnedTab;if(!tab)throw new Error("owned tab missing");let closed=false;try{await tab.close();closed=true}finally{nodeRepl.write(JSON.stringify({cleanupStatus:closed?"closed":"close_failed",ownedTabId:globalThis.__wendiOwnedTabId}))}');setTimeout(()=>process.exit(0),120);return;}if(kind==='abuse')emit(index,mode==='implicit-close-abuse'?'let tab=globalThis.__wendiOwnedTab;if(!tab)throw new Error("owned tab missing");await tab.goto("https://chatgpt.com");await tab.close();':mode==='marked-close-abuse'?marker+'; let tab=globalThis.__wendiOwnedTab; await tab.goto("https://chatgpt.com"); await chooser.setFiles(files); await tab.close(); --run-id "'+runId+'" --owned-tab-id "tab-fixture" --state closing;':marker+'; await tab.close(); --run-id "'+runId+'" --owned-tab-id "tab-fixture" --state closing;');else if(kind==='intent-helper')emitIntentHelper(index);else if(kind==='false-intent-helper')emitFalseIntentHelper(index);else if(kind==='submit'&&mode==='post-intent-delayed'&&index===6){const item=emitStarted(index,'const send=tab.playwright.getByRole("button",{name:/发送提示词/}); await send.click();');setTimeout(()=>{emitCompleted(item);fs.writeFileSync(delayed,'1');next();},700);return;}else if(kind==='submit')emit(index,'const send=tab.playwright.getByRole("button",{name:/发送提示词/}); await send.click();');else if(kind==='duplicate-action'&&mode==='duplicate-upload')emit(index,'await chooser.setFiles(files); await chooser.setFiles(files);');else if(kind==='duplicate-action'&&mode==='duplicate-create')emit(index,'await cua.createBrowserTab("chrome",undefined,{sessionName:"one"}); await cua.createBrowserTab("chrome",undefined,{sessionName:"two"});');else if(kind==='upload'){uploadCallNumber+=1;emit(index,uploadCallNumber===1?'await chooser.setFiles(files); const send=tab.playwright.getByRole("button",{name:/发送提示词/}); const sendEnabled=await send.isEnabled();':'const observed=await tab.getAXState({emit:false}); const sendEnabled=/send/.test(String(observed));')}else if(kind==='init')emit(index,'await cua.getState()');else if(kind==='create')emit(index,'globalThis.__wendiOwnedTab=await cua.createBrowserTab("chrome",undefined,{sessionName:"fixture"})');else if(kind==='navigation')emit(index,'await tab.goto("https://chatgpt.com"); await tab.getAXState({emit:false})');else if(kind==='entry')emit(index,'login chat mode composer 创建图片');else if(kind==='download')emit(index,'const inventory=await pageAssets.list()');else if(kind==='diagnostic-ax')emit(index,'const ax=await tab.getAXState({emit:false}); const copy="prompt-textarea composer uploading"; return {ax,copy};');else if(kind==='entry-diagnostic')emit(index,'const ax=await tab.getAXState({emit:false}); const hasComposer=/prompt-textarea|composer/.test(String(ax));');else emit(index,kind==='business'?'noop':kind);setTimeout(next,60)};
 next();
 `;
   fs.writeFileSync(bin,source,{mode:0o755});
@@ -82,6 +91,27 @@ test('browser call stages follow persisted lease lifecycle, not diagnostic sourc
   assert.equal(browserToolStage(`const send=tab.playwright.getByRole('button',{name:/发送提示词/}); await send.click();`,{leaseState:'uploading',manifestState:'accepted'}),'submit');
 });
 
+test('the known recoverable browser branches fit their bounded stage slots',()=>{
+  const replays=[
+    {stage:'bootstrap',leaseState:'creating',code:'globalThis.__wendiOwnedTab=await cua.createBrowserTab("chrome")'},
+    {stage:'bootstrap',leaseState:'created',code:'try { await tab.goto(target); } catch {} const url=await tab.url(); const ax=await tab.getAXState({emit:false}); return {url,composer:/prompt-textarea/.test(String(ax))};'},
+    {stage:'bootstrap',leaseState:'created',code:'const url=await tab.url(); const ax=await tab.getAXState({emit:false}); return {url,composer:/prompt-textarea/.test(String(ax))};'},
+    {stage:'upload',leaseState:'uploading',code:'let chooser=await directButton.waitForChooser(); if(!chooser){ await plusButton.click(); const ax=await tab.getAXState({emit:false}); chooser=await uploadMenuItem.waitForChooser(); } if(!chooser) throw Error("no chooser"); for(const file of files) await chooser.setFiles([file]); const ax=await tab.getAXState({emit:false});'},
+    {stage:'upload',leaseState:'uploading',code:'const ax=await tab.getAXState({emit:false}); return {attachmentObserved:5,attachmentPending:/uploading|处理中/.test(String(ax)),sendEnabled:false};'},
+    {stage:'submit',leaseState:'uploaded',manifestState:'ready',code:'const send=tab.playwright.getByRole("button",{name:/发送提示词/}); await send.click();'},
+    {stage:'wait_download',leaseState:'generating',manifestState:'submitted',code:'const inventory=await pageAssets.list(); if(!hasUniqueCurrentImage(inventory)){ await exactCurrentResult.click(); await pageAssets.list(); }'},
+    {stage:'wait_download',leaseState:'generating',manifestState:'submitted',code:'const inventory=await pageAssets.list(); const candidate=selectExactCurrentResult(inventory); if(!candidate) throw Error("DOWNLOAD_FAILED");'},
+  ];
+  const counts={bootstrap:0,upload:0,submit:0,wait_download:0};
+  for(const replay of replays){
+    const stage=browserToolStage(replay.code,{leaseState:replay.leaseState,manifestState:replay.manifestState});
+    assert.equal(stage,replay.stage,replay.code);
+    counts[stage]+=1;
+  }
+  assert.deepEqual(counts,{bootstrap:3,upload:2,submit:1,wait_download:2});
+  assert.equal(Object.values(counts).reduce((sum,count)=>sum+count,0),BROWSER_TOOL_STAGE_BUDGETS.total);
+});
+
 test('manifest submission-intent helper is not a browser budget call',async()=>{
   const run=fixture('intent-and-send');
   const result=await runCodex({codexBin:run.codexBin,dir:run.dir,prompt:'fixture',browserMode:'chrome',timeoutMs:5000});
@@ -93,6 +123,36 @@ test('manifest submission-intent helper is not a browser budget call',async()=>{
   assert.equal(execution.browserBusinessCallCount,5);
   assert.deepEqual(execution.browserBusinessStageCounts,{bootstrap:3,upload:1,submit:1});
   assert.equal(execution.submissionIntentObserved,true);
+});
+
+test('failed helper arguments containing submission-intent false do not prove a send',async()=>{
+  const run=fixture('false-intent-helper');
+  await runCodex({codexBin:run.codexBin,dir:run.dir,prompt:'fixture',timeoutMs:5000});
+  await flush();
+  const execution=JSON.parse(fs.readFileSync(path.join(run.dir,'execution.json'),'utf8'));
+  assert.equal(execution.submissionIntentObserved,false);
+});
+
+test('oversized completed CUA output preserves only validated readiness marker evidence in bounded events',async()=>{
+  const run=fixture('readiness-marker-oversized',{lease:false});
+  let immediateEvidence=false;
+  await runCodex({codexBin:run.codexBin,dir:run.dir,prompt:'fixture',browserMode:'chrome',timeoutMs:5000,onEvent:event=>{if(event.type==='item.completed'&&event.item?.id==='readiness'){const sidecar=JSON.parse(fs.readFileSync(path.join(run.dir,'browser-readiness-latest.json'),'utf8'));immediateEvidence=sidecar.itemId==='readiness'&&sidecar.browserReadinessEvidence?.complete===true;}}});
+  assert.equal(immediateEvidence,true);
+  const events=persistedEvents(run.dir),event=events.find(value=>value.item?.id==='readiness');
+  assert.equal(event.truncated,true);
+  assert.equal(event.item.timeout_ms,30000);
+  assert.ok(event.item.resultText.length<=800);
+  assert.deepEqual(event.item.browserReadinessEvidence,{complete:true,source:'cua_completed_result',marker:'WENDI_BROWSER_READY_V1',schemaVersion:1,ready:true,runId:path.basename(run.dir),ownedTabId:'tab-fixture',currentUrl:'https://chatgpt.com/',expectedUrl:'https://chatgpt.com/',imageCreationPath:'chat-composer',checks:{targetUrlMatches:true,loginRequired:false,profileLoaded:true,chatModeActive:true,composerEnabled:true,attachmentEntryEnabled:true,imageCreationAvailable:true},sourceChecks:{gateMarkerPresent:true,gotoCount:1,createTabCount:0,axReadCount:1,urlReadCount:1,getTabCount:0,setFilesCount:0,clickCount:0,pasteCount:0,setValueCount:0,typeTextCount:0,pressKeyCount:0,checkCount:1,ownedHandleReferencePresent:true}});
+  assert.doesNotMatch(event.item.code,/WENDI_BROWSER_READINESS_GATE_V1/);
+  assert.doesNotMatch(JSON.stringify(event),/D{100}|A{100}/);
+  assert.equal(fs.statSync(path.join(run.dir,'browser-readiness-latest.json')).mode&0o777,0o600);
+});
+
+test('later completed CUA call atomically clears an older readiness sidecar',async()=>{
+  const run=fixture('readiness-marker-oversized-followed-by-unready',{lease:false});
+  await runCodex({codexBin:run.codexBin,dir:run.dir,prompt:'fixture',browserMode:'chrome',timeoutMs:5000});
+  const latest=JSON.parse(fs.readFileSync(path.join(run.dir,'browser-readiness-latest.json'),'utf8'));
+  assert.equal(latest.itemId,'readiness-unready');assert.equal(latest.browserReadinessEvidence,null);
 });
 
 test('required one-time CUA environment initialization does not consume bootstrap slots',async()=>{
@@ -139,6 +199,52 @@ test('four business calls plus one audited cleanup call pass and remain within s
   const execution=JSON.parse(fs.readFileSync(path.join(run.dir,'execution.json'),'utf8'));
   assert.equal(execution.browserToolCallCount,5);assert.equal(execution.browserBusinessCallCount,4);assert.equal(execution.browserCleanupCallCount,1);assert.equal(execution.browserToolCallBudget,BROWSER_TOOL_BUSINESS_CALL_BUDGET);assert.equal(execution.browserToolCleanupBudget,BROWSER_TOOL_CLEANUP_CALL_BUDGET);assert.deepEqual(execution.browserToolStageBudgets,BROWSER_TOOL_STAGE_BUDGETS);assert.deepEqual(execution.browserBusinessStageCounts,{bootstrap:3,upload:1});assert.equal(execution.browserToolBudgetExceeded,false);
   persistedEvents(run.dir);
+});
+
+test('the observed owned-tab close script uses the cleanup slot',async()=>{
+  const dir=fs.mkdtempSync(path.join(root,'observed-close-'));
+  const runId=path.basename(dir),ownedTabId='tab-fixture';
+  fs.writeFileSync(path.join(dir,'owned-tab-lease.json'),JSON.stringify({schemaVersion:1,runId,requestId:'11111111-1111-4111-8111-111111111111',ownedTabId,state:'closing'}));
+  const code=`// ${BROWSER_CLEANUP_MARKER}\nconst tab=globalThis.__wendiOwnedTab; const ownedTabId=globalThis.__wendiOwnedTabId; const runId="${runId}"; if(!tab||ownedTabId!=="${ownedTabId}") throw new Error("owned tab cleanup handle unavailable"); let cleanupStatus="close_failed"; try { await tab.close(); cleanupStatus="closed"; } finally { nodeRepl.write(JSON.stringify({cleanupStatus,ownedTabId})); }`;
+  const bin=path.join(dir,'fixture-worker.mjs');
+  fs.writeFileSync(bin,`#!/usr/bin/env node\nconst item=${JSON.stringify({id:'observed-close',type:'mcp_tool_call',server:'cua_repl',tool:'js',arguments:{code}})};\nconsole.log(JSON.stringify({type:'item.started',item}));\nconsole.log(JSON.stringify({type:'item.completed',item}));\n`);
+  fs.chmodSync(bin,0o755);
+  const result=await runCodex({codexBin:bin,dir,prompt:'fixture',browserMode:'chrome',timeoutMs:5000});
+  assert.equal(result.text,'');
+  const execution=JSON.parse(fs.readFileSync(path.join(dir,'execution.json'),'utf8'));
+  assert.equal(execution.browserBusinessCallCount,0);
+  assert.equal(execution.browserCleanupCallCount,1);
+});
+
+test('unmarked close with no source run/tab identity cannot use the cleanup exemption',async()=>{
+  const run=fixture('implicit-cleanup');
+  await assert.rejects(runCodex({codexBin:run.codexBin,dir:run.dir,prompt:'fixture',browserMode:'chrome',timeoutMs:5000}),error=>error.code==='BROWSER_TOOL_BUDGET_EXCEEDED'&&error.stageName==='bootstrap');
+  await flush();
+  assert.equal(readBrowserToolBudget(run.dir).observedCleanup,0);
+  const execution=JSON.parse(fs.readFileSync(path.join(run.dir,'execution.json'),'utf8'));
+  assert.equal(execution.browserBusinessCallCount,5);
+  assert.equal(execution.browserCleanupCallCount,0);
+  assert.deepEqual(execution.browserBusinessStageCounts,{bootstrap:4,upload:1});
+});
+
+test('closing lease does not authorize navigation mixed into an owned-tab close',async()=>{
+  const run=fixture('implicit-close-abuse');
+  await assert.rejects(runCodex({codexBin:run.codexBin,dir:run.dir,prompt:'fixture',browserMode:'chrome',timeoutMs:5000}),error=>error.code==='BROWSER_TOOL_BUDGET_EXCEEDED'&&error.observedBusiness===5&&error.observedCleanup===0);
+  const budget=readBrowserToolBudget(run.dir);
+  assert.equal(budget.observedCleanup,0);
+  assert.equal(budget.budgetKind,'business');
+  const execution=JSON.parse(fs.readFileSync(path.join(run.dir,'execution.json'),'utf8'));
+  assert.equal(execution.browserCleanupCallCount,0);
+});
+
+test('fixed cleanup marker does not exempt scripts mixed with navigation or upload',async()=>{
+  const run=fixture('marked-close-abuse');
+  await assert.rejects(runCodex({codexBin:run.codexBin,dir:run.dir,prompt:'fixture',browserMode:'chrome',timeoutMs:5000}),error=>error.code==='BROWSER_TOOL_BUDGET_EXCEEDED'&&error.observedBusiness===5&&error.observedCleanup===0);
+  const budget=readBrowserToolBudget(run.dir);
+  assert.equal(budget.observedCleanup,0);
+  assert.equal(budget.budgetKind,'business');
+  const execution=JSON.parse(fs.readFileSync(path.join(run.dir,'execution.json'),'utf8'));
+  assert.equal(execution.browserCleanupCallCount,0);
 });
 
 test('the fifth business call is terminated while cleanup is not counted as business',async()=>{

@@ -4,6 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 import {patchManifest} from './run-manifest.mjs';
+import {BROWSER_READINESS_MARKER} from './browser-readiness.mjs';
 
 /**
  * The Chrome extension owns the actual browser handle.  Node cannot safely
@@ -150,8 +151,90 @@ function normalizeLease(value, expected = {}) {
     cleanupVerifiedAt: input.cleanupVerifiedAt || null,
     cleanupError: input.cleanupError ? text(input.cleanupError).slice(0, 1000) : null,
     kernelReset: input.kernelReset === true,
+    ...(input.browserReadiness && typeof input.browserReadiness === 'object' ? {browserReadiness: input.browserReadiness} : {}),
     updatedAt: input.updatedAt || now(),
     ...(input.createdBy ? {createdBy: text(input.createdBy).slice(0, 120)} : {}),
+  };
+}
+
+function normalizeChatUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    if (url.protocol !== 'https:' || url.hostname !== 'chatgpt.com' || url.username || url.password) return null;
+    const pathname = url.pathname.replace(/\/+$/, '') || '/';
+    return `${url.origin}${pathname}${url.search}`;
+  } catch {
+    return null;
+  }
+}
+
+function latestReadinessEvidence(dir) {
+  const evidenceFile = path.join(path.resolve(String(dir || '')), 'browser-readiness-latest.json');
+  let latest;
+  try { latest = JSON.parse(fs.readFileSync(evidenceFile, 'utf8')); } catch { return null; }
+  if (latest?.schemaVersion !== 1
+    || latest?.source !== 'bridge_cua_completed_item'
+    || latest?.eventType !== 'item.completed'
+    || latest?.server !== 'cua_repl'
+    || latest?.tool !== 'js'
+    || typeof latest?.itemId !== 'string'
+    || !latest.itemId) return null;
+  const readiness = latest.browserReadinessEvidence;
+  const evidence = readiness?.complete === true
+    && readiness?.source === 'cua_completed_result'
+    && readiness?.marker === BROWSER_READINESS_MARKER
+    ? readiness
+    : null;
+  return {evidence, sourceChecks: readiness?.sourceChecks || null};
+}
+
+function assertBrowserReadinessEvidence(dir, lease) {
+  const latest = latestReadinessEvidence(dir);
+  const evidence = latest?.evidence;
+  const checks = evidence?.checks;
+  const requiredChecks = ['targetUrlMatches', 'profileLoaded', 'chatModeActive', 'composerEnabled', 'attachmentEntryEnabled', 'imageCreationAvailable'];
+  const sourceChecks = latest?.sourceChecks;
+  const isValid = sourceChecks?.gateMarkerPresent === true
+    && sourceChecks?.gotoCount === 1
+    && sourceChecks?.createTabCount === 0
+    && Number.isInteger(sourceChecks?.checkCount) && sourceChecks.checkCount >= 0 && sourceChecks.checkCount <= 1
+    && sourceChecks?.getTabCount === 0
+    && sourceChecks?.setFilesCount === 0
+    && sourceChecks?.clickCount === 0
+    && sourceChecks?.pasteCount === 0
+    && sourceChecks?.setValueCount === 0
+    && sourceChecks?.typeTextCount === 0
+    && sourceChecks?.pressKeyCount === 0
+    && Number.isInteger(sourceChecks?.axReadCount) && sourceChecks.axReadCount >= 1
+    && Number.isInteger(sourceChecks?.urlReadCount) && sourceChecks.urlReadCount >= 1
+    && sourceChecks?.ownedHandleReferencePresent === true
+    && evidence?.marker === BROWSER_READINESS_MARKER
+    && evidence?.complete === true
+    && evidence?.source === 'cua_completed_result'
+    && evidence?.schemaVersion === 1
+    && evidence?.ready === true
+    && evidence?.ownedTabId === String(lease?.ownedTabId || '')
+    && evidence?.runId === String(lease?.runId || '')
+    && Boolean(normalizeChatUrl(evidence?.currentUrl))
+    && normalizeChatUrl(evidence?.currentUrl) === normalizeChatUrl(evidence?.expectedUrl)
+    && evidence?.imageCreationPath === 'chat-composer'
+    && checks?.loginRequired === false
+    && requiredChecks.every(check => checks?.[check] === true);
+  if (!isValid) {
+    const error = new Error('owned tab 不能进入 uploading：当前 run 最近一次 CUA 调用缺少匹配的、通过校验的 WENDI_BROWSER_READINESS_V1 证据。');
+    error.code = 'OWNED_TAB_READINESS_REQUIRED';
+    throw error;
+  }
+  return {
+    marker: evidence.marker,
+    schemaVersion: evidence.schemaVersion,
+    ownedTabId: evidence.ownedTabId,
+    runId: evidence.runId,
+    currentUrl: normalizeChatUrl(evidence.currentUrl),
+    expectedUrl: normalizeChatUrl(evidence.expectedUrl),
+    ready: true,
+    imageCreationPath: evidence.imageCreationPath,
+    checks: Object.fromEntries(requiredChecks.map(check => [check, true]).concat([['loginRequired', false]])),
   };
 }
 
@@ -322,12 +405,14 @@ export function markOwnedTabStage({dir, runId, requestId, state, ownedTabId, ses
       throw error;
     }
     if (nextState === 'created' && !text(ownedTabId)) throw Object.assign(new Error('created 阶段必须记录实际 ownedTabId。'), {code: 'OWNED_TAB_ID_MISSING'});
+    const browserReadiness = nextState === 'uploading' ? assertBrowserReadinessEvidence(dir, lease) : lease.browserReadiness;
     const next = {
       state: nextState,
       ownedTabId: text(ownedTabId) || lease.ownedTabId,
       sessionName: text(sessionName) || lease.sessionName,
       createdAt: createdAt || lease.createdAt || (nextState === 'created' ? now() : null),
       cleanupStatus: nextState === 'created' ? 'open' : lease.cleanupStatus,
+      ...(browserReadiness ? {browserReadiness} : {}),
     };
     return writeLease(file, lease, next);
   });

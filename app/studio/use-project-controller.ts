@@ -22,6 +22,7 @@ type ProjectControllerOptions = {
   setChecks: Dispatch<SetStateAction<string[]>>;
   setEdit: Dispatch<SetStateAction<{ key: string; title: string } | null>>;
   setEditNote: Dispatch<SetStateAction<string>>;
+  setEditError: Dispatch<SetStateAction<string>>;
   setModelOpen: Dispatch<SetStateAction<boolean>>;
   setTitleOpen: Dispatch<SetStateAction<boolean>>;
   setDeleteTarget: Dispatch<
@@ -54,6 +55,7 @@ export function useProjectController({
   setChecks,
   setEdit,
   setEditNote,
+  setEditError,
   setModelOpen,
   setTitleOpen,
   setDeleteTarget,
@@ -302,6 +304,7 @@ export function useProjectController({
       if (!project || actionInFlight.current) return;
       actionInFlight.current = true;
       status.setWaiting(true);
+      if (name === 'revise-image') setEditError('');
       try {
         const next = await studioApi.projectAction(project.id, name, body);
         if (next.id) setProject(next);
@@ -325,13 +328,17 @@ export function useProjectController({
           setEditNote('');
         }
       } catch (error) {
-        status.setError((error as Error).message);
+        if (name === 'revise-image') {
+          setEditError((error as Error).message);
+        } else {
+          status.setError((error as Error).message);
+        }
       } finally {
         actionInFlight.current = false;
         status.setWaiting(false);
       }
     },
-    [project, setEdit, setEditNote, setView, status],
+    [project, setEdit, setEditError, setEditNote, setView, status],
   );
 
   const switchProjectModel = useCallback(async () => {

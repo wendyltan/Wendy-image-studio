@@ -36,6 +36,7 @@ export function StudioDialogs({
   setEdit,
   editNote,
   setEditNote,
+  editError,
   action,
   story,
   setStory,
@@ -102,6 +103,7 @@ export function StudioDialogs({
   setEdit: DialogSet<EditTarget | null>;
   editNote: string;
   setEditNote: DialogSet<string>;
+  editError: string;
   action: ProjectAction;
   story: Story | null;
   setStory: DialogSet<Story | null>;
@@ -189,8 +191,14 @@ export function StudioDialogs({
             value={editNote}
             onChange={(event) => setEditNote(event.target.value)}
           />
+          {editError && (
+            <p className="error edit-dialog-error" role="alert" aria-live="polite">
+              {editError}
+            </p>
+          )}
           <button
             className="primary"
+            disabled={waiting}
             onClick={() => action('revise-image', { key: edit.key, note: editNote })}
           >
             <Pencil />

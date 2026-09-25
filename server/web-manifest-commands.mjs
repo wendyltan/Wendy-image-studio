@@ -1,7 +1,5 @@
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {OWNED_TAB_LEASE_FILE} from './owned-tab-lease.mjs';
-
 const DEFAULT_HELPER=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'run-manifest.mjs');
 
 export const SUBMISSION_FAILURE_MATRIX=Object.freeze({

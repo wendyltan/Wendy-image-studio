@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {inspectDownloadArtifact} from '../server/web-download-evidence.mjs';
-import {NATIVE_DOWNLOAD_EVIDENCE_FILE,validateNativeDownloadEvidence,writeNativeDownloadEvidence} from '../server/native-download-evidence.mjs';
+import {NATIVE_DOWNLOAD_EVIDENCE_FILE,validateNativeDownloadEvidence,inspectNativeDownloadEvidence,writeNativeDownloadEvidence,writePageAssetsAudit} from '../server/native-download-evidence.mjs';
 import {patchManifest} from '../server/run-manifest.mjs';
 
 const PNG=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=','base64');
@@ -33,10 +33,73 @@ function fixture({manifestState='failed',submitted=true,submissionUncertain=true
 
 function promote(run){return patchManifest({stage:'native-download-recovery',manifestFile:run.manifestFile,args:{nativeEvidenceFile:path.join(run.runDir,NATIVE_DOWNLOAD_EVIDENCE_FILE)}});}
 
+function pageAssetsEvidence(run){
+  const requestFile=path.join(run.runDir,'request.json'),manifestFile=run.manifestFile;
+  const request=JSON.parse(fs.readFileSync(requestFile,'utf8'));
+  const manifest=JSON.parse(fs.readFileSync(manifestFile,'utf8'));
+  const attachmentNames=['character-a.jpg','character-b.jpg','room.jpg','continuity-a.jpg','continuity-b.jpg','edit-base.jpg'];
+  Object.assign(request,{remotePromptLength:1651,remotePromptSha256:'a'.repeat(64)});
+  Object.assign(manifest,{attachmentExpectedCount:6,attachmentObservedCount:6,referenceCount:6});
+  json(requestFile,request);json(manifestFile,manifest);
+  const assetId='file_00000000e3b0820a8a31dbe23391a343',assetUrl=`https://chatgpt.com/backend-api/estuary/content?id=${assetId}&ts=497280&p=fs&cid=1&sig=proof&v=0`;
+  run.evidence={...run.evidence,source:'chrome-page-assets',remoteResult:{buttonLabel:'已生成图片：夜灯下的温馨书桌时光',assetId,assetUrl,width:run.actual.width,height:run.actual.height,bytes:run.actual.bytes,sha256:run.actual.sha256,observedAt:DOWNLOADED,observedInTabId:'recovery-tab-1',userMessage:{promptLength:1651,promptSha256:'a'.repeat(64),attachmentCount:6,attachmentNames,assistantResultImmediatelyAfter:true}},native:{method:'page-assets',ownedTabId:'recovery-tab-1',recoveryTabId:'recovery-tab-1',originalOwnedTabId:'native-tab-1',recoveryTabClosed:true,closedAt:DOWNLOADED,fileName:path.basename(run.output),downloadedAt:DOWNLOADED,sourceAssetId:assetId,sourceAssetUrl:assetUrl},pageAssets:{inventoryId:'baea2ab7-47f2-4d97-ba3a-2a56cc4dd2c4',matchedAsset:{id:'471042be8a7bc510',kind:'image',name:'content',sourceUrl:assetUrl,unavailableFields:['isThumbnail','isPreview','role']},bundle:{requestedCount:1,downloadedCount:1,failedCount:0,failures:[],assetId:'471042be8a7bc510',assetUrl,contentType:'image/png',bytes:run.actual.bytes,sha256:run.actual.sha256}}};
+  writeNativeDownloadEvidence(run.runDir,run.evidence);
+  return run;
+}
+
 test('native Chrome download evidence promotes one submitted unknown result',()=>{
   const run=fixture(),check=validateNativeDownloadEvidence(run.evidence,{expectedIdentity:run.identity,projectRoot:run.projectRoot,request:JSON.parse(fs.readFileSync(path.join(run.runDir,'request.json'))),worker:JSON.parse(fs.readFileSync(path.join(run.runDir,'worker-request.json'))),manifest:JSON.parse(fs.readFileSync(run.manifestFile)),execution:JSON.parse(fs.readFileSync(path.join(run.runDir,'execution.json'))),outputFile:run.output,actual:run.actual});
   assert.equal(check.ok,true,check.errors.join('; '));
   const result=promote(run).manifest;assert.equal(result.state,'downloaded');assert.equal(result.submitted,true);assert.equal(result.recoveredFrom,'native-download');assert.equal(result.priorState,'failed');assert.equal(result.priorErrorCode,'SUBMISSION_UNCERTAIN');assert.equal(result.artifactPath,run.output);assert.equal(result.downloadedAt,DOWNLOADED);
+});
+
+test('page-assets recovery binds a new closed tab to the exact submitted result',()=>{
+  const run=pageAssetsEvidence(fixture()),request=JSON.parse(fs.readFileSync(path.join(run.runDir,'request.json'))),manifest=JSON.parse(fs.readFileSync(run.manifestFile)),execution=JSON.parse(fs.readFileSync(path.join(run.runDir,'execution.json')));
+  const check=validateNativeDownloadEvidence(run.evidence,{expectedIdentity:run.identity,projectRoot:run.projectRoot,request,worker:JSON.parse(fs.readFileSync(path.join(run.runDir,'worker-request.json'))),manifest,execution,outputFile:run.output,actual:run.actual});
+  assert.equal(check.ok,true,check.errors.join('; '));
+  assert.notEqual(run.evidence.native.recoveryTabId,run.evidence.native.originalOwnedTabId);
+});
+
+test('page-assets recovery requires the durable inventory and bundle summary',()=>{
+  const run=pageAssetsEvidence(fixture()),request=JSON.parse(fs.readFileSync(path.join(run.runDir,'request.json'))),manifest=JSON.parse(fs.readFileSync(run.manifestFile)),execution=JSON.parse(fs.readFileSync(path.join(run.runDir,'execution.json'))),worker=JSON.parse(fs.readFileSync(path.join(run.runDir,'worker-request.json')));
+  delete run.evidence.pageAssets.bundle;writeNativeDownloadEvidence(run.runDir,run.evidence);
+  const check=validateNativeDownloadEvidence(run.evidence,{expectedIdentity:run.identity,projectRoot:run.projectRoot,request,worker,manifest,execution,outputFile:run.output,actual:run.actual});
+  assert.equal(check.ok,false);assert.match(check.errors.join('; '),/bundle 摘要/);
+});
+
+test('page-assets audit cross-checks bundle bytes and MIME',()=>{
+  const run=pageAssetsEvidence(fixture()),request=JSON.parse(fs.readFileSync(path.join(run.runDir,'request.json'))),manifest=JSON.parse(fs.readFileSync(run.manifestFile)),execution=JSON.parse(fs.readFileSync(path.join(run.runDir,'execution.json'))),worker=JSON.parse(fs.readFileSync(path.join(run.runDir,'worker-request.json')));
+  run.evidence.pageAssets.bundle.contentType='image/jpeg';run.evidence.pageAssets.bundle.bytes+=1;writeNativeDownloadEvidence(run.runDir,run.evidence);
+  const check=validateNativeDownloadEvidence(run.evidence,{expectedIdentity:run.identity,projectRoot:run.projectRoot,request,worker,manifest,execution,outputFile:run.output,actual:run.actual});
+  assert.equal(check.ok,false);assert.match(check.errors.join('; '),/bundle\.(bytes|contentType)/);
+});
+
+test('page-assets metadata accepts explicit non-preview flags and rejects preview flags',()=>{
+  const checkRun=(mutate)=>{
+    const run=pageAssetsEvidence(fixture()),request=JSON.parse(fs.readFileSync(path.join(run.runDir,'request.json'))),manifest=JSON.parse(fs.readFileSync(run.manifestFile)),execution=JSON.parse(fs.readFileSync(path.join(run.runDir,'execution.json'))),worker=JSON.parse(fs.readFileSync(path.join(run.runDir,'worker-request.json')));
+    mutate(run.evidence.pageAssets.matchedAsset);
+    return validateNativeDownloadEvidence(run.evidence,{expectedIdentity:run.identity,projectRoot:run.projectRoot,request,worker,manifest,execution,outputFile:run.output,actual:run.actual});
+  };
+  const accepted=checkRun(asset=>{asset.isThumbnail=false;asset.isPreview=false;asset.role='generated-result';delete asset.unavailableFields;});
+  assert.equal(accepted.ok,true,accepted.errors.join('; '));
+  for(const mutate of [asset=>{asset.isThumbnail=true;delete asset.unavailableFields;},asset=>{asset.isPreview=true;delete asset.unavailableFields;},asset=>{asset.role='preview';delete asset.unavailableFields;}]){
+    const rejected=checkRun(mutate);assert.equal(rejected.ok,false);assert.match(rejected.errors.join('; '),/非预览|缩略|preview|isThumbnail|isPreview/);
+  }
+});
+
+test('inspect reads a same-run external page-assets audit without rewriting history',()=>{
+  const run=pageAssetsEvidence(fixture()),pageAssets=run.evidence.pageAssets,evidence=structuredClone(run.evidence);delete evidence.pageAssets;
+  const evidenceFile=writeNativeDownloadEvidence(run.runDir,evidence),sourceEvidenceSha256=crypto.createHash('sha256').update(fs.readFileSync(evidenceFile)).digest('hex');
+  writePageAssetsAudit(run.runDir,{schemaVersion:1,source:'chrome-page-assets-audit',transport:'direct-chrome',browser:'chrome',...run.identity,conversationUrl:evidence.conversationUrl,sourceEvidenceFile:NATIVE_DOWNLOAD_EVIDENCE_FILE,sourceEvidenceSha256,pageAssets});
+  const checked=inspectNativeDownloadEvidence(evidenceFile,{expectedIdentity:run.identity,projectRoot:run.projectRoot,request:JSON.parse(fs.readFileSync(path.join(run.runDir,'request.json'))),worker:JSON.parse(fs.readFileSync(path.join(run.runDir,'worker-request.json'))),manifest:JSON.parse(fs.readFileSync(run.manifestFile)),execution:JSON.parse(fs.readFileSync(path.join(run.runDir,'execution.json'))),outputFile:run.output});
+  assert.equal(checked.ok,true,checked.errors.join('; '));assert.equal(checked.pageAssetsAudit.sourceEvidenceSha256,sourceEvidenceSha256);
+});
+
+test('page-assets recovery rejects an unbound result or original-tab spoof',()=>{
+  const run=pageAssetsEvidence(fixture());run.evidence.remoteResult.userMessage.assistantResultImmediatelyAfter=false;writeNativeDownloadEvidence(run.runDir,run.evidence);
+  assert.throws(()=>promote(run),/紧跟|绑定/);assert.equal(JSON.parse(fs.readFileSync(run.manifestFile)).state,'failed');
+  const run2=pageAssetsEvidence(fixture());run2.evidence.native.originalOwnedTabId=run2.evidence.native.recoveryTabId;writeNativeDownloadEvidence(run2.runDir,run2.evidence);
+  assert.throws(()=>promote(run2),/冒充|原执行 tab/);assert.equal(JSON.parse(fs.readFileSync(run2.manifestFile)).state,'failed');
 });
 
 test('native recovery rejects a hash mismatch',()=>{

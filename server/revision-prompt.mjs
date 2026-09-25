@@ -80,7 +80,112 @@ function splitNote(note){
 // base prompt here.
 const KEEP_CLAUSE=/(?:保持|保留|不改变|不改动|不要改变|不要改动|不要修改|无需(?:再)?修改|不得改变)[^。！？!?]*?(?:不变|原样|如前|一致|$)/g;
 
+const CRITIQUE_KEEP_CLAUSE=/(?:保持|保留|不改变|不改动|不要改变|不要改动|不要修改|无需(?:再)?修改|不得改变)[^。！？!?；;]*?(?:不变|原样|如前|一致|$)/gu;
+const CRITIQUE_FREEZE_CLAUSE=/(?:冻结(?:要求)?|要求)(?:明确|固定|锁定)(?:为|成)?[^。！？!?；;]*/gu;
+const CRITIQUE_ACTION_MARKER=/(?:^|[，,；;。！？!?]|(?:并且|且|并|同时))\s*((?:但)?建议(?:加强|改为|调整为|改成|采用|删除|移除|去掉|修正为|恢复为|替换为|修改为)?|需要|应当?|请(?:将|把)?|改为|改成|调整为|替换为|删除|移除|去掉|修正为|恢复为|加强|采用|修改为|增加|补上|补足|降低|提高|修复)/gu;
+const POSITIVE_ACTION=/^(改为|改成|调整为|替换为|删除|移除|去掉|修正为|恢复为|加强|采用|修改为|增加|补上|补足|降低|提高|修复|重排|移动|放到|改用)\s*(.+)$/u;
+
+function stripCritiqueKeep(value){
+  return text(value)
+    .replace(CRITIQUE_KEEP_CLAUSE,' ')
+    .replace(CRITIQUE_FREEZE_CLAUSE,' ')
+    .replace(/[。！？!?]+$/g,'')
+    .replace(/\s{2,}/g,' ')
+    .replace(/^[，,、；;：:\s]+|[，,、；;：:\s]+$/g,'')
+    .trim();
+}
+
+function correctionFromAction(marker,target,narrative){
+  const value=text(marker).replace(/^但/u,'').trim(),rawTarget=text(target);
+  if(!rawTarget)return null;
+  if(value.startsWith('建议')){
+    const verb=value.slice(2).trim();
+    if(!verb){
+      const requested=rawTarget.replace(/^(?:将|把)\s*/u,'').trim();
+      return rawTarget!==requested
+        ? `将${requested}，只改变该问题所需的局部。`
+        : null;
+    }
+    const direction=rawTarget.replace(/(?:关系|姿态|方式)$/u,'').trim();
+    return narrative&&/(?:加强|调整)/u.test(verb)
+      ? `让人物身体与脸部呈现${direction}，以“${narrative}”清楚表达原定动作和视线；避免正视镜头。`
+      : `将相关内容${verb}${rawTarget}，只改变该问题所需的局部。`;
+  }
+  const action=value.startsWith('请')?rawTarget.replace(/^(?:将|把)\s*/u,''):value==='需要'||value.startsWith('应')?rawTarget:`${value}${rawTarget}`;
+  const positive=action.match(POSITIVE_ACTION);
+  if(!positive){
+    if(value.startsWith('请')&&rawTarget)return `按要求完成${rawTarget}，只改变该问题所需的局部。`;
+    return null;
+  }
+  const [,verb,subject]=positive;
+  return `${verb}${subject}，只改变该问题所需的局部。`;
+}
+
+function critiqueLink(left,right){
+  const chars=value=>value.match(/[\p{Script=Han}A-Za-z0-9]/gu)||[];
+  const rightText=text(right);
+  const leftChars=chars(left);
+  for(let index=0;index<leftChars.length-1;index++){
+    if(rightText.includes(leftChars.slice(index,index+2).join('')))return true;
+  }
+  return /^(?:并且?|而且|同时|还要|另外|以及|且)$/u.test(text(left));
+}
+
+function parseCritiqueSegment(segment){
+  const original=text(segment),clean=stripCritiqueKeep(original);
+  if(!clean)return {corrections:[],unresolved:[]};
+  const chair=clean.match(/(前[一二三四五六七八九十两\d]+格)使用([^，,；;。]+)[，,]\s*((?:第)?[一二三四五六七八九十\d]+格)变成([^；;。]+)/u);
+  if(chair){
+    const [,referenceSlots,desired,affectedSlot,incorrect]=chair,remainder=stripCritiqueKeep(clean.slice(chair[0].length));
+    const rest=remainder?parseCritiqueSegment(remainder):{corrections:[],unresolved:[]};
+    return {corrections:[`将${affectedSlot}中的${incorrect.trim()}替换为与${referenceSlots}一致的${desired.trim()}。`,...rest.corrections],unresolved:rest.unresolved};
+  }
+  const markers=[];
+  CRITIQUE_ACTION_MARKER.lastIndex=0;
+  for(const match of clean.matchAll(CRITIQUE_ACTION_MARKER)){
+    const marker=match[1],start=match.index+match[0].lastIndexOf(marker);
+    markers.push({marker,start,end:start+marker.length});
+  }
+  if(!markers.length)return {corrections:[],unresolved:[clean]};
+  const corrections=[],unresolved=[],prefix=stripCritiqueKeep(clean.slice(0,markers[0].start));
+  const narrative=clean.match(/导致[“"]([^”"]+)[”"]的叙事/u)?.[1];
+  const targets=markers.map((current,index)=>{
+    const next=markers[index+1],regionEnd=next?.start??clean.length,region=clean.slice(current.end,regionEnd),delimiter=region.search(/[，,；;。！？!?]|并(?=(?:建议|需要|应|请))/u);
+    const target=(delimiter<0?region:region.slice(0,delimiter)).trim();
+    return next&&region.endsWith('并')?target.slice(0,-1).trim():target;
+  });
+  if(prefix&&!critiqueLink(prefix,targets[0])&&!/(?:导致|因此|使得|以便|为使)/u.test(prefix))unresolved.push(prefix);
+  for(let index=0;index<markers.length;index++){
+    const current=markers[index],next=markers[index+1],regionEnd=next?.start??clean.length,region=clean.slice(current.end,regionEnd),delimiter=region.search(/[，,；;。！？!?]|并(?=(?:建议|需要|应|请))/u),targetText=targets[index],tail=delimiter<0?'':stripCritiqueKeep(region.slice(delimiter+1));
+    const correction=correctionFromAction(current.marker,targetText,narrative);
+    if(correction)corrections.push(correction);else unresolved.push(`${current.marker}${targetText}`.trim());
+    if(tail&&(!next||!critiqueLink(tail,targets[index+1])))unresolved.push(tail);
+  }
+  return {corrections,unresolved};
+}
+
+function reviewCritiqueCorrections(note){
+  if(!/(?:成稿|页面|画面)?校对(?:指出|发现|提出)以下[^\n]{0,20}(?:问题|缺陷)/u.test(String(note||'')))return null;
+  const bullets=String(note||'').split(/\r?\n/).map(line=>line.trim()).filter(line=>/^[-*•]\s*/.test(line)).map(line=>line.replace(/^[-*•]\s*/,''));
+  if(!bullets.length)throw unresolvedReviewCritique();
+  const corrections=[],unresolved=[];
+  for(const bullet of bullets){
+    const parsed=parseCritiqueSegment(bullet);corrections.push(...parsed.corrections);unresolved.push(...parsed.unresolved);
+  }
+  if(unresolved.length||!corrections.length)throw unresolvedReviewCritique(unresolved);
+  return corrections;
+}
+
+function unresolvedReviewCritique(parts=[]){
+  const unresolved=[...new Set(parts.map(text).filter(Boolean))],detail=unresolved.length?`未处理部分：${unresolved.join('；')}`:'请将校对提供的具体修复建议写入修改说明';
+  const error=new Error(`校对问题未能完整转换为正向修订目标；${detail}。本次没有提交生图。`);
+  error.code='UNRESOLVED_REVIEW_CRITIQUE';error.unresolvedParts=unresolved;
+  return error;
+}
+
 function normalizeChangeList(note){
+  const critiqueCorrections=reviewCritiqueCorrections(note);
+  if(critiqueCorrections)return critiqueCorrections;
   const normalized=[];
   for(const row of splitNote(note)){
     const hadKeep=KEEP_CLAUSE.test(row);
@@ -117,6 +222,9 @@ function intentFlags(lines){
 
 function positiveResult(line){
   const value=redactInternal(line);
+  if(/^(?:将(?:相关内容|第)|删除|移除|去掉|修正为|恢复为|调整为|改为|改成|替换为|增加|补上|补足|降低|提高|加强|采用|修复)/u.test(value)){
+    return `按“${value.replace(/[。！？!?；;]+$/,'')}”完成可直接观察的局部修订，其余未涉及部分保持不变。`;
+  }
   const espressoDomain=/(?:咖啡机|意式|萃取|冲煮|portafilter|萃取头|出液(?:口|嘴)?|液流|粉碗|手柄)/i.test(value);
   const actionDomain=/(?:动作|姿势|站姿|肩颈|肘部|手臂|手腕|重心|站立|坐姿|转身|表情)/i.test(value);
   const clothingDomain=/(?:服装|衣服|裙|鞋|穿着|配饰|衣物)/i.test(value);

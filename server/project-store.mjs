@@ -141,12 +141,23 @@ export function createProjectStore({
     running.brief = brief;
   }
 
-  function saveProject(project) {
+  function saveProject(project, {expectedRevision} = {}) {
     const file = path.join(projectDir(project.id), 'project.json');
+    if (expectedRevision !== undefined && (!Number.isInteger(Number(expectedRevision)) || Number(expectedRevision) < 0)) {
+      throw new TypeError('expectedRevision must be a non-negative integer');
+    }
     // A running task keeps an in-memory snapshot. Preserve user changes made
     // from another request before that task writes its next progress checkpoint.
     if (fs.existsSync(file)) {
       const latest = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (expectedRevision !== undefined && Number(latest.revision) !== Number(expectedRevision)) {
+        const error = new Error(`作品已更新（当前版本 ${latest.revision}），拒绝提交基于旧版本的验收结果。`);
+        error.code = 'REVISION_CONFLICT';
+        error.statusCode = 409;
+        error.currentRevision = Number(latest.revision);
+        error.expectedRevision = Number(expectedRevision);
+        throw error;
+      }
       if (runningProjects.has(project.id) && Number(latest.revision) > Number(project.revision)) {
         if (latest.titleLocked && latest.title !== project.title) {
           project.title = latest.title;
@@ -157,6 +168,13 @@ export function createProjectStore({
         }
       }
       project.revision = Math.max(Number(project.revision) || 0, Number(latest.revision) || 0);
+    } else if (expectedRevision !== undefined) {
+      const error = new Error('作品记录已不存在，拒绝提交基于旧版本的验收结果。');
+      error.code = 'REVISION_CONFLICT';
+      error.statusCode = 409;
+      error.currentRevision = null;
+      error.expectedRevision = Number(expectedRevision);
+      throw error;
     }
     project.schemaVersion = 3;
     project.revision = (Number(project.revision) || 0) + 1;

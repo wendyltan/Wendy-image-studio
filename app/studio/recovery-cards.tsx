@@ -54,6 +54,13 @@ export function NoOutputCard({
       project.currentTask?.submitted === false &&
       project.currentTask?.referenceCount === 0 &&
       /5\s*小时创作额度.*旧快照|额度快照/.test(project.message || ''));
+  const oldOwnedTabId = String(project.currentTask?.ownedTabId || project.currentTask?.webTimings?.ownedTabId || '').trim();
+  const oldOwnedTabState = String(project.currentTask?.ownedTabState || project.currentTask?.webTimings?.ownedTabState || '');
+  const oldCleanupStatus = String(project.currentTask?.cleanupStatus || project.currentTask?.webTimings?.cleanupStatus || '');
+  const oldOwnedTabPending = ['orphaned', 'close_unconfirmed'].includes(oldOwnedTabState) || ['cleanup_pending', 'close_unconfirmed'].includes(oldCleanupStatus);
+  const oldOwnedTabNeedsAck = oldOwnedTabPending || (Boolean(oldOwnedTabId) && !(oldOwnedTabState === 'closed_verified' && ['closed', 'closed_verified'].includes(oldCleanupStatus)));
+  const oldOwnedTabCannotAck = oldOwnedTabNeedsAck && !oldOwnedTabId;
+  const oldOwnedTabName = String(project.currentTask?.sessionName || project.currentTask?.webTimings?.sessionName || '旧生图专用标签页');
   return (
     <div className="recovery-card">
       <div>
@@ -75,22 +82,31 @@ export function NoOutputCard({
                 ? `${target} 的附件入口没有打开浏览器文件选择器；本次未上传附件、未发送消息，也未生成新图。系统不会自行重试，修复附件入口后可只重试这一张。`
                 : `${target} 没有保存到本地，也没有可找回的原图。系统不会自行重试；重新生成会发起一次新的生图并消耗创作额度。`}
         </p>
+        {oldOwnedTabNeedsAck && (
+          <p role="note">
+            {oldOwnedTabCannotAck ? '旧专用标签页身份缺失，当前无法安全确认或重试。' : `旧专用标签页仍记录为未核实关闭：${oldOwnedTabName}（…${oldOwnedTabId.slice(-6)}）。重新生成前需要单独确认你已关闭它；这只是人工确认，不会改写历史清理状态。`}
+          </p>
+        )}
       </div>
       <div>
         <button
           className="secondary"
-          disabled={disabled}
+          disabled={disabled || oldOwnedTabCannotAck}
           onClick={() => {
-            if (
+            const retryConfirmed =
               confirm(
                 quotaSnapshotStop
                   ? '本次没有上传附件或发送图片请求，原图仍保留。只有在额度已刷新后确认，才会发起一条新的单格修改请求。继续吗？'
                   : '确认重新生成这一张吗？这会发起一次新的生图，并消耗创作额度。',
-              )
-            )
+              );
+            const tabClosedConfirmed = retryConfirmed && (!oldOwnedTabNeedsAck || confirm(
+              `请确认：我已关闭旧生图标签页“${oldOwnedTabName}”（…${oldOwnedTabId.slice(-6)}）。这只记录人工确认，不会标记系统已核实关闭。继续重新生成这一张吗？`,
+            ));
+            if (retryConfirmed && tabClosedConfirmed)
               action('retry-missing', {
                 confirmNoImage: true,
-                idempotencyKey: `retry:${project.id}:${retryToken}:${target}`,
+                ...(oldOwnedTabNeedsAck ? { confirmOwnedTabClosed: true, ownedTabId: oldOwnedTabId } : {}),
+                idempotencyKey: `retry:${project.id}:${retryToken}:${target}${oldOwnedTabNeedsAck ? `:${oldOwnedTabId}` : ''}`,
               });
           }}
         >
@@ -116,6 +132,13 @@ export function UnknownResultCard({
     retryToken =
       project.currentTask?.id ||
       `${project.revision ?? project.version}:${target}`;
+  const oldOwnedTabId = String(project.currentTask?.ownedTabId || project.currentTask?.webTimings?.ownedTabId || '').trim();
+  const oldOwnedTabState = String(project.currentTask?.ownedTabState || project.currentTask?.webTimings?.ownedTabState || '');
+  const oldCleanupStatus = String(project.currentTask?.cleanupStatus || project.currentTask?.webTimings?.cleanupStatus || '');
+  const oldOwnedTabPending = ['orphaned', 'close_unconfirmed'].includes(oldOwnedTabState) || ['cleanup_pending', 'close_unconfirmed'].includes(oldCleanupStatus);
+  const oldOwnedTabNeedsAck = oldOwnedTabPending || (Boolean(oldOwnedTabId) && !(oldOwnedTabState === 'closed_verified' && ['closed', 'closed_verified'].includes(oldCleanupStatus)));
+  const oldOwnedTabCannotAck = oldOwnedTabNeedsAck && !oldOwnedTabId;
+  const oldOwnedTabName = String(project.currentTask?.sessionName || project.currentTask?.webTimings?.sessionName || '旧生图专用标签页');
   return (
     <div className="recovery-card">
       <div>
@@ -124,20 +147,29 @@ export function UnknownResultCard({
           {target}{' '}
           在连接中断前可能已经由远端生成，但本地没有可用原图。系统不会把它当成明确失败，也不会自行重试。
         </p>
+        {oldOwnedTabNeedsAck && (
+          <p role="note">
+            {oldOwnedTabCannotAck ? '旧专用标签页身份缺失，当前无法安全确认或重试。' : `旧专用标签页仍记录为未核实关闭：${oldOwnedTabName}（…${oldOwnedTabId.slice(-6)}）。若继续，需单独确认已关闭；这不会改写历史清理状态。`}
+          </p>
+        )}
       </div>
       <div>
         <button
           className="secondary"
-          disabled={disabled}
+          disabled={disabled || oldOwnedTabCannotAck}
           onClick={() => {
-            if (
+            const retryConfirmed =
               confirm(
                 '这张图片的远端结果仍无法确认。仍然重新生成可能产生重复图片并消耗创作额度，确定继续吗？',
-              )
-            )
+              );
+            const tabClosedConfirmed = retryConfirmed && (!oldOwnedTabNeedsAck || confirm(
+              `请确认：我已关闭旧生图标签页“${oldOwnedTabName}”（…${oldOwnedTabId.slice(-6)}）。这只记录人工确认，不会标记系统已核实关闭。仍要继续吗？`,
+            ));
+            if (retryConfirmed && tabClosedConfirmed)
               action('retry-missing', {
                 confirmUnknownResult: true,
-                idempotencyKey: `retry-unknown:${project.id}:${retryToken}:${target}`,
+                ...(oldOwnedTabNeedsAck ? { confirmOwnedTabClosed: true, ownedTabId: oldOwnedTabId } : {}),
+                idempotencyKey: `retry-unknown:${project.id}:${retryToken}:${target}${oldOwnedTabNeedsAck ? `:${oldOwnedTabId}` : ''}`,
               });
           }}
         >

@@ -3,7 +3,15 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import {E,G,W,brief,callCount,done,panel,panelDecisionFixture,sha256File,temp,plan} from './workflow-fixtures.mjs';
+import {execFileSync} from 'node:child_process';
+import {E,G,W,brief,callCount,done,panel,panelDecisionBody,panelDecisionFixture,sha256File,temp,plan} from './workflow-fixtures.mjs';
+
+function pageQaFixture(idea){
+  const fixture=panelDecisionFixture(idea),project=fixture.project;project.brief.workflowPreset='quick';
+  execFileSync('/Library/Frameworks/Python.framework/Versions/3.10/bin/python3',['-c','from PIL import Image; import sys; Image.new("RGB",(1034,1358),"#d8dfce").save(sys.argv[1])',fixture.file]);
+  fixture.integrity={sha256:sha256File(fixture.file),sizeBytes:fs.statSync(fixture.file).size};project.panels['1-1'].integrity=fixture.integrity;project.panels['1-1'].qa={pass:true,status:'qa_pass',issues:[],issueDetails:[],repairPrompt:''};
+  project.artifacts.find(item=>item.id===fixture.artifactId).integrity=fixture.integrity;E.saveProject(project);return fixture;
+}
 
 test('legacy network failures migrate to unknown results instead of confirmed no-output',()=>{
   let legacy=E.createProject({...brief,idea:'旧网络失败迁移测试'});legacy.status='attention';legacy.currentTask={id:'legacy-network',kind:'image',target:'第1页-第1格',status:'failed_no_output',errorCode:'network',providerInvocations:1,completedAt:new Date().toISOString()};E.saveProject(legacy);
@@ -53,6 +61,27 @@ test('an explicitly approved unknown pending image is archived before one retry'
   assert.equal(E.imageRetryState(unknown).certainty,'unknown_result');E.retryMissingImage(unknown,'第1页-第1格',{allowUnknownResult:true});unknown=await done(unknown.id);
   assert.equal(unknown.pending,null);assert.equal(unknown.supersededPending.length,1);assert.equal(unknown.supersededPending[0].file,oldFile);assert(unknown.panels['1-1']);assert.equal(unknown.status,'paused');
 });
+test('retry requires a separate exact acknowledgement for a matched orphaned owned Chrome tab',()=>{
+  const project=E.createProject({...brief,idea:'重试前必须单独确认孤儿专用标签页'});project.plan=structuredClone(plan);project.version=1;project.approved={version:1,hash:W.digest(project.plan)};project.samplesApproved=true;project.status='attention';
+  const taskId=crypto.randomUUID(),requestId=crypto.randomUUID(),runId=`orphaned-retry-${crypto.randomUUID()}`,target='第1页-第1格',ownedTabId='1514709780',sessionName='🎨 温蒂生图-616e4f0d',dir=path.join(E.projectDir(project.id),'.制作记录',runId),outputFile=path.join(E.projectDir(project.id),'v1','素材','orphaned.png'),identity={projectId:project.id,projectVersion:project.version,taskId,target,requestId,runId,outputFile};fs.mkdirSync(dir,{recursive:true});
+  const json=(name,value)=>fs.writeFileSync(path.join(dir,name),JSON.stringify(value));
+  json('request.json',{schemaVersion:2,identitySchemaVersion:2,identityLocked:true,provider:G.WEB_IMAGE_PROVIDER,...identity,expectedOutput:path.relative(E.projectDir(project.id),outputFile)});
+  json('worker-request.json',{schemaVersion:2,identitySchemaVersion:2,identityLocked:true,provider:G.WEB_IMAGE_PROVIDER,...identity,manifestFile:path.join(dir,'web-generation.json')});
+  json('execution.json',{schemaVersion:1,runId});json('run-identity.json',{schemaVersion:1,identitySchemaVersion:2,identityLocked:true,provider:G.WEB_IMAGE_PROVIDER,...identity});
+  json('web-generation.json',{schemaVersion:2,identitySchemaVersion:2,identityLocked:true,provider:G.WEB_IMAGE_PROVIDER,...identity,state:'failed',accepted:true,submitted:false,submissionIntent:false,ownedTabId,ownedTabState:'orphaned',cleanupStatus:'cleanup_pending'});
+  json('owned-tab-lease.json',{schemaVersion:1,runId,requestId,sessionName,ownedTabId,createdAt:new Date().toISOString(),state:'orphaned',cleanupStatus:'cleanup_pending',cleanupVerifiedAt:null,kernelReset:true});
+  project.currentTask={id:taskId,kind:'image',target,status:'failed_no_output',projectId:project.id,projectVersion:project.version,requestId,errorCode:'browser-handle-lost',providerInvocations:0,webTimings:{ownedTabId,sessionName,ownedTabState:'orphaned',cleanupStatus:'cleanup_pending'}};
+  project.tasks=[project.currentTask];project.lastFailure={kind:'browser-handle-lost',definiteNoOutput:true,key:target,taskId,diagnostics:{runId}};E.saveProject(project);
+  assert.equal(typeof E.assertRetryOwnedTabClosureAcknowledgment,'function','the engine must expose and use a fail-closed retry gate');
+  assert.throws(()=>E.assertRetryOwnedTabClosureAcknowledgment(project,target),/专用标签页.*确认/);
+  assert.throws(()=>E.assertRetryOwnedTabClosureAcknowledgment(project,target,{confirmOwnedTabClosed:true,ownedTabId:'another-tab'}),/精确标签页|专用标签页/);
+  assert.throws(()=>E.retryMissingImage(project,target),/专用标签页.*确认/);
+  const requirement=E.assertRetryOwnedTabClosureAcknowledgment(project,target,{confirmOwnedTabClosed:true,ownedTabId});
+  assert.deepEqual({runId:requirement.runId,requestId:requirement.requestId,ownedTabId:requirement.ownedTabId,sessionName:requirement.sessionName},{runId,requestId,ownedTabId,sessionName});
+  const lease=JSON.parse(fs.readFileSync(path.join(dir,'owned-tab-lease.json'),'utf8'));assert.equal(lease.state,'orphaned');assert.equal(lease.cleanupStatus,'cleanup_pending');
+  lease.state='closed_verified';lease.cleanupStatus='closed';json('owned-tab-lease.json',lease);const manifest=JSON.parse(fs.readFileSync(path.join(dir,'web-generation.json'),'utf8'));manifest.ownedTabState='closed_verified';manifest.cleanupStatus='closed';json('web-generation.json',manifest);project.currentTask.ownedTabState='closed_verified';project.currentTask.cleanupStatus='closed';project.currentTask.webTimings.ownedTabState='closed_verified';project.currentTask.webTimings.cleanupStatus='closed';
+  assert.equal(E.assertRetryOwnedTabClosureAcknowledgment(project,target),null,'a durably verified closed tab must not require a manual acknowledgement');
+});
 test('retrying a failed panel stops after that one panel',async()=>{
   let single=E.createProject({...brief,idea:'只重试一个分镜的流程'});const duo=structuredClone(plan);duo.pages[0].layout='duo';duo.pages[0].panels=[structuredClone(panel),structuredClone(panel)];single.plan=duo;single.version=1;single.approved={version:1,hash:W.digest(duo)};single.samplesApproved=true;single.status='attention';single.lastFailure={kind:'no-output',definiteNoOutput:true,key:'第1页-第1格',attempts:1,at:new Date().toISOString()};E.saveProject(single);
   E.retryMissingImage(single,'第1页-第1格');single=await done(single.id);
@@ -61,6 +90,64 @@ test('retrying a failed panel stops after that one panel',async()=>{
 test('deferred file checks are not visual QA passes',()=>{
   const fixture=panelDecisionFixture('区分延迟文件检查与真实质检');fixture.project.panels['1-1'].qa={pass:true,status:'deferred',summary:'仅文件检查',issues:[],repairPrompt:''};E.saveProject(fixture.project);
   const restored=E.readProject(fixture.project.id);assert.equal(restored.panels['1-1'].qa.pass,null);assert.equal(restored.panels['1-1'].qa.status,'deferred');assert.equal(restored.panels['1-1'].qa.summary,'仅文件检查');
+});
+test('a current deferred original resumes into page-level QA without another image request',async()=>{
+  const fixture=panelDecisionFixture('deferred 原图暂停恢复一致性'),project=fixture.project;project.brief.workflowPreset='balanced';
+  execFileSync('/Library/Frameworks/Python.framework/Versions/3.10/bin/python3',['-c','from PIL import Image; import sys; Image.new("RGB",(1034,1358),"#d8dfce").save(sys.argv[1])',fixture.file]);fixture.integrity={sha256:sha256File(fixture.file),sizeBytes:fs.statSync(fixture.file).size};project.panels['1-1'].integrity=fixture.integrity;project.artifacts.find(item=>item.id===fixture.artifactId).integrity=fixture.integrity;
+  project.panels['1-1'].qa={pass:null,status:'deferred',summary:'仅完成本地文件检查',issues:[],issueDetails:[],repairPrompt:''};E.saveProject(project);
+  const beforeImages=project.tasks.filter(task=>task.kind==='image').length;
+  E.generatePages(project);const resumed=await done(project.id);
+  assert.equal(resumed.status,'ready',resumed.error||resumed.message);assert.equal(resumed.panels['1-1'].qa.pass,null);assert.equal(resumed.panels['1-1'].qa.status,'deferred');
+  assert.equal(resumed.tasks.filter(task=>task.kind==='image').length,beforeImages);assert.equal(resumed.pages.length,1);assert.equal(resumed.pages[0].qa.pass,true);
+});
+test('page PNG is durably registered before remote QA and a retry only repeats QA',async()=>{
+  const fixture=panelDecisionFixture('页图先登记再校对恢复'),project=fixture.project;project.brief.workflowPreset='quick';project.panels['1-1'].qa={pass:true,status:'qa_pass',issues:[],issueDetails:[],repairPrompt:''};E.saveProject(project);
+  execFileSync('/Library/Frameworks/Python.framework/Versions/3.10/bin/python3',['-c','from PIL import Image; import sys; Image.new("RGB",(1034,1358),"#d8dfce").save(sys.argv[1])',fixture.file]);fixture.integrity={sha256:sha256File(fixture.file),sizeBytes:fs.statSync(fixture.file).size};project.panels['1-1'].integrity=fixture.integrity;project.artifacts.find(item=>item.id===fixture.artifactId).integrity=fixture.integrity;E.saveProject(project);
+  const marker=path.join(temp,'page-qa-crash-once'),beforeImages=project.tasks.filter(task=>task.kind==='image').length;process.env.WENDI_TEST_CRASH_PAGE_QA_ONCE=marker;
+  E.generatePages(project);const interrupted=await done(project.id);delete process.env.WENDI_TEST_CRASH_PAGE_QA_ONCE;
+  assert.equal(interrupted.status,'attention');assert.equal(interrupted.pages.length,1);assert.equal(interrupted.pages[0].qa.pass,null);assert.equal(interrupted.pages[0].qa.status,'unavailable');assert.ok(interrupted.pages[0].qa.qaError);assert(interrupted.pages[0].qa.summary.includes(interrupted.pages[0].qa.qaError));assert.equal(interrupted.pages[0].qaHistory.length,1);
+  const originalPage=interrupted.pages[0],originalFile=W.inside(E.projectDir(project.id),originalPage.file),originalHash=sha256File(originalFile),layoutDirs=()=>fs.readdirSync(path.join(E.projectDir(project.id),'.制作记录')).filter(name=>name.includes('第1页排版')).length,layoutsBefore=layoutDirs();
+  assert.equal(interrupted.artifacts.find(item=>item.id==='page:1').valid,true);assert.equal(interrupted.artifacts.find(item=>item.id==='page:1').file,originalPage.file);
+  E.generatePages(interrupted);const retried=await done(project.id);
+  assert.equal(retried.status,'ready',retried.error||retried.message);assert.equal(retried.pages[0].file,originalPage.file);assert.equal(sha256File(originalFile),originalHash);assert.equal(layoutDirs(),layoutsBefore);assert.equal(retried.tasks.filter(task=>task.kind==='image').length,beforeImages);assert.equal(retried.pages[0].qa.pass,true);
+  retried.pages[0].qa={pass:false,status:'needs_review',summary:'测试注入：页面 QA 未通过',issues:['需人工复核'],issueDetails:[],repairPrompt:''};E.saveProject(retried);
+  E.generatePages(retried);const blocked=await done(project.id);assert.equal(blocked.status,'attention');assert.equal(blocked.pages[0].file,originalPage.file);assert.equal(sha256File(originalFile),originalHash);assert.equal(layoutDirs(),layoutsBefore);assert.equal(blocked.tasks.filter(task=>task.kind==='image').length,beforeImages);
+  E.reviewPage(blocked,1);const reviewed=await done(project.id);assert.equal(reviewed.pages[0].file,originalPage.file);assert.equal(sha256File(originalFile),originalHash);assert.equal(layoutDirs(),layoutsBefore);assert.equal(reviewed.tasks.filter(task=>task.kind==='image').length,beforeImages);assert.equal(reviewed.pages[0].qa.pass,true);
+});
+test('page QA quota refusal persists unavailable with the same candidate for QA-only recovery',async()=>{
+  const fixture=pageQaFixture('页图校对额度拒绝可恢复'),project=fixture.project,quota=path.join(temp,'page-qa-quota-once');process.env.WENDI_TEST_USAGE_LIMIT_ONCE=quota;
+  E.generatePages(project);const interrupted=await done(project.id);delete process.env.WENDI_TEST_USAGE_LIMIT_ONCE;
+  const page=interrupted.pages[0],file=W.inside(E.projectDir(project.id),page.file),hash=sha256File(file),layoutCount=fs.readdirSync(path.join(E.projectDir(project.id),'.制作记录')).filter(name=>name.includes('第1页排版')).length;
+  assert.equal(page.qa.status,'unavailable');assert.equal(page.qa.pass,null);assert.match(page.qa.qaError,/额度不足/);assert.equal(interrupted.artifacts.find(item=>item.id==='page:1').valid,true);
+  E.generatePages(interrupted);const resumed=await done(project.id);assert.equal(resumed.pages[0].file,page.file);assert.equal(sha256File(file),hash);assert.equal(resumed.pages[0].qa.pass,true);assert.equal(fs.readdirSync(path.join(E.projectDir(project.id),'.制作记录')).filter(name=>name.includes('第1页排版')).length,layoutCount);
+});
+test('pausing during page QA persists unavailable and keeps the registered PNG',async()=>{
+  const fixture=pageQaFixture('页图校对暂停可恢复'),project=fixture.project,marker=path.join(temp,'page-qa-pause-entered');process.env.WENDI_TEST_PAUSE_PAGE_QA_ONCE=marker;
+  E.generatePages(project);for(let i=0;i<200&&!fs.existsSync(marker);i++)await new Promise(resolve=>setTimeout(resolve,20));assert(fs.existsSync(marker),'fixture did not enter page QA');
+  E.active.get(project.id).abort();const interrupted=await done(project.id);delete process.env.WENDI_TEST_PAUSE_PAGE_QA_ONCE;
+  const page=interrupted.pages[0],file=W.inside(E.projectDir(project.id),page.file);assert.equal(interrupted.status,'paused');assert.equal(page.qa.status,'unavailable');assert.equal(page.qa.pass,null);assert.ok(page.qa.qaError);assert(fs.existsSync(file));assert.equal(interrupted.artifacts.find(item=>item.id==='page:1').valid,true);
+  const hash=sha256File(file),layoutCount=fs.readdirSync(path.join(E.projectDir(project.id),'.制作记录')).filter(name=>name.includes('第1页排版')).length;E.generatePages(interrupted);const resumed=await done(project.id);
+  assert.equal(resumed.pages[0].file,page.file);assert.equal(sha256File(file),hash);assert.equal(resumed.pages[0].qa.pass,true);assert.equal(fs.readdirSync(path.join(E.projectDir(project.id),'.制作记录')).filter(name=>name.includes('第1页排版')).length,layoutCount);
+});
+test('pause after local composition registers the candidate before stopping, then resumes with QA only',async()=>{
+  const fixture=pageQaFixture('排版返回后暂停先登记候选页'),project=fixture.project,marker=path.join(temp,'compose-finished-before-register');
+  const callsBefore=callCount(),imageTasksBefore=project.tasks.filter(task=>task.kind==='image').length;process.env.WENDI_TEST_PAUSE_AFTER_COMPOSE=marker;
+  E.generatePages(project);for(let i=0;i<200&&!fs.existsSync(marker);i++)await new Promise(resolve=>setTimeout(resolve,20));assert(fs.existsSync(marker),'fixture did not finish local composition');
+  E.active.get(project.id).abort();const interrupted=await done(project.id);delete process.env.WENDI_TEST_PAUSE_AFTER_COMPOSE;
+  const layoutRuns=()=>fs.readdirSync(path.join(E.projectDir(project.id),'.制作记录')).filter(name=>name.includes('第1页排版'));
+  const run=layoutRuns().map(name=>path.join(E.projectDir(project.id),'.制作记录',name)).find(dir=>fs.existsSync(path.join(dir,'排版.json')));assert(run);
+  const spec=JSON.parse(fs.readFileSync(path.join(run,'排版.json'),'utf8')),composedFile=spec.output,relative=path.relative(E.projectDir(project.id),composedFile);
+  assert(fs.existsSync(composedFile),'local compositor produced its PNG before the pause');
+  assert.equal(interrupted.status,'paused');assert.equal(interrupted.pages.length,1);assert.equal(interrupted.pages[0].file,relative);assert.equal(interrupted.pages[0].qa.status,'pending');assert.equal(interrupted.pages[0].qa.pass,null);
+  assert.equal(interrupted.pages[0].sourceIntegrity[0].key,'1-1');assert.equal(interrupted.artifacts.find(item=>item.id==='page:1').valid,true);assert.equal(callCount(),callsBefore);assert.equal(interrupted.tasks.filter(task=>task.kind==='image').length,imageTasksBefore);
+  const hash=sha256File(composedFile),layoutCount=layoutRuns().length;E.generatePages(interrupted);const resumed=await done(project.id);
+  assert.equal(resumed.status,'ready');assert.equal(resumed.pages[0].file,relative);assert.equal(sha256File(composedFile),hash);assert.equal(layoutRuns().length,layoutCount);assert.equal(resumed.tasks.filter(task=>task.kind==='image').length,imageTasksBefore);assert.equal(callCount(),callsBefore+1);assert.equal(resumed.pages[0].qa.pass,true);
+});
+test('an unverifiable composed PNG leaves failure evidence but is never registered as a passing page',async()=>{
+  const fixture=pageQaFixture('排版文件损坏不登记通过'),project=fixture.project,marker=path.join(temp,'composed-page-corrupted');
+  const callsBefore=callCount();process.env.WENDI_TEST_CORRUPT_PAGE_AFTER_COMPOSE=marker;E.generatePages(project);const failed=await done(project.id);delete process.env.WENDI_TEST_CORRUPT_PAGE_AFTER_COMPOSE;
+  assert.equal(failed.pages.length,0);assert.equal(failed.artifacts.some(item=>item.id==='page:1'&&item.valid!==false),false);assert.equal(callCount(),callsBefore);
+  assert.equal(failed.pageComposeFailures.length,1);assert.match(failed.pageComposeFailures[0].outputFile,/候选成稿.*\.png$/);assert.match(failed.pageComposeFailures[0].error,/PNG|图像|解码|格式|读取/i);assert(fs.existsSync(W.inside(E.projectDir(project.id),failed.pageComposeFailures[0].outputFile)));
 });
 test('re-reviewing a storyboard panel never removes or invalidates its existing page artifact',async()=>{
   const fixture=panelDecisionFixture('分镜校对只读保留成稿'),project=fixture.project,artifactId=fixture.artifactId;
@@ -71,6 +158,36 @@ test('re-reviewing a storyboard panel never removes or invalidates its existing 
   E.reviewImage(project,'1-1');const reviewed=await done(project.id);delete process.env.WENDI_TEST_FAIL_PANEL_QA_ONCE;
   assert.equal(reviewed.panels['1-1'].qa.pass,false);assert.equal(reviewed.pages.length,1);assert.equal(reviewed.pages[0].file,fixture.relative);
   assert.equal(reviewed.artifacts.find(item=>item.id==='page:1').valid,true);assert.equal(callCount(),priorCalls+1);
+});
+test('a failed re-review blocks resume and export until the current issues are explicitly accepted',async()=>{
+  for(const preset of ['quick','balanced','careful']){
+    const fixture=panelDecisionFixture(`重新校对失败不得沿用旧页-${preset}`),project=fixture.project,artifactId=fixture.artifactId;
+    project.brief.workflowPreset=preset;
+    project.panels['1-1'].qa={pass:true,status:'qa_pass',summary:'旧校对通过',issues:[],issueDetails:[],repairPrompt:''};
+    const oldDecision=preset==='quick'?{action:'accept_current',projectVersion:1,artifactId,contentHash:W.digest({artifactId,file:fixture.relative,at:fixture.at}),integritySha256:fixture.integrity.sha256,acknowledgedIssueIds:['older-hand-issue'],issues:['旧问题已人工接受']}:{action:'adopt_recovered',projectId:project.id,projectVersion:1,taskId:`recovered-${preset}`,requestId:`request-${preset}`,artifactId,contentHash:W.digest({artifactId,file:fixture.relative,at:fixture.at}),integritySha256:fixture.integrity.sha256,continueProduction:false};
+    project.panels['1-1'].userDecision=oldDecision;
+    project.pages=[{number:1,file:fixture.relative,qa:{pass:true,status:'qa_pass',summary:'成稿已校对',issues:[],issueDetails:[]},at:fixture.at,projectVersion:1,compositionVersion:'no-page-title-v1',integrity:fixture.integrity,sourceIntegrity:[{key:'1-1',file:fixture.relative,...fixture.integrity}],dependsOn:[artifactId]}];
+    project.artifacts.push({id:'page:1',kind:'page',file:fixture.relative,dependsOn:[artifactId],valid:true,at:fixture.at,projectVersion:1,compositionVersion:'no-page-title-v1',integrity:fixture.integrity,sourceIntegrity:[{key:'1-1',file:fixture.relative,...fixture.integrity}]},{id:'story:audit',kind:'story-audit',file:null,dependsOn:['page:1'],valid:true,at:fixture.at});
+    project.storyQA={pass:true,summary:'整篇已校对',issues:[],repairPrompt:''};project.status='ready';project.pages[0].qa.pass=true;
+    const manifest=path.join(E.projectDir(project.id),'v1','已确认分镜.md');fs.mkdirSync(path.dirname(manifest),{recursive:true});fs.writeFileSync(manifest,'# test accepted storyboard\n');E.saveProject(project);
+    assert.equal(E.pageIsCurrent(project,project.pages[0]),true);
+    const pageHash=sha256File(fixture.file),pageCount=project.pages.length,imageTaskCount=project.tasks.filter(task=>task.kind==='image').length,marker=path.join(temp,`r1-fail-review-${preset}`);
+    process.env.WENDI_TEST_FAIL_PANEL_QA_ONCE=marker;E.reviewImage(project,'1-1');const reviewed=await done(project.id);delete process.env.WENDI_TEST_FAIL_PANEL_QA_ONCE;
+    assert.equal(reviewed.panels['1-1'].qa.pass,false);assert.equal(reviewed.panels['1-1'].userDecision.action,oldDecision.action);
+    assert.equal(reviewed.pages.length,pageCount);assert.equal(sha256File(fixture.file),pageHash);assert.equal(reviewed.artifacts.find(item=>item.id==='page:1').valid,true);
+    E.resume(reviewed);let blocked=await done(project.id);
+    assert.notEqual(blocked.status,'ready',`${preset}: unresolved panel issue must block resume`);assert.equal(blocked.pages.length,pageCount);assert.equal(sha256File(fixture.file),pageHash);
+    await assert.rejects(E.accept(blocked,W.CHECKS),/请先完成全篇制作和校对/);
+    const decision={...panelDecisionBody({project:blocked,relative:fixture.relative,at:blocked.panels['1-1'].at,artifactId}),key:'1-1',expectedRevision:blocked.revision,continueProduction:false,acknowledgedIssueIds:['formal-hand']};
+    // The issue-specific acknowledgement is current-image scoped; it must not erase
+    // the earlier recovered-image adoption record.
+    await E.decidePanel(blocked,decision);blocked=E.readProject(blocked.id);
+    assert.equal(blocked.panels['1-1'].userDecision.action,'accept_current');
+    if(oldDecision.action==='adopt_recovered')assert.equal(blocked.panels['1-1'].userDecisionHistory?.[0]?.action,'adopt_recovered');
+    E.resume(blocked);const resolved=await done(project.id);
+    assert.equal(resolved.status,'ready');assert.equal(resolved.panels['1-1'].qa.pass,false);
+    assert.equal(resolved.pages.length,pageCount);assert.equal(sha256File(fixture.file),pageHash);assert.equal(resolved.tasks.filter(task=>task.kind==='image').length,imageTaskCount);
+  }
 });
 test('manual panel rejection is local, identity-checked, and idempotent',()=>{
   const fixture=panelDecisionFixture('人工打回不触发生图');const project=fixture.project,artifactId=fixture.artifactId,oldPage={number:1,file:fixture.relative,qa:{pass:true,status:'qa_pass',issues:[],issueDetails:[],repairPrompt:''},at:fixture.at,dependsOn:[artifactId]};project.panels['1-1'].qa={pass:true,status:'deferred',summary:'仅文件检查',issues:[],repairPrompt:''};project.pages=[oldPage];project.artifacts.push({id:'page:1',kind:'page',file:fixture.relative,dependsOn:[artifactId],valid:true,at:fixture.at},{id:'story:audit',kind:'story-audit',file:null,dependsOn:['page:1'],valid:true,at:fixture.at},{id:'export:bundle',kind:'export',file:'v1/温蒂漫画成品.zip',dependsOn:['story:audit'],valid:true,at:fixture.at});project.status='paused';E.saveProject(project);

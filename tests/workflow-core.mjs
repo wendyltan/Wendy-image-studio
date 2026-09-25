@@ -35,9 +35,10 @@ test('web image provider records the dedicated Chrome focus boundary',()=>{
   assert.match(text,/禁止调用 image_gen/);
   assert.match(text,/禁止接管用户已有标签页/);
   assert.match(text,/createBrowserTab\("chrome",undefined,\{sessionName:"🎨 温蒂生图-[a-f0-9]{8}"\}\)/);
-  assert.match(text,/tab\.goto\("https:\/\/chatgpt\.com"\)/);
-  assert.match(text,/try\s*\{/);
-  assert.match(text,/finally\s*\{/);
+  assert.match(text,/tab\.goto\("https:\/\/chatgpt\.com\/"\)/);
+  assert.match(text,/try\/finally 中只调用一次 await tab\.close\(\)/);
+  assert.match(text,/必须包含注释标识 WENDI_OWNED_TAB_CLEANUP_V1[\s\S]*精确的 --run-id[\s\S]*--owned-tab-id/);
+  assert.match(text,/bridge 只有在 durable lease 属于本 run 且 state=closing、源码标识中的 runId\/tabId 与 lease 精确匹配/);
   assert.doesNotMatch(text,/createBrowserTab\("chrome"[^\n]*visible:false/);
   assert.doesNotMatch(text,/visible\s*:/);
   assert.doesNotMatch(text,/createBrowserTab\("iab"/);
@@ -213,7 +214,7 @@ test('panel revision only freezes same-page originals when continuity is explici
   p.plan.pages[0].layout='montage';
   p.approved.hash=W.digest(p.plan);
   assert.deepEqual(E.revisionContinuityKeys(p,'1-3','请和同页前两格保持椅子款式一致'),['1-1','1-2']);
-  const root=E.projectDir(p.id),source=W.inside(W.REFS,W.FACE[0]),sha=sha256File(source),at=new Date().toISOString();fs.mkdirSync(path.join(root,'v1','素材'),{recursive:true});
+  const root=E.projectDir(p.id),source=W.inside(W.REFS,W.FACE[0]),at=new Date().toISOString();fs.mkdirSync(path.join(root,'v1','素材'),{recursive:true});
   p.panels={};p.artifacts=[];
   for(const key of ['1-1','1-2','1-3']){const file=path.join(root,'v1','素材',`${key}.png`);fs.copyFileSync(source,file);const relative=path.relative(root,file),integrity={sha256:sha256File(file),sizeBytes:fs.statSync(file).size};p.panels[key]={key,file:relative,basePrompt:panel.prompt,integrity,qa:{pass:true,status:'passed',issueDetails:[]},at};p.artifacts.push({id:`image:第1页-第${key.split('-')[1]}格`,kind:'image',file:relative,valid:true,integrity,at});}
   E.saveProject(p);E.reviseImage(p,'1-3','请和同页前两格保持椅子款式一致');const revised=await done(p.id);
@@ -277,6 +278,27 @@ test('panel adoption validates the actual file and rechecks async state',async()
   const replaced=panelDecisionFixture('替换正式分镜不能沿用旧身份');const oldDecision=panelDecisionBody(replaced);fs.copyFileSync(W.inside(W.REFS,W.FACE[1]),replaced.file);await assert.rejects(()=>E.decidePanel(replaced.project,oldDecision),/内容|更新|完整性/);saved=E.readProject(replaced.project.id);assert.equal(saved.panels['1-1'].userDecision,undefined);
   const stale=panelDecisionFixture('异步校验期间过期决定');const staleDecision=panelDecisionBody(stale);const pendingDecision=E.decidePanel(stale.project,staleDecision);const changed=E.readProject(stale.project.id);changed.message='另一个本地操作已更新作品';E.saveProject(changed);await assert.rejects(()=>pendingDecision,/更新|刷新|过期/);saved=E.readProject(stale.project.id);assert.equal(saved.panels['1-1'].userDecision,undefined);
   const valid=panelDecisionFixture('完整图片可以人工采用');const beforeImages=valid.project.tasks.filter(task=>task.kind==='image').length;await E.decidePanel(valid.project,panelDecisionBody(valid));assert.equal(valid.project.panels['1-1'].userDecision.action,'accept_current');assert.equal(valid.project.panels['1-1'].qa.pass,false);assert.equal(valid.project.tasks.filter(task=>task.kind==='image').length,beforeImages);assert.equal(valid.project.pages.length,0);
+});
+
+function recoveredAdoptionFixture(idea='恢复图采用测试'){
+  const fixture=panelDecisionFixture(idea),project=fixture.project,key='2-3',taskId=crypto.randomUUID(),requestId=crypto.randomUUID(),runDir=path.join(E.projectDir(project.id),'.制作记录',`run-${crypto.randomUUID()}`),file=path.join(E.projectDir(project.id),'v2','素材','recovered.png'),relative=path.relative(E.projectDir(project.id),file),artifactId='image:第2页-第3格';
+  fs.mkdirSync(path.dirname(file),{recursive:true});fs.copyFileSync(W.inside(W.REFS,W.FACE[0]),file);const integrity={sha256:sha256File(file),sizeBytes:fs.statSync(file).size},runId=path.basename(runDir),target='第2页-第3格',provider=G.WEB_IMAGE_PROVIDER,at=new Date().toISOString();
+  project.version=2;project.approved={version:2,hash:W.digest(project.plan)};project.status='paused';project.pending=null;project.panels={[key]:{key:target,file:relative,prompt:'fixture',integrity,qa:{pass:null,status:'manual_review',summary:'等待人工校对',issues:[],repairPrompt:''},at}};
+  const task={id:taskId,kind:'image',target,status:'recovered_local',projectId:project.id,projectVersion:2,requestId,provider,qa:'manual_review'};project.tasks=[task];project.currentTask=structuredClone(task);project.artifacts=[{id:artifactId,kind:'image',file:relative,valid:true,projectVersion:2,at,integrity}];project.pages=[{number:2,file:'v2/候选成稿/02-old.png',dependsOn:[artifactId],qa:{pass:null,status:'unavailable'}}];
+  fs.mkdirSync(runDir,{recursive:true});const outputFile=file,common={identitySchemaVersion:2,identityLocked:true,projectId:project.id,projectVersion:2,taskId,target,requestId,runId,outputFile};
+  fs.writeFileSync(path.join(runDir,'request.json'),JSON.stringify({schemaVersion:2,provider,...common,expectedOutput:relative}));fs.writeFileSync(path.join(runDir,'worker-request.json'),JSON.stringify({schemaVersion:2,provider,...common,manifestFile:path.join(runDir,'web-generation.json')}));fs.writeFileSync(path.join(runDir,'execution.json'),JSON.stringify({schemaVersion:1,runId,state:'completed'}));fs.writeFileSync(path.join(runDir,'run-identity.json'),JSON.stringify({schemaVersion:1,...common}));fs.writeFileSync(path.join(runDir,'web-generation.json'),JSON.stringify({schemaVersion:2,provider,...common,state:'downloaded',accepted:true,submitted:true,artifactPath:file}));
+  E.saveProject(project);return {project,key,taskId,requestId,artifactId,file,integrity,action:{panelKey:key,projectVersion:2,taskId,requestId,artifactId,expectedSha256:integrity.sha256,expectedRevision:project.revision,planHash:project.approved.hash,continueProduction:false}};
+}
+test('recovered manual-review image can be locally adopted without passing QA or resuming production',async()=>{
+  const accepted=recoveredAdoptionFixture('原图恢复后仅记录人工采用'),project=accepted.project,beforeCalls=callCount(),beforeTaskCount=project.tasks.length,beforePages=structuredClone(project.pages);
+  await E.adoptRecoveredPanel(project,accepted.action);
+  assert.equal(project.panels[accepted.key].userDecision.action,'adopt_recovered');assert.equal(project.panels[accepted.key].userDecision.requestId,accepted.requestId);assert.equal(project.panels[accepted.key].qa.pass,null);assert.equal(project.panels[accepted.key].qa.status,'manual_review');assert.equal(E.panelAccepted(project.panels[accepted.key]),true);assert.equal(project.status,'paused');assert.equal(project.pending,null);assert.deepEqual(project.pages,beforePages);assert.equal(project.tasks.length,beforeTaskCount);assert.equal(callCount(),beforeCalls);assert.equal(E.active.has(project.id),false);
+  for(const [name,extra] of Object.entries({request:{requestId:crypto.randomUUID()},task:{taskId:crypto.randomUUID()},version:{projectVersion:1},hash:{expectedSha256:'0'.repeat(64)},nonCurrent:{panelKey:'2-2'}})){
+    const rejected=recoveredAdoptionFixture(`不可信采用拒绝-${name}`);await assert.rejects(()=>E.adoptRecoveredPanel(rejected.project,{...rejected.action,...extra}),/身份|当前|哈希|图片|匹配|版本|目标/);
+  }
+  const rejected=recoveredAdoptionFixture('已经人工拒绝的恢复图不得采用');rejected.project.panels[rejected.key].qa={pass:false,status:'needs_review',issues:['用户打回']};rejected.project.panels[rejected.key].userDecision={action:'reject_current'};E.saveProject(rejected.project);await assert.rejects(()=>E.adoptRecoveredPanel(rejected.project,rejected.action),/人工|校对|拒绝/);
+  const corrupt=recoveredAdoptionFixture('损坏恢复图片不能采用');fs.writeFileSync(corrupt.file,'not an image');await assert.rejects(()=>E.adoptRecoveredPanel(corrupt.project,corrupt.action),/解码|图片/);
+  const unsafe=recoveredAdoptionFixture('不允许采用后自动继续');await assert.rejects(()=>E.adoptRecoveredPanel(unsafe.project,{...unsafe.action,continueProduction:true}),/继续制作/);
 });
 test('pending recovery stays bound to its plan version across a plan revision',async()=>{
   let switched=E.createProject({...brief,idea:'方案版本隔离与迟到原图测试'});E.planProject(switched);switched=await done(switched.id);E.approvePlan(switched,W.digest(switched.plan));switched=await done(switched.id);

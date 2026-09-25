@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import type { Dispatch, SetStateAction } from 'react';
 import type { Story } from './types';
 import { workflowClockActive } from './workflow-utils';
 import {
@@ -29,8 +30,18 @@ export function useStudioController() {
   const [history, setHistory] = useState<number | null>(null);
   const [now, setNow] = useState(0);
   const [zoom, setZoom] = useState<{ url: string; title: string } | null>(null);
-  const [edit, setEdit] = useState<{ key: string; title: string } | null>(null);
+  const [edit, setEditState] = useState<{
+    key: string;
+    title: string;
+  } | null>(null);
+  const [editError, setEditError] = useState('');
   const [editNote, setEditNote] = useState('');
+  const setEdit = useCallback<
+    Dispatch<SetStateAction<{ key: string; title: string } | null>>
+  >((value) => {
+    setEditError('');
+    setEditState(value);
+  }, []);
   const [story, setStory] = useState<Story | null>(null);
   const [settingTab, setSettingTab] = useState<'documents' | 'assets'>(
     'documents',
@@ -71,6 +82,7 @@ export function useStudioController() {
     setChecks,
     setEdit,
     setEditNote,
+    setEditError,
     setModelOpen,
     setTitleOpen,
     setDeleteTarget,
@@ -203,6 +215,7 @@ export function useStudioController() {
     setZoom,
     edit,
     setEdit,
+    editError,
     editNote,
     setEditNote,
     story,

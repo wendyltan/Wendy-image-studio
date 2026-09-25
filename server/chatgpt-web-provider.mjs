@@ -159,13 +159,32 @@ function explicitManifestErrorCode(manifest){
   return code||null;
 }
 
-function uploadProjection(dir,worker){
+function knownCount(value){
+  if(value===null||value===undefined||value==='')return null;
+  const parsed=typeof value==='number'?value:Number(value);
+  return Number.isSafeInteger(parsed)&&parsed>=0?parsed:null;
+}
+
+function uploadProjection(dir,worker,manifest={}){
   const evidence=uploadEvidenceFromRun(dir);
-  if(!evidence)return {};
-  const expected=Number.isInteger(Number(evidence.attachmentExpected))?Number(evidence.attachmentExpected):Array.isArray(worker?.referenceEntries)?worker.referenceEntries.length:null;
-  const observed=Number.isInteger(Number(evidence.attachmentObserved))?Number(evidence.attachmentObserved):null;
-  const pending=evidence.attachmentPending===true||Array.isArray(evidence.attachmentPending)&&evidence.attachmentPending.length>0;
-  return {attachmentExpectedCount:expected,attachmentObservedCount:observed,attachmentPending:pending,sendEnabled:evidence.sendEnabled===true,failureStage:evidence.failureStage||null,browserStage:observed!==null&&expected!==null&&observed===expected&&!pending&&evidence.sendEnabled===true&&evidence.failureStage===null?'ready_to_send':'uploading'};
+  const expected=knownCount(evidence?.attachmentExpected)??knownCount(manifest.attachmentExpectedCount)??(Array.isArray(worker?.referenceEntries)?worker.referenceEntries.length:null);
+  const observed=knownCount(evidence?.attachmentObserved)??knownCount(manifest.attachmentObservedCount)??knownCount(manifest.referenceCount);
+  const pending=evidence?.attachmentPending===true||Array.isArray(evidence?.attachmentPending)&&evidence.attachmentPending.length>0;
+  return {attachmentExpectedCount:expected,attachmentObservedCount:observed,attachmentPending:pending,sendEnabled:evidence?.sendEnabled===true,failureStage:evidence?.failureStage||null,browserStage:observed!==null&&expected!==null&&observed===expected&&!pending&&evidence?.sendEnabled===true&&evidence?.failureStage===null?'ready_to_send':'uploading'};
+}
+
+function uploadSelectorNoMatchesEvidence(dir){
+  try{
+    const events=fs.readFileSync(path.join(dir,'events.jsonl'),'utf8').split(/\r?\n/);
+    for(const line of events){
+      if(!line.trim())continue;
+      const event=JSON.parse(line),item=event?.item;
+      if(event.type!=='item.completed'||item?.type!=='mcp_tool_call'||item.server!=='cua_repl'||item.tool!=='js')continue;
+      const text=String(item.resultText||'');
+      if(/Playwright selector deadline exceeded[\s\S]*?"kind"\s*:\s*"no_matches"[\s\S]*?"action"\s*:\s*"click"[\s\S]*?(?:从电脑上传|上传照片|上传文件)/i.test(text))return text;
+    }
+  }catch{}
+  return null;
 }
 
 function runtimeProjection(dir,manifest,failure){
@@ -174,6 +193,10 @@ function runtimeProjection(dir,manifest,failure){
   const message=String(failure?.message||manifest?.error||'').trim();
   if(!message)return null;
   return {schemaVersion:1,category:'control_flow',message:message.slice(0,1200),stack:'',toolStage:'executor',browserBudgetStage:manifest?.browserStage||'post_upload_pre_submit',source:'manifest',capturedAt:new Date().toISOString()};
+}
+
+function safeRuntimeExcerpt(value){
+  return String(value||'').replace(/[\r\n\t]+/g,' ').replace(/data:image\/[\w.+-]+;base64,[A-Za-z0-9+/=]+/gi,'[image-data-redacted]').replace(/(?:file:\/\/|https?:\/\/|\/Volumes\/|\/Users\/|\/private\/|[A-Za-z]:[\\/])[^\s"'<>]+/g,'[path-redacted]').replace(/[a-f0-9]{8}-[a-f0-9-]{27,}/gi,'[id-redacted]').replace(/\s{2,}/g,' ').trim().slice(0,500);
 }
 
 function originPermissionDeniedForRun({dir,manifestFile,outputFile,requestId,manifest}={}){
@@ -190,7 +213,7 @@ function uploadUnavailableForRun({dir,manifestFile,outputFile,requestId,manifest
   if(!manifest||manifest.state!=='failed'||manifest.submitted!==false)return false;
   if(!browserRunIdentityMatches({dir,manifestFile,outputFile,requestId,manifest}))return false;
   const explicit=explicitManifestErrorCode(manifest);
-  if(explicit)return ['FILE_UPLOAD_CHROME_UNAVAILABLE','FILE_CHOOSER_EVENT_TIMEOUT','FILE_CHOOSER_ROUTE_UNAVAILABLE','FILE_SET_FAILED','ATTACHMENT_VERIFICATION_TIMEOUT','WORKER_SCRIPT_RUNTIME_ERROR','EXECUTOR_RUNTIME_ERROR','BROWSER_MODE_ENTRY_UNAVAILABLE','BROWSER_CREATE_UNAVAILABLE','BROWSER_HANDLE_LOST'].includes(explicit);
+  if(explicit)return ['FILE_UPLOAD_CHROME_UNAVAILABLE','FILE_CHOOSER_EVENT_TIMEOUT','FILE_CHOOSER_ROUTE_UNAVAILABLE','FILE_SET_FAILED','ATTACHMENT_VERIFICATION_TIMEOUT','WORKER_SCRIPT_RUNTIME_ERROR','EXECUTOR_RUNTIME_ERROR','BROWSER_MODE_ENTRY_UNAVAILABLE','BROWSER_CREATE_UNAVAILABLE','BROWSER_HANDLE_LOST','BROWSER_BOOTSTRAP_TIMEOUT'].includes(explicit);
   const worker=readJsonObject(path.join(dir,'worker-request.json'));
   const modern=Number(worker?.schemaVersion||0)>=2||Number(manifest?.schemaVersion||0)>=2;
   const evidence=uploadEvidenceFromRun(dir);
@@ -212,6 +235,26 @@ function structuredUploadFailureCode(dir){
   const validation=validateUploadEvidence(evidence);
   if(!validation.ok)return null;
   return uploadEvidenceFailureCode(evidence);
+}
+
+export function bootstrapKernelResetEvidence(dir,manifest,worker){
+  if(manifest?.submitted!==false||manifest?.submissionIntent!==false||knownCount(manifest.attachmentObservedCount)!==0||knownCount(manifest.referenceCount)!==0)return null;
+  const expected=Array.isArray(worker?.referenceEntries)?worker.referenceEntries.length:Array.isArray(worker?.referenceFiles)?worker.referenceFiles.length:knownCount(manifest.attachmentExpectedCount);
+  if(!Number.isInteger(expected)||expected<1)return null;
+  let events;
+  try{events=fs.readFileSync(path.join(dir,'events.jsonl'),'utf8').split('\n').filter(Boolean).map(line=>JSON.parse(line));}catch{return null;}
+  const completed=events.filter(event=>event?.type==='item.completed').map(event=>event.item||{});
+  const cua=completed.filter(item=>item.type==='mcp_tool_call'&&item.server==='cua_repl'&&item.tool==='js');
+  const timeoutIndex=cua.findIndex(item=>/(?:js execution timed out|execution timed out)[^\n]*(?:kernel reset)|kernel reset[^\n]*(?:rerun your request)/i.test(String(item.resultText||'')));
+  if(timeoutIndex<1)return null;
+  const itemCode=item=>String(item.arguments?.code||item.code||'');
+  const before=cua.slice(0,timeoutIndex+1),creates=before.flatMap(item=>itemCode(item).match(/\bcua\s*\.\s*createBrowserTab\s*\(/g)||[]).length;
+  if(creates!==1)return null;
+  const preTimeoutCode=before.map(itemCode).join('\n');
+  if(/\.\s*(?:setFiles|click|paste|setValue|typeText|pressKey)\s*\(|发送提示词|submission-intent|run-manifest\.mjs\s+submission-intent/i.test(preTimeoutCode))return null;
+  const uploadStage=completed.some(item=>item.type==='command_execution'&&/owned-tab-lease\.mjs[\s\S]*--state\s+uploading/.test(String(item.command||item.code||'')));
+  if(uploadStage)return null;
+  return String(cua[timeoutIndex].resultText||'').slice(0,500);
 }
 
 function knownBrowserFailureCode(detail,dir){
@@ -236,7 +279,12 @@ function recordBrowserPreSubmissionFailure(manifestFile,requestId,failure,dir){
   const worker=readJsonObject(path.join(dir,'worker-request.json'));
   const modern=Number(worker?.schemaVersion||0)>=2||Number(manifest?.schemaVersion||0)>=2;
   if(modern&&!browserRunIdentityMatches({dir,manifestFile,outputFile:worker?.outputFile,requestId,manifest}))return manifest;
-  const detail=String(browserRunEvidenceText(dir,{manifest,failure})||'Chrome 专用标签页的焦点管理能力不可用。').slice(0,1000);
+  const selectorFailure=uploadSelectorNoMatchesEvidence(dir);
+  const bootstrapTimeout=browserRunIdentityMatches({dir,manifestFile,outputFile:worker?.outputFile,requestId,manifest})?bootstrapKernelResetEvidence(dir,manifest,worker):null;
+  const detail=String(bootstrapTimeout||selectorFailure||browserRunEvidenceText(dir,{manifest,failure})||'Chrome 专用标签页的焦点管理能力不可用.')
+    .replace(/data:image\/[\w.+-]+;base64,[A-Za-z0-9+/=]+/gi,'[image-data-redacted]')
+    .replace(/(?:file:\/\/|https?:\/\/|\/Volumes\/|\/Users\/|\/private\/|[A-Za-z]:[\\/])[^\s"'<>]+/g,'[path-redacted]')
+    .replace(/[a-f0-9]{8}-[a-f0-9-]{27,}/gi,'[id-redacted]').replace(/[\r\n\t]+/g,' ').slice(0,1000);
   const explicit=explicitManifestErrorCode(manifest);
   // Once a worker wrote a concrete errorCode, never replace it by scanning
   // event text. This is what prevents prompt/command words like "permission"
@@ -247,13 +295,17 @@ function recordBrowserPreSubmissionFailure(manifestFile,requestId,failure,dir){
   const uploadUnavailable=!explicit&&uploadUnavailableForRun({dir,manifestFile,outputFile:worker?.outputFile,requestId,manifest});
   const historicalIab=!explicit&&iabUnavailableEvidence(String(failure?.code||failure?.message||''));
   const inferredCode=modern?(structuredUploadFailureCode(dir)||knownBrowserFailureCode(detail,dir)):knownBrowserFailureCode(detail,dir);
-  const errorCode=explicit|| (inferredCode|| (uploadUnavailable?'FILE_UPLOAD_CHROME_UNAVAILABLE':originPermissionDenied?'BROWSER_ORIGIN_PERMISSION_DENIED':historicalIab?'IAB_UNAVAILABLE':browserTabBackgroundEvidence(detail)?'BROWSER_TAB_BACKGROUND_UNAVAILABLE':chromeUnavailableEvidence(detail)?'BROWSER_CHROME_UNAVAILABLE':browserFocusEvidence(detail)&&/RESTORE_FAILED_AFTER_CLOSE/i.test(detail)?'BROWSER_FOCUS_RESTORE_FAILED_AFTER_CLOSE':browserFocusEvidence(detail)&&/RESTORE_FAILED/i.test(detail)?'BROWSER_FOCUS_RESTORE_FAILED':'BROWSER_FOCUS_UNAVAILABLE'));
+  const selectorPreSubmitProven=manifest.submitted===false&&manifest.submissionIntent===false&&(knownCount(manifest.attachmentObservedCount)===0||knownCount(manifest.referenceCount)===0);
+  const selectorRouteCode=selectorFailure&&selectorPreSubmitProven&&['WORKER_SCRIPT_RUNTIME_ERROR','EXECUTOR_RUNTIME_ERROR'].includes(explicit)?'FILE_CHOOSER_ROUTE_UNAVAILABLE':null;
+  const errorCode=bootstrapTimeout?'BROWSER_BOOTSTRAP_TIMEOUT':selectorRouteCode||explicit|| (inferredCode|| (uploadUnavailable?'FILE_UPLOAD_CHROME_UNAVAILABLE':originPermissionDenied?'BROWSER_ORIGIN_PERMISSION_DENIED':historicalIab?'IAB_UNAVAILABLE':browserTabBackgroundEvidence(detail)?'BROWSER_TAB_BACKGROUND_UNAVAILABLE':chromeUnavailableEvidence(detail)?'BROWSER_CHROME_UNAVAILABLE':browserFocusEvidence(detail)&&/RESTORE_FAILED_AFTER_CLOSE/i.test(detail)?'BROWSER_FOCUS_RESTORE_FAILED_AFTER_CLOSE':browserFocusEvidence(detail)&&/RESTORE_FAILED/i.test(detail)?'BROWSER_FOCUS_RESTORE_FAILED':'BROWSER_FOCUS_UNAVAILABLE'));
   const prefix=browserFailurePrefix(errorCode);
   try{
-    const projection=uploadProjection(dir,worker),runtime=errorCode==='WORKER_SCRIPT_RUNTIME_ERROR'||errorCode==='EXECUTOR_RUNTIME_ERROR'?runtimeProjection(dir,manifest,failure):null;
+    const projection=uploadProjection(dir,worker,manifest),runtime=bootstrapTimeout?{schemaVersion:1,category:'browser_action_failure',message:safeRuntimeExcerpt(bootstrapTimeout),stack:'',toolStage:'executor',browserBudgetStage:'bootstrap',source:'cua_repl',capturedAt:new Date().toISOString()}:errorCode==='WORKER_SCRIPT_RUNTIME_ERROR'||errorCode==='EXECUTOR_RUNTIME_ERROR'?runtimeProjection(dir,manifest,failure):null;
     const complete=projection.attachmentObservedCount!==null&&projection.attachmentExpectedCount!==null&&projection.attachmentObservedCount===projection.attachmentExpectedCount&&projection.attachmentPending===false&&projection.sendEnabled===true;
-    const failureStage=complete?'post_upload_pre_submit':(projection.failureStage||null);
-    patchManifestState(manifestFile,'failed',{submitted:'false',submissionIntent:manifest.submissionIntent===true?'true':'false',preSubmissionFailure:'true',errorCode,...projection,failureStage,browserStage:projection.browserStage||null,...(runtime?{runtimeErrorCategory:runtime.category,runtimeErrorMessage:runtime.message,runtimeErrorStack:runtime.stack,runtimeErrorToolStage:runtime.toolStage,runtimeErrorBrowserBudgetStage:runtime.browserBudgetStage||null}:{}),error:`${prefix}；${projection.attachmentObservedCount!==null&&projection.attachmentExpectedCount!==null?`已观察到 ${projection.attachmentObservedCount}/${projection.attachmentExpectedCount} 个附件，发送前失败，未发送消息`:'未上传附件或发送消息'}。原始错误：${detail}`});
+    const failureStage=bootstrapTimeout?'bootstrap_timeout':complete?'post_upload_pre_submit':(projection.failureStage||null);
+    const counts=Number.isInteger(projection.attachmentObservedCount)&&Number.isInteger(projection.attachmentExpectedCount)?`已观察到 ${projection.attachmentObservedCount}/${projection.attachmentExpectedCount} 个附件，发送前失败，未发送消息`:'附件数量无法核实，发送前失败，未发送消息';
+    const secondaryCleanup=bootstrapTimeout?`；次要清理事实：自有标签页句柄无法继续使用，关闭状态未确认（${manifest.ownedTabCleanupStatus||manifest.cleanupStatus||'cleanup_pending'}）`:'';
+    patchManifestState(manifestFile,'failed',{submitted:'false',submissionIntent:manifest.submissionIntent===true?'true':'false',preSubmissionFailure:'true',errorCode,...projection,failureStage,browserStage:bootstrapTimeout?'bootstrap':projection.browserStage||null,...(runtime?{runtimeErrorCategory:runtime.category,runtimeErrorMessage:runtime.message,runtimeErrorStack:runtime.stack,runtimeErrorToolStage:runtime.toolStage,runtimeErrorBrowserBudgetStage:runtime.browserBudgetStage||null}:{}),error:`${prefix}；${counts}${secondaryCleanup}。原始错误：${detail}`});
     if(runtime&&!readExecutorRuntimeError(dir))writeExecutorRuntimeError(dir,runtime);
     return readWebManifest(manifestFile);
   }catch{return manifest;}
@@ -262,7 +314,7 @@ function recordBrowserPreSubmissionFailure(manifestFile,requestId,failure,dir){
 function recordBrowserToolBudgetFailure(manifestFile,requestId,failure,dir){
   const manifest=readWebManifest(manifestFile);
   if(manifest?.requestId!==requestId)return manifest;
-  const budget=readBrowserToolBudget(dir)||{},projection=uploadProjection(dir,readJsonObject(path.join(dir,'worker-request.json'))),postIntent=budget.submissionIntentObserved===true||manifest.submissionIntent===true;
+  const budget=readBrowserToolBudget(dir)||{},projection=uploadProjection(dir,readJsonObject(path.join(dir,'worker-request.json')),manifest),postIntent=budget.submissionIntentObserved===true||manifest.submissionIntent===true;
   const detail=String(failure?.message||'BROWSER_TOOL_BUDGET_EXCEEDED').slice(0,1000),prefix=browserFailurePrefix('BROWSER_TOOL_BUDGET_EXCEEDED');
   try{
     patchManifestState(manifestFile,'failed',{...projection,submitted:postIntent?'true':'false',submissionIntent:postIntent?'true':'false',submissionUncertain:postIntent?'true':'false',preSubmissionFailure:postIntent?'false':'true',errorCode:'BROWSER_TOOL_BUDGET_EXCEEDED',failureStage:postIntent?'post_submit_unknown':'pre_submission_browser_budget',browserStage:postIntent?'submission_uncertain':'browser_budget_exceeded',error:`${prefix}；${postIntent?'已记录发送意图，但停止时无法确认消息是否送达，结果未知，禁止重发':'未记录发送意图；但超限调用与中断可能竞态，附件或发送状态无法核实，禁止自动重试'}。原始错误：${detail}`});
@@ -317,7 +369,7 @@ function finalizeWorkerResult({dir,manifestFile,outputFile,requestId,result,fail
   const normalizedOrigin=normalizeOriginPermissionDenied({manifestFile,requestId,dir,outputFile,manifest,failure});
   if(normalizedOrigin)manifest=normalizedOrigin;
   else if(failure?.code==='BROWSER_TOOL_BUDGET_EXCEEDED'||browserToolBudgetExceededEvidence(browserRunEvidenceText(dir,{manifest,failure})))manifest=recordBrowserToolBudgetFailure(manifestFile,requestId,failure,dir);
-  else if((failure||explicitManifestErrorCode(manifest))&&browserPreSubmissionFailureObserved(dir,failure,manifest))manifest=recordBrowserPreSubmissionFailure(manifestFile,requestId,failure,dir);
+  else if((failure||explicitManifestErrorCode(manifest))&&(browserPreSubmissionFailureObserved(dir,failure,manifest)||bootstrapKernelResetEvidence(dir,manifest,readJsonObject(path.join(dir,'worker-request.json')))))manifest=recordBrowserPreSubmissionFailure(manifestFile,requestId,failure,dir);
   if(manifest?.requestId===requestId&&(!manifest.role||!manifest.executorReasoningEffort)){
     try{
       patchManifestState(manifestFile,'metadata',{role:manifest.role||role,executorModel:(manifest.executorModel??model)||null,executorReasoningEffort:manifest.executorReasoningEffort||reasoningEffort,focusPolicy:manifest.focusPolicy||WEB_IMAGE_FOCUS_POLICY});
@@ -449,7 +501,7 @@ export async function recoverOwnedTabCleanup({dir} = {}) {
  * Preserve the durable orphan marker and record that cleanup is blocked rather
  * than launching a second session which cannot access the original handle.
  */
-export async function autoRecoverOwnedTabCleanup({codexBin,dir,signal,timeoutMs,model,reasoningEffort,role='browser-cleanup',runCodexImpl=runCodex} = {}) {
+export async function autoRecoverOwnedTabCleanup({codexBin:_codexBin,dir,signal:_signal,timeoutMs:_timeoutMs,model:_model,reasoningEffort:_reasoningEffort,role:_role='browser-cleanup',runCodexImpl:_runCodexImpl=runCodex} = {}) {
   const manifestFile=path.join(dir,'web-generation.json'),runId=path.basename(path.resolve(dir));
   const manifest=readWebManifest(manifestFile),requestId=manifest?.requestId;
   // Read the persisted lease by run id first.  If the manifest was tampered

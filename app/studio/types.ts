@@ -57,7 +57,6 @@ export type Picture = {
   };
   number?: number;
   artifactId?: string;
-  contentHash?: string;
   decision?: { action?: string; at?: string } | null;
   availableActions?: string[];
 };

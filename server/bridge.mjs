@@ -88,6 +88,10 @@ function compactEvent(value){
   if(!value||typeof value!=='object')return value;
   const output={};
   for(const [name,item] of Object.entries(value)){
+    if(['resultText','error','message','stderr'].includes(name)&&typeof item==='string'){
+      output[name]=redactRuntimeText(item,MAX_EVENT_TEXT);
+      continue;
+    }
     if(name==='screenshot'&&item&&typeof item==='object'){
       const pageUrl=item.pageUrl||item.url||null;
       output[name]={pageUrl:typeof pageUrl==='string'&&/^data:image\//i.test(pageUrl)?`[image-data-redacted:${pageUrl.length} chars]`:pageUrl,tabId:item.tabId||null,omitted:true};
@@ -102,23 +106,75 @@ function compactEvent(value){
   return output;
 }
 
+const READINESS_CHECK_KEYS=['targetUrlMatches','loginRequired','profileLoaded','chatModeActive','composerEnabled','attachmentEntryEnabled','imageCreationAvailable'];
+function extractBrowserReadinessEvidence(event){
+  const item=event?.item;
+  if(event?.type!=='item.completed'||item?.type!=='mcp_tool_call'||item.server!=='cua_repl'||item.tool!=='js')return null;
+  const texts=[];
+  if(typeof item.resultText==='string')texts.push(item.resultText);
+  for(const block of item.result?.content||[])if(block?.type==='text'&&typeof block.text==='string')texts.push(block.text);
+  const lines=texts.flatMap(text=>text.split(/\r?\n/));
+  const markerLines=lines.filter(line=>line.includes('WENDI_BROWSER_READY_V1'));
+  if(markerLines.length!==1)return null;
+  const markerLine=markerLines[0].trim(),match=markerLine.match(/^WENDI_BROWSER_READY_V1:(\{[^\n]*\})$/);
+  if(!match||Buffer.byteLength(match[1],'utf8')>1800)return null;
+  let value;
+  try{value=JSON.parse(match[1]);}catch{return null;}
+  const safeUrl=input=>{
+    if(typeof input!=='string'||input.length>500)return null;
+    try{const url=new URL(input);return url.protocol==='https:'&&url.hostname==='chatgpt.com'&&!url.username&&!url.password?url.href:null;}catch{return null;}
+  };
+  const currentUrl=safeUrl(value?.currentUrl),expectedUrl=safeUrl(value?.expectedUrl);
+  if(value?.marker!=='WENDI_BROWSER_READY_V1'||value?.schemaVersion!==1||value?.ready!==true||typeof value?.runId!=='string'||!value.runId||value.runId.length>200||typeof value?.ownedTabId!=='string'||!value.ownedTabId||value.ownedTabId.length>200||!currentUrl||!expectedUrl||value.imageCreationPath!=='chat-composer')return null;
+  if(!value.checks||READINESS_CHECK_KEYS.some(key=>typeof value.checks[key]!=='boolean'))return null;
+  const checks=Object.fromEntries(READINESS_CHECK_KEYS.map(key=>[key,value.checks[key]]));
+  const code=typeof item.arguments?.code==='string'?item.arguments.code:'';
+  const count=pattern=>(code.match(pattern)||[]).length;
+  const sourceChecks={gateMarkerPresent:code.includes('WENDI_BROWSER_READINESS_GATE_V1'),gotoCount:count(/\.goto\s*\(/g),createTabCount:count(/\bcua\.createBrowserTab\s*\(/g),axReadCount:count(/\.getAXState\s*\(/g),urlReadCount:count(/\.url\s*\(/g),getTabCount:count(/\bcua\.getTab\s*\(/g),setFilesCount:count(/\.setFiles\s*\(/g),clickCount:count(/\.click\s*\(/g),pasteCount:count(/\.paste\s*\(/g),setValueCount:count(/\.setValue\s*\(/g),typeTextCount:count(/\.typeText\s*\(/g),pressKeyCount:count(/\.pressKey\s*\(/g),checkCount:count(/\.check\s*\(/g),ownedHandleReferencePresent:code.includes('globalThis.__wendiOwnedTab')&&code.includes('globalThis.__wendiOwnedTabId')};
+  return {complete:true,source:'cua_completed_result',marker:'WENDI_BROWSER_READY_V1',schemaVersion:1,ready:true,runId:value.runId,ownedTabId:value.ownedTabId,currentUrl,expectedUrl,imageCreationPath:'chat-composer',checks,sourceChecks};
+}
+
 function boundedEvent(value){
   const compact=compactEvent(value);
+  const readiness=extractBrowserReadinessEvidence(value);
+  if(readiness&&compact?.item&&typeof compact.item==='object')compact.item.browserReadinessEvidence=readiness;
   const serialized=JSON.stringify(compact);
   if(Buffer.byteLength(serialized||'null','utf8')<=MAX_EVENT_TEXT)return compact;
   const item=compact&&typeof compact==='object'&&!Array.isArray(compact)?compact.item:null;
   const summary={type:compact&&typeof compact==='object'&&!Array.isArray(compact)?compact.type:null,truncated:true,originalBytes:Buffer.byteLength(serialized||'null','utf8')};
   if(item&&typeof item==='object'){
     summary.item={id:item.id||null,type:item.type||null,server:item.server||null,tool:item.tool||item.name||null};
+    const timeoutMs=item.arguments?.timeout_ms;
+    if(Number.isSafeInteger(timeoutMs)&&timeoutMs>=0&&timeoutMs<=300000)summary.item.timeout_ms=timeoutMs;
+    if(item.browserReadinessEvidence?.complete===true&&item.browserReadinessEvidence?.source==='cua_completed_result')summary.item.browserReadinessEvidence=item.browserReadinessEvidence;
     const code=item.arguments?.code||item.arguments?.command;
     if(code)summary.item.code=redactRuntimeText(code,800);
-    const text=(item.result?.content||[]).filter(block=>block?.type==='text'&&typeof block.text==='string').map(block=>redactRuntimeText(block.text,800)).join(' ');
-    if(text)summary.item.resultText=text;
+    const text=(typeof item.resultText==='string'?item.resultText:(item.result?.content||[]).filter(block=>block?.type==='text'&&typeof block.text==='string').map(block=>block.text).join(' '));
+    const boundedText=redactRuntimeText(text,800);
+    if(boundedText)summary.item.resultText=boundedText;
   } else if(compact&&typeof compact==='object'&&!Array.isArray(compact)){
     for(const key of ['message','error','stderr','text'])if(compact[key])summary[key]=redactRuntimeText(compact[key],800);
   }
   if(Buffer.byteLength(JSON.stringify(summary),'utf8')<=MAX_EVENT_TEXT)return summary;
   return {type:summary.type||'event',truncated:true,originalBytes:summary.originalBytes};
+}
+
+function persistLatestBrowserReadiness(dir,event){
+  const item=event?.item;
+  if(event?.type!=='item.completed'||item?.type!=='mcp_tool_call'||item.server!=='cua_repl'||item.tool!=='js')return true;
+  const file=path.join(path.resolve(String(dir||'')),'browser-readiness-latest.json');
+  const temp=`${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  const record={schemaVersion:1,source:'bridge_cua_completed_item',eventType:'item.completed',itemId:String(item.id||event.item_id||''),server:'cua_repl',tool:'js',browserReadinessEvidence:extractBrowserReadinessEvidence(event)};
+  try{
+    fs.writeFileSync(temp,JSON.stringify(record),{mode:0o600,flag:'wx'});
+    fs.renameSync(temp,file);
+    fs.chmodSync(file,0o600);
+    return true;
+  }catch{
+    try{fs.unlinkSync(temp);}catch{}
+    try{fs.unlinkSync(file);}catch{}
+    return false;
+  }
 }
 
 function boundedEventLine(value){
@@ -163,28 +219,44 @@ function browserToolCallInfo(event,{dir,cleanupCallUsed=false,runIdOverride=null
     && !/(?:\bcua\.[A-Za-z_$][\w$]*|\b(?:tab|globalThis\.__wendiOwnedTab)\s*\.|createBrowserTab|filechooser|pageAssets|\.getByRole\(|\.locator\()/i.test(source);
   if(manifestOnly)return null;
   const closeLike=/(?:globalThis\.__wendiOwnedTab|__wendiOwnedTab|\btab)\s*\.\s*close\s*\(/i.test(source);
-  const fixedCleanup=source.includes(BROWSER_CLEANUP_MARKER)&&closeLike&&/(?:--state[^\n]{0,120}closing|ownedTabStage[^\n]*closing|cleanup-status|\bfinally\b)/i.test(source);
+  const singleClose=(source.match(/\.\s*close\s*\(/gi)||[]).length===1;
+  const currentOwnedHandle=/(?:const|let|var)\s+tab\s*=\s*globalThis\.__wendiOwnedTab\b/.test(source)
+    ||/globalThis\.__wendiOwnedTab\s*\.\s*close\s*\(/.test(source);
+  const reportsOwnedId=/globalThis\.__wendiOwnedTabId\b/.test(source);
+  const mixedBrowserAction=/(?:\bcua\s*\.|\b(?:createBrowserTab|getTab|listTabs)\s*\(|\btab\s*\.\s*(?:goto|click|reload|back|forward|url|playwright|capabilities)\b|\.\s*(?:setFiles|waitForChooser|waitForEvent|click)\s*\(|pageAssets|filechooser)/i.test(source);
+  const closeOnlySource=closeLike&&singleClose&&currentOwnedHandle&&reportsOwnedId&&!mixedBrowserAction;
+  const fixedCleanup=source.includes(BROWSER_CLEANUP_MARKER)&&closeOnlySource&&/(?:--state[^\n]{0,120}closing|ownedTabStage[^\n]*closing|cleanup-status|\bfinally\b)/i.test(source);
   let lease=null;
   try{lease=dir?readOwnedTabLease(dir):null;}catch{}
   const runId=String(runIdOverride||path.basename(path.resolve(String(dir||''))));
   const leaseRunMatches=Boolean(lease?.runId)&&lease.runId===runId;
-  const sourceRunId=source.match(/--run-id\s+(?:"([^"]+)"|'([^']+)'|([^\s;,)]+))/i)?.slice(1).find(Boolean)||source.match(/--run-id["']\s*,\s*["']([^"']+)/i)?.[1]||null;
+  const sourceRunId=source.match(/--run-id\s+(?:"([^"]+)"|'([^']+)'|([^\s;,)]+))/i)?.slice(1).find(Boolean)||source.match(/--run-id["']\s*,\s*["']([^"']+)/i)?.[1]||source.match(/\b(?:const|let)\s+runId\s*=\s*["']([^"']+)["']/)?.[1]||null;
   const sourceRunMatches=Boolean(sourceRunId&&sourceRunId===runId);
   const leaseOwnedTabId=String(lease?.ownedTabId||'');
-  const sourceOwnedTabId=source.match(/--owned-tab-id\s+(?:"([^"]+)"|'([^']+)'|([^\s;,)]+))/i)?.slice(1).find(Boolean)||source.match(/--owned-tab-id["']\s*,\s*["']([^"']+)/i)?.[1]||null;
+  const sourceOwnedTabId=source.match(/--owned-tab-id\s+(?:"([^"]+)"|'([^']+)'|([^\s;,)]+))/i)?.slice(1).find(Boolean)||source.match(/--owned-tab-id["']\s*,\s*["']([^"']+)/i)?.[1]||source.match(/\bownedTabId\s*!==\s*["']([^"']+)["']/)?.[1]||null;
   const ownedTabMatches=Boolean(leaseOwnedTabId&&sourceOwnedTabId&&leaseOwnedTabId===sourceOwnedTabId);
   const cleanupCandidate=fixedCleanup&&closeLike;
-  const cleanupAuthorized=cleanupCandidate&&lease?.state==='closing'&&leaseRunMatches&&sourceRunMatches&&ownedTabMatches&&!cleanupCallUsed;
+  const leaseIsClosing=lease?.state==='closing'&&leaseRunMatches&&Boolean(leaseOwnedTabId);
+  const explicitCleanupIdentity=sourceRunMatches&&ownedTabMatches;
+  const cleanupAuthorized=cleanupCandidate&&leaseIsClosing&&explicitCleanupIdentity&&!cleanupCallUsed;
   const manifestState=manifestBrowserState(dir);
   return {id:String(item.id||event?.item_id||event?.id||''),phase:type.includes('started')?'started':type.includes('completed')?'completed':'other',kind:runtimeInitialization?'initialization':cleanupAuthorized?'cleanup':cleanupCandidate?'deferred_cleanup':'business',stage:browserToolBusinessStage(source,'bootstrap',{leaseState:lease?.state||null,manifestState,submissionIntentObserved:manifestHasSubmissionIntent(dir)}),closeLike,fixedCleanup,cleanupCandidate,leaseState:lease?.state||null,manifestState,leaseRunMatches,sourceRunMatches,ownedTabMatches,ownedTabId:leaseOwnedTabId||null};
 }
 
 function eventContainsSubmissionIntent(event){
+  if(!String(event?.type||'').includes('completed'))return false;
   const item=event?.item&&typeof event.item==='object'?event.item:{};
-  const fields=[item.arguments?.code,item.arguments?.command,item.command,item.result?.structured_content,item.result?.content,item.aggregated_output,event?.message,event?.error].filter(Boolean);
-  let source='';
-  try{source=JSON.stringify(fields);}catch{source=String(fields);}
-  return /(?:submission-intent|submissionIntent|submission_intent_recorded)/i.test(source);
+  const command=String(item.command||item.arguments?.command||'');
+  if(item.type!=='command_execution'||!/\brun-manifest\.mjs\s+submission-intent\b/.test(command))return false;
+  const fields=[item.result?.structured_content,item.aggregated_output,...(item.result?.content||[]).filter(block=>block?.type==='text').map(block=>block.text)].filter(Boolean);
+  for(const field of fields){
+    if(field&&typeof field==='object'&&(field.submissionIntent===true||field.manifest?.submissionIntent===true))return true;
+    if(typeof field==='string'){
+      try{const parsed=JSON.parse(field);if(parsed?.submissionIntent===true||parsed?.manifest?.submissionIntent===true)return true;}catch{}
+      if(/submission_intent_recorded\s*[:=]\s*true/i.test(field))return true;
+    }
+  }
+  return false;
 }
 
 function manifestHasSubmissionIntent(dir){
@@ -239,7 +311,7 @@ export function browserToolStage(value,lifecycle={}){
   if(['uploading','uploaded'].includes(leaseState))return 'upload';
   if(['creating','created'].includes(leaseState))return 'bootstrap';
   if(/pageAssets|\.bundle\(|\.list\(\)|download-evidence|下载原图|生成结果|停止生成|等待生成/i.test(source))return 'wait_download';
-  if(/setFiles\s*\(|waitForEvent\s*\(\s*['\"]filechooser['\"]|filechooser|\.fill\s*\(|\.paste\s*\(/i.test(source))return 'upload';
+  if(/setFiles\s*\(|waitForEvent\s*\(\s*["']filechooser["']|filechooser|\.fill\s*\(|\.paste\s*\(/i.test(source))return 'upload';
   if(/createBrowserTab|\.goto\(|waitForLoadState|getAXState|聊天模式|创建图片|composer|登录/i.test(source))return 'bootstrap';
   return 'bootstrap';
 }
@@ -251,16 +323,21 @@ function browserToolBusinessStage(source, fallback='bootstrap',lifecycle={}){
 
 function runtimeCandidate(event){
   const item=event?.item||{};
+  if(String(event?.type||'').includes('completed')&&item.type==='command_execution'){
+    const helperOutput=String(item.aggregated_output||item.output||'');
+    try{if(JSON.parse(helperOutput)?.ok===true)return null;}catch{}
+  }
   const rawError=item.error||event.error||event.message||event.error?.message;
   const textCandidates=[];
   if(rawError)textCandidates.push(typeof rawError==='string'?rawError:rawError.message||rawError.stack||JSON.stringify(rawError));
+  if(String(event?.type||'').includes('completed')&&item.server==='cua_repl'&&item.tool==='js'&&typeof item.resultText==='string')textCandidates.push(item.resultText);
   for(const key of ['aggregated_output','output','stdout','stderr'])if(typeof item[key]==='string')textCandidates.push(item[key]);
   for(const block of item.result?.content||[])if(block?.type==='text'&&typeof block.text==='string')textCandidates.push(block.text);
-  const raw=textCandidates.find(value=>/(?:ReferenceError|TypeError|SyntaxError|RangeError|is not defined|not a function|WORKER_SCRIPT_RUNTIME_ERROR|EXECUTOR_RUNTIME_ERROR|BROWSER_HANDLE_LOST)/i.test(String(value)))||'';
+  const raw=textCandidates.find(value=>/(?:ReferenceError|TypeError|SyntaxError|RangeError|Playwright selector deadline exceeded|js execution timed out|kernel reset|is not defined|not a function|WORKER_SCRIPT_RUNTIME_ERROR|EXECUTOR_RUNTIME_ERROR|BROWSER_HANDLE_LOST)/i.test(String(value)))||'';
   if(!raw)return null;
   const source=String(raw);
   const match=source.match(/(ReferenceError|TypeError|SyntaxError|RangeError|Error)\s*:\s*([^\n]+)/i);
-  const category=match?.[1] ? 'javascript_runtime' : 'executor_error';
+  const category=/Playwright selector deadline exceeded|js execution timed out|kernel reset/i.test(source)?'browser_action_failure':match?.[1] ? 'javascript_runtime' : 'executor_error';
   const browserBudgetStage=browserToolBusinessStage(source);
   return {
     schemaVersion:1,
@@ -474,6 +551,10 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
   fs.mkdirSync(dir,{recursive:true});
   const resultPath=path.join(dir,'response.txt');
   const runId=String(runIdOverride||path.basename(path.resolve(dir))),leaseRoot=path.resolve(leaseDir||dir),startedAt=new Date().toISOString();
+  const readinessLatestFile=path.join(leaseRoot,'browser-readiness-latest.json');
+  if(browserMode==='chrome'){
+    try{fs.unlinkSync(readinessLatestFile);}catch(err){if(err?.code!=='ENOENT')throw Object.assign(new Error('无法清除旧浏览器 readiness 证据，已阻止执行。'),{code:'BROWSER_READINESS_EVIDENCE_PERSIST_FAILED',cause:err});}
+  }
   const executionFile=path.join(dir,'execution.json');
   const execution={schemaVersion:1,role,model:model||null,reasoningEffort,browserMode:browserMode||null,image:Boolean(image),runId,startedAt};
   const saveExecution=patch=>{try{fs.writeFileSync(executionFile,JSON.stringify({...execution,...patch},null,2),{mode:0o600});}catch{}};
@@ -524,7 +605,7 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
       try{
         const lease=readOwnedTabLease(leaseRoot,{runId});
         if(lease){
-          const browserFailure=String(err?.message||error||'');
+          const browserFailure=[String(err?.message||error||''),...capturedEvents.filter(event=>event?.type==='item.completed'&&event?.item?.server==='cua_repl'&&event?.item?.tool==='js').map(event=>event.item.resultText||'')].join(' ');
           const kernelReset=/kernel\s*reset|globalThis[^\n]*(?:lost|undefined)|owned.?tab[^\n]*(?:lost|handle)/i.test(browserFailure);
           const finalized=finalizeOwnedTabLease({dir:leaseRoot,runId,requestId:lease.requestId,reason:err?'executor-exit':'executor-finished',kernelReset});
           if(finalized){
@@ -541,7 +622,7 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
       }
       resolve(result);
     };
-    const registerBrowserToolCall=(callKey,kind,event,stageHint=null,{deferTermination=false}={})=>{
+    const registerBrowserToolCall=(callKey,kind,event,stageHint=null)=>{
       if(browserToolCallIds.has(callKey))return;
       browserToolCallIds.add(callKey);browserToolCalls+=1;
       const source=String(event?.item?.arguments?.code||event?.item?.arguments?.command||'');
@@ -618,6 +699,7 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
             } else registerBrowserToolCall(callKey,browserCall.kind,e,browserCall.stage,{deferTermination:browserCall.phase==='started'});
           }
           const compact=boundedEvent(e);
+          if(browserMode==='chrome'&&!persistLatestBrowserReadiness(leaseRoot,e)){error='BROWSER_READINESS_EVIDENCE_PERSIST_FAILED';stop();}
           capturedEvents.push(compact);
           const candidate=runtimeCandidate(e);if(candidate)persistRuntimeError(candidate);
           if(e.type==='item.completed'&&e.item?.type==='agent_message')last=e.item.text;

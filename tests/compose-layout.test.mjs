@@ -110,6 +110,7 @@ test('accept refuses a legacy titled page and accepts a re-composed current page
   fs.appendFileSync(projectPage,'tamper');
   await assert.rejects(E.accept(project,W.CHECKS),/完整性/);
   fs.copyFileSync(pageFile,projectPage);
+  E.saveProject(project);
   await E.accept(project,W.CHECKS);
   assert.equal(project.accepted,true);assert(fs.existsSync(path.join(E.projectDir(project.id),'v1','成品','01.png')));
   assert.equal(project.bundleIntegrity.entries.length,2);

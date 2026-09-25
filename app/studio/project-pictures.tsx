@@ -8,10 +8,11 @@ import {
   Pencil,
   RotateCcw,
 } from 'lucide-react';
-import type { Project } from './types';
+import type { Picture, Project } from './types';
 import { MeasuredMasonryGrid, QaBadge } from './visuals';
 import type { ProjectAction } from './recovery-cards';
 import { PanelDecisionCard } from './recovery-cards';
+import { sourcedPageRepairPrompt } from './revision-prefill';
 
 export function ProjectPictures({
   project,
@@ -42,6 +43,7 @@ export function ProjectPictures({
   decisionCoverFitNote: string | null;
   previousAttemptNoOutput: boolean;
 }) {
+  const planPages = project.plan?.pages ?? [];
   const panelForPageIssue = (
     pageNumber: number,
     issue: NonNullable<Picture['qa']['issueDetails']>[number],
@@ -81,7 +83,7 @@ export function ProjectPictures({
         : null;
     if (!panelNumber) return null;
     const panelCount =
-      project.plan.pages.find((entry) => entry.number === pageNumber)?.panels
+      planPages.find((entry) => entry.number === pageNumber)?.panels
         .length || 0;
     return panelNumber > 0 && panelNumber <= panelCount
       ? `${pageNumber}-${panelNumber}`
@@ -163,8 +165,18 @@ export function ProjectPictures({
       </div>
       {project.pages.length ? (
         <MeasuredMasonryGrid className="finished-grid">
-          {project.pages.map((page) => (
-            <div className="image-card" key={page.number}>
+          {project.pages.map((page) => {
+            const issueGroups = sourceIssueGroups(
+              page.number ?? 0,
+              page.qa.issueDetails || [],
+            );
+            const singleIssueRepairPrompt = sourcedPageRepairPrompt(
+              issueGroups,
+              page.qa.issueDetails || [],
+              page.qa.repairPrompt,
+            );
+            return (
+              <div className="image-card" key={page.number}>
               <button
                 className="image-button"
                 aria-label={`点击查看第 ${page.number} 页大图`}
@@ -198,40 +210,38 @@ export function ProjectPictures({
                     待人工复核：请先查看页面大图，确认文字未遮挡主体，并核对本页当前文件及分镜来源无误；只有确认后再点击下方按钮。系统不会自动重排或生图。
                   </p>
                 )}
-                {sourceIssueGroups(page.number, page.qa.issueDetails || []).map(
-                  ({ panelKey, issues }) => {
-                    const descriptions = issues
-                      .map((issue) => String(issue.description || ''))
-                      .filter(Boolean);
-                    if (!descriptions.length) return null;
-                    return (
-                      <div className="page-issue-route" key={panelKey}>
-                        <p>成稿问题：{descriptions.join('；')}</p>
-                        <button
-                          className="secondary"
-                          disabled={disabled}
-                          onClick={() => {
-                            const [pageNumber, panelNumber] =
-                              panelKey.split('-');
-                            const items = descriptions
-                              .map((description) => `- ${description}`)
-                              .join('\n');
-                            setEditNote(
+                {issueGroups.map(({ panelKey, issues }) => {
+                  const descriptions = issues
+                    .map((issue) => String(issue.description || ''))
+                    .filter(Boolean);
+                  if (!descriptions.length) return null;
+                  return (
+                    <div className="page-issue-route" key={panelKey}>
+                      <p>成稿问题：{descriptions.join('；')}</p>
+                      <button
+                        className="secondary"
+                        disabled={disabled}
+                        onClick={() => {
+                          const [pageNumber, panelNumber] = panelKey.split('-');
+                          const items = descriptions
+                            .map((description) => `- ${description}`)
+                            .join('\n');
+                          setEditNote(
+                            singleIssueRepairPrompt ||
                               `成稿校对指出以下分镜问题：\n${items}\n\n请只修改第 ${pageNumber} 页第 ${panelNumber} 格，逐项修复以上问题；保留该格其他人物、场景、动作、构图和风格，不改动其他分镜。`,
-                            );
-                            setEdit({
-                              key: panelKey,
-                              title: `修改分镜 ${panelKey}`,
-                            });
-                          }}
-                        >
-                          修改分镜 {panelKey}
-                          {issues.length > 1 ? `（${issues.length}项）` : ''}
-                        </button>
-                      </div>
-                    );
-                  },
-                )}
+                          );
+                          setEdit({
+                            key: panelKey,
+                            title: `修改分镜 ${panelKey}`,
+                          });
+                        }}
+                      >
+                        修改分镜 {panelKey}
+                        {issues.length > 1 ? `（${issues.length}项）` : ''}
+                      </button>
+                    </div>
+                  );
+                })}
                 <div className="inline-actions">
                   {project.accepted && (
                     <a href={page.url + '?download=1'}>
@@ -298,8 +308,9 @@ export function ProjectPictures({
                   </button>
                 </div>
               </div>
-            </div>
-          ))}
+              </div>
+            );
+          })}
         </MeasuredMasonryGrid>
       ) : Object.keys(project.panels).length === 0 ? (
         <div className="empty-state">
@@ -336,7 +347,7 @@ export function ProjectPictures({
                 <div className="panel-card-meta">
                   <div className="panel-card-heading">
                     <span>分镜 {key}</span>
-                    <QaBadge qa={panel.qa} />
+                    <QaBadge qa={panel.qa} decision={panel.decision} />
                   </div>
                   <div className="panel-review-row">
                     <button

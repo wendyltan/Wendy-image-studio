@@ -258,6 +258,7 @@ const BROWSER_TAB_BACKGROUND_ERROR=/(?:BROWSER_TAB_BACKGROUND_UNAVAILABLE|非前
 const CHROME_UNAVAILABLE_ERROR=/(?:BROWSER_CHROME_UNAVAILABLE|Browser is not available:\s*chrome|Chrome extension.*(?:不可用|unavailable))/i;
 const BROWSER_CREATE_UNAVAILABLE_ERROR=/(?:BROWSER_CREATE_UNAVAILABLE|createBrowserTab[^\n]*(?:failed|error|不可用|失败)|创建(?:专用)?(?:Chrome )?标签页[^\n]*(?:失败|不可用))/i;
 const BROWSER_HANDLE_LOST_ERROR=/(?:BROWSER_HANDLE_LOST|owned.?tab[^\n]*(?:handle|句柄)[^\n]*(?:lost|missing|失效|丢失)|globalThis\.__wendiOwnedTab[^\n]*(?:undefined|lost|不存在))/i;
+const BROWSER_BOOTSTRAP_TIMEOUT_ERROR=/(?:BROWSER_BOOTSTRAP_TIMEOUT|js execution timed out[^\n]*kernel reset|kernel reset[^\n]*rerun your request)/i;
 const BROWSER_MODE_ENTRY_UNAVAILABLE_ERROR=/(?:BROWSER_MODE_ENTRY_UNAVAILABLE|(?:聊天模式|创建图片入口|image creation entry)[^\n]*(?:不可用|失败|missing|未找到))/i;
 const FILE_CHOOSER_EVENT_TIMEOUT_ERROR=/(?:FILE_CHOOSER_EVENT_TIMEOUT|filechooser[^\n]*(?:timeout|timed out|超时)|文件选择器[^\n]*(?:超时|等待失败))/i;
 const FILE_CHOOSER_ROUTE_UNAVAILABLE_ERROR=/(?:FILE_CHOOSER_ROUTE_UNAVAILABLE|(?:附件入口|上传照片|上传文件|from computer|upload route)[^\n]*(?:不可用|失败|未找到|unavailable))/i;
@@ -317,7 +318,7 @@ export function executorRuntimeErrorEvidence(value){
 
 export function browserPreSubmissionUnavailableText(value){
   const text=String(value||'');
-  return IAB_UNAVAILABLE_ERROR.test(text)||WORKER_SCRIPT_RUNTIME_ERROR.test(text)||EXECUTOR_RUNTIME_ERROR.test(text)||FILE_UPLOAD_CHROME_UNAVAILABLE_ERROR.test(text)||BROWSER_CREATE_UNAVAILABLE_ERROR.test(text)||BROWSER_HANDLE_LOST_ERROR.test(text)||BROWSER_MODE_ENTRY_UNAVAILABLE_ERROR.test(text)||FILE_CHOOSER_EVENT_TIMEOUT_ERROR.test(text)||FILE_CHOOSER_ROUTE_UNAVAILABLE_ERROR.test(text)||FILE_SET_FAILED_ERROR.test(text)||ATTACHMENT_VERIFICATION_TIMEOUT_ERROR.test(text)||BROWSER_TOOL_BUDGET_EXCEEDED_ERROR.test(text)||DOWNLOAD_FAILED_ERROR.test(text)||BROWSER_ORIGIN_PERMISSION_DENIED_ERROR.test(text)||BROWSER_FOCUS_ERROR.test(text)||BROWSER_TAB_BACKGROUND_ERROR.test(text)||CHROME_UNAVAILABLE_ERROR.test(text);
+  return IAB_UNAVAILABLE_ERROR.test(text)||BROWSER_BOOTSTRAP_TIMEOUT_ERROR.test(text)||WORKER_SCRIPT_RUNTIME_ERROR.test(text)||EXECUTOR_RUNTIME_ERROR.test(text)||FILE_UPLOAD_CHROME_UNAVAILABLE_ERROR.test(text)||BROWSER_CREATE_UNAVAILABLE_ERROR.test(text)||BROWSER_HANDLE_LOST_ERROR.test(text)||BROWSER_MODE_ENTRY_UNAVAILABLE_ERROR.test(text)||FILE_CHOOSER_EVENT_TIMEOUT_ERROR.test(text)||FILE_CHOOSER_ROUTE_UNAVAILABLE_ERROR.test(text)||FILE_SET_FAILED_ERROR.test(text)||ATTACHMENT_VERIFICATION_TIMEOUT_ERROR.test(text)||BROWSER_TOOL_BUDGET_EXCEEDED_ERROR.test(text)||DOWNLOAD_FAILED_ERROR.test(text)||BROWSER_ORIGIN_PERMISSION_DENIED_ERROR.test(text)||BROWSER_FOCUS_ERROR.test(text)||BROWSER_TAB_BACKGROUND_ERROR.test(text)||CHROME_UNAVAILABLE_ERROR.test(text);
 }
 
 export function browserToolBudgetExceededEvidence(value){return BROWSER_TOOL_BUDGET_EXCEEDED_ERROR.test(String(value||''));}
@@ -382,6 +383,7 @@ export function browserFailureCode({explicitCode=null,uploadUnavailable=false,or
   if(explicitCode)return explicitCode;
   const source=String(failure?.code||failure?.message||'');
   if(IAB_UNAVAILABLE_ERROR.test(source))return 'IAB_UNAVAILABLE';
+  if(BROWSER_BOOTSTRAP_TIMEOUT_ERROR.test(detail))return 'BROWSER_BOOTSTRAP_TIMEOUT';
   if(WORKER_SCRIPT_RUNTIME_ERROR.test(detail))return 'WORKER_SCRIPT_RUNTIME_ERROR';
   if(EXECUTOR_RUNTIME_ERROR.test(detail))return 'EXECUTOR_RUNTIME_ERROR';
   if(BROWSER_CREATE_UNAVAILABLE_ERROR.test(detail))return 'BROWSER_CREATE_UNAVAILABLE';
@@ -404,6 +406,7 @@ export function browserFailureCode({explicitCode=null,uploadUnavailable=false,or
 export function browserFailurePrefix(errorCode){
   if(errorCode==='BROWSER_CREATE_UNAVAILABLE')return 'Chrome 专用标签页创建能力不可用；本次未上传附件或发送消息';
   if(errorCode==='BROWSER_HANDLE_LOST')return 'Chrome 专用标签页句柄在提交前丢失；本次未上传附件或发送消息，关闭状态未确认';
+  if(errorCode==='BROWSER_BOOTSTRAP_TIMEOUT')return 'Chrome 就绪引导脚本超时并导致 CUA kernel 重置；本次未上传附件或发送消息，专用标签页关闭状态未确认';
   if(errorCode==='BROWSER_MODE_ENTRY_UNAVAILABLE')return 'ChatGPT 聊天或创建图片入口不可用；本次未上传附件或发送消息';
   if(errorCode==='FILE_CHOOSER_EVENT_TIMEOUT')return '附件入口已定位，但 filechooser 事件未在点击前后有界时间内出现；本次未上传附件或发送消息';
   if(errorCode==='FILE_CHOOSER_ROUTE_UNAVAILABLE')return '附件入口或“从电脑上传”菜单不可用；本次未上传附件或发送消息';

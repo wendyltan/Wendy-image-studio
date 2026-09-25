@@ -13,6 +13,8 @@ import {createProjectStore} from './project-store.mjs';
 import {createJobRunner} from './job-runner.mjs';
 import {createImageWorkflow,preAcceptanceQuotaEvidence as classifyPreAcceptanceQuotaEvidence,confirmedUnsentEvidence as classifyConfirmedUnsentEvidence,quotaPauseMessage as formatQuotaPauseMessage} from './image-workflow.mjs';
 import {canonicalPanelKey} from './image-single-flight.mjs';
+import {readRunIdentity,compareRunIdentity} from './run-identity.mjs';
+import {readOwnedTabLease} from './owned-tab-lease.mjs';
 export {buildRevisionPrompt,revisionPromptTelemetry};
 export const active = new Map();
 export const COMPOSITION_VERSION='no-page-title-v1';
@@ -466,7 +468,33 @@ function normalizePageQA(result){
 function materialSampleIssues(issues=[],details=[]){if(details.length)return details.filter(x=>x.category!=='aspect_ratio').map(x=>x.description);return issues.filter(x=>!/(?:2\s*[:：]\s*3|3\s*[:：]\s*4).*(?:画幅|比例|竖图)|(?:画幅|比例|竖图).*(?:2\s*[:：]\s*3|3\s*[:：]\s*4)/i.test(x));}
 function qaPassed(qa){return qa?.pass===true&&qa?.status!=='deferred';}
 function sampleAccepted(sample){return Boolean(qaPassed(sample?.qa)||sample?.userDecision?.action==='accept_current');}
-function panelAccepted(panel){return Boolean(qaPassed(panel?.qa)||panel?.userDecision?.action==='accept_current');}
+export function panelAccepted(panel){return Boolean(qaPassed(panel?.qa)||['accept_current','adopt_recovered'].includes(panel?.userDecision?.action));}
+function panelDecisionResolvesCurrentIssues(p,key,panel){
+  if(panel?.qa?.pass!==false)return false;
+  const decision=panel.userDecision,artifactId=artifactIdForImageKey(key),artifact=currentImageArtifact(p,key);
+  if(decision?.action!=='accept_current'||!artifact||artifact.id!==decision.artifactId||decision.artifactId!==artifactId||Number(decision.projectVersion)!==Number(p.version))return false;
+  if(decision.contentHash!==digest({artifactId,file:panel.file,at:panel.at||artifact.at||null}))return false;
+  const sha=panel.integrity?.sha256;
+  if(!sha||sha!==artifact.integrity?.sha256||sha!==decision.integritySha256)return false;
+  const issueIds=(panel.qa.issueDetails||[]).filter(issue=>['blocking','review'].includes(issue.severity)).map(issue=>String(issue.id)).filter(Boolean);
+  const acknowledged=Array.isArray(decision.acknowledgedIssueIds)?decision.acknowledgedIssueIds.map(String):[];
+  if(issueIds.length!==acknowledged.length||issueIds.some((id,index)=>id!==acknowledged[index]))return false;
+  const issues=Array.isArray(panel.qa.issues)?panel.qa.issues:[];
+  const acknowledgedIssues=Array.isArray(decision.issues)?decision.issues:[];
+  return issues.length===acknowledgedIssues.length&&issues.every((issue,index)=>issue===acknowledgedIssues[index]);
+}
+function panelReviewResolved(p,key,panel){
+  if(qaPassed(panel?.qa))return true;
+  if(panel?.qa?.pass===false)return panelDecisionResolvesCurrentIssues(p,key,panel);
+  return true;
+}
+async function deferredPanelCanProceed(p,key,panel){
+  if(p.brief.workflowPreset==='careful'||panel?.qa?.status!=='deferred'||panel.qa.pass!==null||panel.userDecision||!panel.file)return false;
+  const artifact=currentImageArtifact(p,key),versionDir=`v${p.version}`;
+  if(!artifact||artifact.valid!==true||artifact.file!==panel.file||path.normalize(panel.file).split(path.sep)[0]!==versionDir)return false;
+  if(artifact.projectVersion!=null&&Number(artifact.projectVersion)!==Number(p.version))return false;
+  try{const actual=await verifyImage(inside(projectDir(p.id),panel.file));return integrityMatches(panel.integrity,actual)&&integrityMatches(artifact.integrity,actual);}catch{return false;}
+}
 function requirePanelDecision(p,key,record=p.panels?.[key]){
   p.panelDecision={state:'required',panelKey:key,artifactId:artifactIdForImageKey(key),projectVersion:p.version,at:new Date().toISOString(),issueIds:(record?.qa?.issueDetails||[]).filter(issue=>['blocking','review'].includes(issue.severity)).map(issue=>String(issue.id)).filter(Boolean)};
 }
@@ -773,7 +801,7 @@ export async function decidePanel(p,decision={}){
   const key=String(decision.key||decision.panelKey||''),record=p.panels?.[key],action=String(decision.action||'');
   if(!/^\d+-\d+$/.test(key)||!record)throw new Error('没有可供决定的正式分镜。');
   if(action!=='accept_current')throw new Error('正式分镜只能采用当前图片或修改这一张。');
-  if(record.qa?.pass!==false||record.userDecision?.action==='accept_current')throw new Error('当前正式分镜没有等待人工采用的失败质检。');
+  if(record.qa?.pass!==false||panelDecisionResolvesCurrentIssues(p,key,record))throw new Error('当前正式分镜没有等待人工采用的失败质检。');
   if(Object.prototype.hasOwnProperty.call(decision,'expectedRevision')&&Number(decision.expectedRevision)!==Number(p.revision))throw new Error('作品已更新，请刷新后再提交这次决定。');
   if(decision.planHash&&decision.planHash!==p.approved?.hash)throw new Error('方案已更新，请重新查看当前分镜后再决定。');
   const artifactId=artifactIdForImageKey(key),artifact=(p.artifacts||[]).find(item=>item.id===artifactId);
@@ -784,9 +812,43 @@ export async function decidePanel(p,decision={}){
   const acknowledgedIssueIds=[...new Set((Array.isArray(decision.acknowledgedIssueIds)?decision.acknowledgedIssueIds:[]).map(String).filter(Boolean))],requiredIssueIds=(record.qa.issueDetails||[]).filter(issue=>['blocking','review'].includes(issue.severity)).map(issue=>String(issue.id)).filter(Boolean);
   if(requiredIssueIds.some(id=>!acknowledgedIssueIds.includes(id)))throw new Error('请先确认正式分镜中列出的待注意问题，再采用当前图片。');
   const expectedRevision=Number(p.revision),expectedVersion=Number(p.version),expectedPlanHash=p.approved.hash,verified=await verifyPanelImage(p,record,artifact),latest=readProject(p.id),latestRecord=latest.panels?.[key],latestArtifact=(latest.artifacts||[]).find(item=>item.id===artifactId);
-  if(active.has(p.id)||Number(latest.revision)!==expectedRevision||Number(latest.version)!==expectedVersion||latest.approved?.hash!==expectedPlanHash||!['attention','paused'].includes(latest.status)||latest.panelDecision?.state!=='required'||latest.panelDecision.panelKey!==key||latestRecord?.file!==record.file||latestRecord?.at!==record.at||latestRecord?.qa?.pass!==false||latestRecord?.userDecision?.action==='accept_current'||latestArtifact?.file!==record.file||latestArtifact?.valid===false||latestRecord.integrity?.sha256&&latestRecord.integrity.sha256!==verified.integrity.sha256||latestArtifact.integrity?.sha256&&latestArtifact.integrity.sha256!==verified.integrity.sha256)throw new Error('作品或当前图片已更新，请刷新后再提交这次决定。');
-  Object.assign(p,latest);const current=p.panels[key],currentArtifact=(p.artifacts||[]).find(item=>item.id===artifactId);current.integrity=verified.integrity;currentArtifact.integrity=verified.integrity;const decidedAt=new Date().toISOString();current.userDecision={action:'accept_current',at:decidedAt,projectVersion:p.version,artifactId,contentHash,integritySha256:verified.integrity.sha256,acknowledgedIssueIds,issues:current.qa.issues||[]};p.panelDecision={state:'accepted',panelKey:key,artifactId,projectVersion:p.version,at:decidedAt};p.error=null;p.status='paused';p.message=`已明确采用第 ${key.split('-')[0]} 页第 ${key.split('-')[1]} 格当前图片。模型质检结论仍保留；接下来会继续排版和整篇检查。`;saveProject(p);
+  if(active.has(p.id)||Number(latest.revision)!==expectedRevision||Number(latest.version)!==expectedVersion||latest.approved?.hash!==expectedPlanHash||!['attention','paused'].includes(latest.status)||latest.panelDecision?.state!=='required'||latest.panelDecision.panelKey!==key||latestRecord?.file!==record.file||latestRecord?.at!==record.at||latestRecord?.qa?.pass!==false||panelDecisionResolvesCurrentIssues(latest,key,latestRecord)||latestArtifact?.file!==record.file||latestArtifact?.valid===false||latestRecord.integrity?.sha256&&latestRecord.integrity.sha256!==verified.integrity.sha256||latestArtifact.integrity?.sha256&&latestArtifact.integrity.sha256!==verified.integrity.sha256)throw new Error('作品或当前图片已更新，请刷新后再提交这次决定。');
+  Object.assign(p,latest);const current=p.panels[key],currentArtifact=(p.artifacts||[]).find(item=>item.id===artifactId);current.integrity=verified.integrity;currentArtifact.integrity=verified.integrity;if(current.userDecision){current.userDecisionHistory=Array.isArray(current.userDecisionHistory)?current.userDecisionHistory:[];current.userDecisionHistory.push(structuredClone(current.userDecision));current.userDecisionHistory=current.userDecisionHistory.slice(-20);}const decidedAt=new Date().toISOString();current.userDecision={action:'accept_current',at:decidedAt,projectVersion:p.version,artifactId,contentHash,integritySha256:verified.integrity.sha256,acknowledgedIssueIds,issues:current.qa.issues||[]};p.panelDecision={state:'accepted',panelKey:key,artifactId,projectVersion:p.version,at:decidedAt};p.error=null;p.status='paused';p.message=`已明确采用第 ${key.split('-')[0]} 页第 ${key.split('-')[1]} 格当前图片。模型质检结论仍保留；接下来会继续排版和整篇检查。`;saveProject(p);
   return decision.continueProduction===false?p:generatePages(p);
+}
+export async function adoptRecoveredPanel(p,decision={}){
+  verifyApproval(p);
+  if(decision.continueProduction!==false)throw new Error('恢复原图采用只记录人工决定，必须明确关闭继续制作。');
+  const panelKey=String(decision.panelKey||''),record=p.panels?.[panelKey],artifactId=artifactIdForImageKey(panelKey),artifact=(p.artifacts||[]).find(item=>item.id===artifactId);
+  if(!/^\d+-\d+$/.test(panelKey)||!record||!artifact)throw new Error('没有可采用的当前恢复分镜。');
+  if(p.status!=='paused'||p.pending||active.has(p.id)||hasLiveWork(p.id))throw new Error('作品仍有任务运行或等待恢复，暂不能记录采用。');
+  if(record.qa?.status!=='manual_review'||record.qa?.pass!==null)throw new Error('当前分镜不是等待人工校对的恢复原图。');
+  if(record.userDecision||(p.manualPanelReview?.panelKey===panelKey&&p.manualPanelReview?.state==='needs_review'))throw new Error('当前分镜已有人工决定或拒绝记录，不能改为采用。');
+  const taskId=String(decision.taskId||''),requestId=String(decision.requestId||''),expectedSha256=String(decision.expectedSha256||''),version=Number(decision.projectVersion),expectedRevision=Number(decision.expectedRevision),expectedPlanHash=String(decision.planHash||'');
+  const task=p.currentTask,taskRecord=(p.tasks||[]).find(item=>item.id===taskId);
+  if(!taskId||!requestId||!expectedSha256||!Number.isInteger(version)||!Number.isInteger(expectedRevision)||!expectedPlanHash)throw new Error('恢复原图身份信息不完整，不能记录采用。');
+  if(version!==Number(p.version)||Number(record.projectVersion??version)!==version||Number(artifact.projectVersion??version)!==version||expectedRevision!==Number(p.revision)||expectedPlanHash!==p.approved?.hash)throw new Error('作品或恢复图片版本已变化，请刷新后重新确认。');
+  if(!task||task.id!==taskId||taskRecord?.id!==taskId||task.status!=='recovered_local'||taskRecord.status!=='recovered_local'||task.projectId!==p.id||taskRecord.projectId!==p.id||Number(task.projectVersion)!==version||Number(taskRecord.projectVersion)!==version||task.requestId!==requestId||taskRecord.requestId!==requestId||String(task.target||'')!==String(taskRecord.target||'')||panelKeyFromImageKey(task.target)!==panelKey||task.qa!=='manual_review'||taskRecord.qa!=='manual_review')throw new Error('当前恢复任务身份与分镜不匹配。');
+  if(artifact.id!==artifactId||artifact.valid!==true||artifact.file!==record.file||path.normalize(record.file).split(path.sep)[0]!==`v${version}`)throw new Error('当前恢复分镜文件已过期或不属于当前版本。');
+  const verified=await verifyPanelImage(p,record,artifact);
+  if(verified.integrity.sha256!==expectedSha256||record.integrity?.sha256!==expectedSha256||artifact.integrity?.sha256!==expectedSha256)throw new Error('恢复原图哈希与当前项目完整性记录不一致。');
+  const runRoot=path.join(projectDir(p.id),'.制作记录');let matching=null;
+  if(fs.existsSync(runRoot))for(const name of fs.readdirSync(runRoot).reverse()){
+    const candidate=matchingWebRunRecord({dir:path.join(runRoot,name),projectId:p.id,projectVersion:version,taskId,key:task.target,file:verified.file});
+    if(candidate?.manifest?.requestId===requestId&&candidate.manifest.state==='downloaded'&&candidate.manifest.accepted===true&&candidate.manifest.submitted===true&&path.resolve(candidate.manifest.artifactPath||candidate.manifest.outputFile||'')===path.resolve(verified.file)){matching=candidate;break;}
+  }
+  if(!matching)throw new Error('没有找到与当前分镜、任务、版本和 request 完全匹配的已下载执行记录。');
+  const latest=readProject(p.id),latestRecord=latest.panels?.[panelKey],latestArtifact=(latest.artifacts||[]).find(item=>item.id===artifactId);
+  if(Number(latest.revision)!==expectedRevision||Number(latest.version)!==version||latest.approved?.hash!==expectedPlanHash||latest.status!=='paused'||latest.pending||latest.currentTask?.id!==taskId||latest.currentTask?.requestId!==requestId||latestRecord?.file!==record.file||latestRecord?.qa?.status!=='manual_review'||latestRecord?.qa?.pass!==null||latestArtifact?.file!==record.file||latestArtifact?.valid!==true)throw new Error('项目或当前恢复图片已变化，请刷新后重新确认。');
+  if(latestRecord.userDecision){
+    const existing=latestRecord.userDecision;
+    if(existing.action==='adopt_recovered'&&existing.requestId===requestId&&existing.integritySha256===expectedSha256)return Object.assign(p,latest);
+    throw new Error('当前分镜已有人工决定，不能重复或覆盖。');
+  }
+  Object.assign(p,latest);const adopted=p.panels[panelKey],at=new Date().toISOString();
+  adopted.userDecision={action:'adopt_recovered',at,projectId:p.id,projectVersion:version,taskId,requestId,artifactId,contentHash:digest({artifactId,file:adopted.file,at:adopted.at||latestArtifact.at||null}),integritySha256:expectedSha256,continueProduction:false};
+  p.message=`已记录你对第 ${panelKey.split('-')[0]} 页第 ${panelKey.split('-')[1]} 格恢复原图的人工采用；自动分镜校对与页级成稿校对尚未完成，未继续制作。`;
+  saveProject(p,{expectedRevision});return p;
 }
 function defaultCaptionAnchor(panel,index){return ['time','dialogue'].includes(panel?.captionKind)?'top-right':index%2?'top-left':'bottom-left';}
 function nextCaptionAnchor(anchor){return {'bottom-left':'top-right','top-left':'bottom-right','top-right':'bottom-left','bottom-right':'top-left'}[anchor]||'top-right';}
@@ -846,23 +908,50 @@ function invalidatePagePresentation(p,pageNumber,reason){
   invalidateArtifacts(p,['story:audit','export:bundle']);p.storyQA=null;p.bundle=null;p.accepted=false;p.acceptance=null;
 }
 async function composePage(p,page,signal){
-  const previous=p.pages?.find(item=>Number(item.number)===Number(page.number));
+  let previous=p.pages?.find(item=>Number(item.number)===Number(page.number));
   const alreadyArchived=(p.invalidatedPages||[]).some(item=>Number(item?.page?.number)===Number(page.number)&&item?.page?.file===previous?.file);
-  if(previous&&previous.compositionVersion!==COMPOSITION_VERSION&&!alreadyArchived)invalidatePagePresentation(p,page.number,'composition-version-migration');
-  const dir=runDir(p,`第${page.number}页排版`);const output=path.join(versionDir(p),'候选成稿',`${String(page.number).padStart(2,'0')}-${Date.now()}.png`);
+  let archived=alreadyArchived;
+  if(previous&&previous.compositionVersion!==COMPOSITION_VERSION&&!alreadyArchived){invalidatePagePresentation(p,page.number,'composition-version-migration');archived=true;}
+  let reusable=null;
+  if(previous&&previous.compositionVersion===COMPOSITION_VERSION&&Number(previous.projectVersion)===Number(p.version)&&['pending','unavailable'].includes(previous.qa?.status)){
+    try{await validatePageReviewEvidence(p,page.number);reusable=previous;}catch{}
+  }
+  if(previous&&!reusable&&!archived){invalidatePagePresentation(p,page.number,'page-recomposed');saveProject(p);}
+  const dir=reusable?null:runDir(p,`第${page.number}页排版`),output=reusable?inside(projectDir(p.id),reusable.file):path.join(versionDir(p),'候选成稿',`${String(page.number).padStart(2,'0')}-${Date.now()}.png`);
   const images=page.panels.map((_,i)=>inside(projectDir(p.id),p.panels[`${page.number}-${i+1}`].file));
-  const sourceIntegrity=[];
-  for(const [index,file] of images.entries()){
+  const sourceIntegrity=reusable?reusable.sourceIntegrity:[];
+  if(!reusable)for(const [index,file] of images.entries()){
     const integrity=await verifyImage(file);
     sourceIntegrity.push({key:`${page.number}-${index+1}`,file:path.relative(projectDir(p.id),file),format:String(integrity.format||'').toUpperCase(),width:integrity.width,height:integrity.height,sizeBytes:integrity.sizeBytes,sha256:integrity.sha256});
   }
   const layoutHints=p.pageLayouts?.[page.number]||{style:'floating-v2'};
-  jsonWrite(path.join(dir,'排版.json'),{page,total:p.plan.pages.length,images,output,layoutHints,compositionVersion:COMPOSITION_VERSION});
-  await pythonRun(['compose',path.join(dir,'排版.json')]);checkpoint(signal);
+  if(!reusable){jsonWrite(path.join(dir,'排版.json'),{page,total:p.plan.pages.length,images,output,layoutHints,compositionVersion:COMPOSITION_VERSION});
+    await pythonRun(['compose',path.join(dir,'排版.json')]);
+    if(process.env.WENDI_TEST_PAUSE_AFTER_COMPOSE&&!fs.existsSync(process.env.WENDI_TEST_PAUSE_AFTER_COMPOSE)){fs.writeFileSync(process.env.WENDI_TEST_PAUSE_AFTER_COMPOSE,'compose-finished');await new Promise(resolve=>setTimeout(resolve,250));}
+    if(process.env.WENDI_TEST_CORRUPT_PAGE_AFTER_COMPOSE&&!fs.existsSync(process.env.WENDI_TEST_CORRUPT_PAGE_AFTER_COMPOSE)){fs.writeFileSync(process.env.WENDI_TEST_CORRUPT_PAGE_AFTER_COMPOSE,'corrupted');fs.writeFileSync(output,'not a PNG');}
+    let pageIntegrity;
+    try{pageIntegrity=await verifyImage(output);}catch(error){
+      const evidence={number:page.number,outputFile:path.relative(projectDir(p.id),output),projectVersion:p.version,compositionVersion:COMPOSITION_VERSION,sourceIntegrity,error:String(error?.message||error).slice(0,1000),at:new Date().toISOString()};
+      p.pageComposeFailures=Array.isArray(p.pageComposeFailures)?p.pageComposeFailures:[];p.pageComposeFailures.push(evidence);p.pageComposeFailures=p.pageComposeFailures.slice(-20);saveProject(p);throw error;
+    }
+    const result={number:page.number,file:path.relative(projectDir(p.id),output),qa:{pass:null,status:'pending',summary:'本地成稿已登记，等待页面校对。',issues:[],issueDetails:[],repairPrompt:''},layoutHints,compositionVersion:COMPOSITION_VERSION,projectVersion:p.version,integrity:pageIntegrity,sourceIntegrity,at:new Date().toISOString(),dependsOn:page.panels.map((_,i)=>artifactIdForImageKey(`${page.number}-${i+1}`))};
+    p.pages=p.pages.filter(q=>q.number!==page.number);p.pages.push(result);p.pages.sort((a,b)=>a.number-b.number);recordArtifact(p,`page:${page.number}`,'page',result.file,result.dependsOn,{compositionVersion:COMPOSITION_VERSION,projectVersion:p.version,integrity:pageIntegrity,sourceIntegrity});saveProject(p);previous=result;
+    checkpoint(signal);
+  }
   activity(p,`正在核对第 ${page.number} 页的文字、画面和连续性…`);
-  const report=normalizePageQA(await qa(p,output,JSON.stringify(pageQaDefinition(page)),imageRefs(p,[...new Set(page.panels.flatMap(q=>q.references))]),signal,'1080×1440最终漫画页'));
-  const pageIntegrity=await verifyImage(output),result={number:page.number,file:path.relative(projectDir(p.id),output),qa:report,layoutHints,compositionVersion:COMPOSITION_VERSION,projectVersion:p.version,integrity:pageIntegrity,sourceIntegrity,at:new Date().toISOString(),dependsOn:page.panels.map((_,i)=>artifactIdForImageKey(`${page.number}-${i+1}`))};
-  p.pages=p.pages.filter(q=>q.number!==page.number);p.pages.push(result);p.pages.sort((a,b)=>a.number-b.number);recordArtifact(p,`page:${page.number}`,'page',result.file,result.dependsOn,{compositionVersion:COMPOSITION_VERSION,projectVersion:p.version,integrity:pageIntegrity,sourceIntegrity});saveProject(p);
+  let report;
+  try{report=normalizePageQA(await qa(p,output,JSON.stringify(pageQaDefinition(page)),imageRefs(p,[...new Set(page.panels.flatMap(q=>q.references))]),signal,'1080×1440最终漫画页'));}
+  catch(error){
+    const qaError=String(error?.message||error).slice(0,1000),result=previous;
+    result.qaHistory=Array.isArray(result.qaHistory)?result.qaHistory:[];
+    result.qaHistory.push({status:'unavailable',error:qaError,at:new Date().toISOString()});result.qaHistory=result.qaHistory.slice(-20);
+    result.qa={pass:null,status:'unavailable',summary:`本次页面校对未完成；成稿已保留。${qaError}`,issues:[],issueDetails:[],repairPrompt:'',qaError};
+    saveProject(p);throw error;
+  }
+  const result=previous,pageIntegrity=await verifyImage(output);
+  if(pageIntegrity.sha256!==result.integrity.sha256)throw new Error('校对期间成稿文件发生变化，已停止更新校对状态。');
+  result.qaHistory=Array.isArray(result.qaHistory)?result.qaHistory:[];result.qaHistory.push({status:report.status|| (report.pass?'qa_pass':'needs_review'),pass:report.pass,at:new Date().toISOString()});result.qaHistory=result.qaHistory.slice(-20);
+  result.qa=report;recordArtifact(p,`page:${page.number}`,'page',result.file,result.dependsOn,{compositionVersion:COMPOSITION_VERSION,projectVersion:p.version,integrity:result.integrity,sourceIntegrity:result.sourceIntegrity});saveProject(p);
   if(!report.pass){
     const actions=[...repairActions(report)],onlyLayout=actions.length>0&&actions.every(action=>['reletter','recompose','review'].includes(action));
     result.nextStep=onlyLayout?(actions.includes('reletter')?'重新排字':'重新排版'):'查看或修订';saveProject(p);
@@ -938,7 +1027,7 @@ function reviewPageQaOnly(p,pageNumber){
   verifyApproval(p);if(p.pending)throw new Error('请先完成这次原图找回，再校对成稿。');
   const number=Number(pageNumber),page=p.pages?.find(item=>Number(item.number)===number),definition=p.plan?.pages?.find(item=>Number(item.number)===number);
   if(!page||!definition)throw new Error('这一页没有当前版本中可校对的成稿。');
-  const artifact=(p.artifacts||[]).find(item=>item.id===`page:${number}`),pageFile=page.file?inside(projectDir(p.id),page.file):null;
+  const pageFile=page.file?inside(projectDir(p.id),page.file):null;
   if(!pageFile)throw new Error('这一页没有当前版本中可校对的成稿。');
   return job(p,'page-review',async signal=>{
     activity(p,`准备校对第 ${number} 页现有成稿`,number,p.pages.length,'页面');
@@ -974,7 +1063,7 @@ export function unifyPageLayouts(p){
       invalidatePagePresentation(p,number,'layout-unified');p.pageLayouts[number]=current.qa?.pass?{...p.pageLayouts[number],style:'floating-v2',source:'whole-story-unify',at:new Date().toISOString()}:repairedLayoutHints(page,current.qa,p.pageLayouts[number]);
       const result=await composePage(p,page,signal);
       const manualLayoutCheck=current.qa?.manualReviewRequired||current.layoutVerification?.manualConfirmationRequired;
-      if(manualLayoutCheck){result.qa.manualReviewRequired=true;result.qa.status='manual_layout_review';result.qa.summary='版式已统一，但先前的文字遮挡仍需人工查看确认；自动校对通过不会替代这项确认。';result.layoutVerification={...(current.layoutVerification||{}),manualConfirmationRequired:true,automatedVisualProof:false};saveProject(p);}
+      if(manualLayoutCheck){result.qa.manualReviewRequired=true;result.qa.status='manual_layout_review';result.qa.summary='版式已统一，但先前的文字遮挡仍需人工查看确认；自动校对通过不会替代这项确认。';result.layoutVerification={...current.layoutVerification,manualConfirmationRequired:true,automatedVisualProof:false};saveProject(p);}
       if(!result.qa.pass||manualLayoutCheck)failed++;
     }
     p.error=null;p.status=failed?'attention':'paused';activity(p,failed?`已有页面已统一为同一版式，其中 ${failed} 页仍需单独调整。`:`已有 ${numbers.length} 页已统一为同一版式，原始分镜均未重新生成。`,numbers.length,numbers.length,'页面');
@@ -1017,7 +1106,7 @@ export function pageIsCurrent(p,page){
   const definition=p.plan?.pages?.find(item=>Number(item.number)===Number(page.number));
   if(!pageArtifact||pageArtifact.compositionVersion!==COMPOSITION_VERSION||!definition||!Array.isArray(page.dependsOn))return false;
   const expected=definition.panels.map((_,index)=>artifactIdForImageKey(`${page.number}-${index+1}`));
-  return expected.every(id=>page.dependsOn.includes(id)&&currentImageArtifact(p,`${page.number}-${expected.indexOf(id)+1}`)?.id===id);
+  return expected.every((id,index)=>page.dependsOn.includes(id)&&currentImageArtifact(p,`${page.number}-${index+1}`)?.id===id&&panelReviewResolved(p,`${page.number}-${index+1}`,p.panels?.[`${page.number}-${index+1}`]));
 }
 export async function confirmPageLayout(p,{pageNumber,projectVersion,contentHash}={}){
   verifyApproval(p);if(p.pending||active.has(p.id)||hasLiveWork(p.id))throw new Error('当前作品仍有任务运行，暂不能确认页面排版。');
@@ -1041,13 +1130,18 @@ export async function confirmPageLayout(p,{pageNumber,projectVersion,contentHash
 export function generatePages(p){verifyApproval(p);if(!p.samplesApproved)throw new Error('请先确认人物和场景样张。');const unconfirmedLayout=p.pages?.find(page=>page.layoutVerification?.manualConfirmationRequired===true);if(unconfirmedLayout){p.status='attention';p.error=null;p.message=`第 ${unconfirmedLayout.number} 页已重排并校对，但还没有人工确认。请先查看大图并确认排版；系统不会自动重复重排或生成分镜。`;saveProject(p);return p;}return job(p,'generating',async signal=>{
   const totalPanels=p.plan.pages.reduce((n,page)=>n+page.panels.length,0),verifyPanels=p.brief.workflowPreset==='careful';let completed=Object.keys(p.panels).length;
   for(const page of p.plan.pages){
+    const unresolved=page.panels.map((_,index)=>`${page.number}-${index+1}`).find(key=>p.panels?.[key]?.qa?.pass===false&&!panelDecisionResolvesCurrentIssues(p,key,p.panels[key]));
+    if(unresolved){const [,panelNumber]=unresolved.split('-');p.status='attention';p.error=null;p.message=`第 ${page.number} 页第 ${panelNumber} 格重新校对未通过；原图和已排页图均已保留。请先查看当前问题并明确处理，不能沿用旧采用记录完成验收。`;saveProject(p);return;}
     if(pageIsCurrent(p,p.pages.find(q=>q.number===page.number)))continue;
+    const priorPage=p.pages?.find(q=>Number(q.number)===Number(page.number));
+    if(priorPage?.qa?.pass===false){p.status='attention';p.message=`第 ${page.number} 页校对未通过；原成稿和问题记录均已保留。请先查看本页并使用“重新校对”或明确的修订入口，继续制作不会自动重排或重新生图。`;saveProject(p);return;}
     const geoFile=path.join(runDir(p,'分镜比例'),'page.json');jsonWrite(geoFile,page);
     const geometry=JSON.parse(await pythonRun(['geometry',geoFile]));
     for(const [i,q] of page.panels.entries()){
       const key=`${page.number}-${i+1}`;
       const existing=p.panels[key];
-      if(panelAccepted(existing)){await addScreen(p,key,q,signal);continue;}
+      if(existing?.qa?.pass===false?panelDecisionResolvesCurrentIssues(p,key,existing):panelAccepted(existing)){await addScreen(p,key,q,signal);continue;}
+      if(await deferredPanelCanProceed(p,key,existing)){await addScreen(p,key,q,signal);continue;}
       // This may be a file recovered after an interrupted local copy or a QA
       // outage. It is a real retained image, not a signal to spend another
       // generation request when the creator presses Continue.
@@ -1121,7 +1215,47 @@ export function imageRetryState(p){
   return deriveImageRetryState(p,CONFIRMED_PRE_SUBMISSION_KINDS);
 }
 function unknownResultMessage(target='当前图片',reason=null){return deriveUnknownResultMessage(target,reason);}
-export function retryMissingImage(p,target,{allowUnknownResult=false}={}){
+export function assertRetryOwnedTabClosureAcknowledgment(p,target,{confirmOwnedTabClosed=false,ownedTabId=null}={}){
+  const task=p?.currentTask,runId=String(p?.lastFailure?.diagnostics?.runId||task?.webTimings?.runId||'').trim();
+  const hintedTabId=String(task?.ownedTabId||task?.webTimings?.ownedTabId||'').trim();
+  const hintedState=String(task?.ownedTabState||task?.webTimings?.ownedTabState||'');
+  const hintedCleanup=String(task?.cleanupStatus||task?.webTimings?.cleanupStatus||'');
+  const hintedVerifiedClosed=hintedState==='closed_verified'&&['closed','closed_verified'].includes(hintedCleanup);
+  const hintedPending=hintedState==='orphaned'||['cleanup_pending','close_unconfirmed'].includes(hintedCleanup)||hintedState==='close_unconfirmed';
+  if(!runId){if(hintedVerifiedClosed)return null;if(hintedTabId||hintedPending)throw new Error('旧专用标签页的运行身份无法核实，已阻止重试。');return null;}
+  if(path.basename(runId)!==runId||runId==='.'||runId==='..')throw new Error('旧专用标签页的运行身份无效，已阻止重试。');
+  const requestId=String(task?.requestId||'').trim(),taskId=String(task?.id||'').trim(),canonicalTarget=canonicalPanelKey(target);
+  const dir=path.join(projectDir(p.id),'.制作记录',runId);
+  // Legacy pre-browser failures have a run directory but no web request or Chrome lease.
+  // Allow an explicit retry only if no tab was created and no modern browser record exists.
+  if(!requestId&&taskId&&canonicalTarget&&canonicalPanelKey(task?.target)===canonicalTarget
+    &&p.lastFailure?.definiteNoOutput===true&&p.lastFailure?.attempts===0
+    &&task?.providerInvocations===0&&hintedState==='not_created'&&hintedCleanup==='not_attempted'
+    &&!hintedTabId&&!hintedPending&&!fs.existsSync(path.join(dir,'owned-tab-lease.json'))
+    &&!fs.existsSync(path.join(dir,'web-generation.json')))return null;
+  if(!requestId||!taskId||!canonicalTarget||canonicalPanelKey(task?.target)!==canonicalTarget)throw new Error('旧专用标签页与当前图片身份不匹配，已阻止重试。');
+  let record,comparison,lease;
+  try{
+    record=readRunIdentity(dir,{strict:true});
+    comparison=compareRunIdentity({record,requireModern:true,expected:{projectId:p.id,projectVersion:p.version,taskId,target:task.target,requestId,runId}});
+    lease=readOwnedTabLease(dir,{runId,requestId});
+  }catch{throw new Error('旧专用标签页的执行记录或 lease 无法核实，已阻止重试。');}
+  if(!comparison?.ok)throw new Error(`旧专用标签页的执行记录身份不匹配（${comparison?.issues?.join('；')||'未知'}），已阻止重试。`);
+  if(!lease)throw new Error('旧专用标签页 lease 缺失，已阻止重试。');
+  const manifest=record.manifest||{},leaseTabId=String(lease.ownedTabId||'').trim(),manifestTabId=String(manifest.ownedTabId||'').trim();
+  if(!leaseTabId&&!manifestTabId&&lease.state==='not_created'&&!hintedTabId&&!hintedPending)return null;
+  if(!leaseTabId||leaseTabId!==manifestTabId||(hintedTabId&&hintedTabId!==leaseTabId))throw new Error('旧专用标签页 ID 与执行记录不一致，已阻止重试。');
+  const verifiedClosed=lease.state==='closed_verified'&&['closed','closed_verified'].includes(lease.cleanupStatus)&&(manifest.ownedTabState==='closed_verified'||manifest.cleanupStatus==='closed'||manifest.cleanupStatus==='closed_verified');
+  if(verifiedClosed)return null;
+  const needsAck=hintedPending||lease.state==='orphaned'||lease.state==='close_unconfirmed'||['cleanup_pending','close_unconfirmed'].includes(lease.cleanupStatus)||manifest.ownedTabState==='orphaned'||manifest.ownedTabState==='close_unconfirmed'||['cleanup_pending','close_unconfirmed'].includes(manifest.cleanupStatus)||Boolean(leaseTabId);
+  if(!needsAck)return null;
+  if(confirmOwnedTabClosed!==true||String(ownedTabId||'').trim()!==leaseTabId){
+    const sessionName=String(lease.sessionName||manifest.sessionName||task?.sessionName||'专用标签页');
+    const error=new Error(`旧专用标签页“${sessionName}”（${leaseTabId}）尚未取得关闭凭据。请通过页面的单独确认入口确认它已关闭；页面会附带并校验精确标签页 ID。`);error.code='OWNED_TAB_CLOSURE_ACK_REQUIRED';error.ownedTab={runId,requestId,ownedTabId:leaseTabId,sessionName};throw error;
+  }
+  return {runId,requestId,ownedTabId:leaseTabId,sessionName:lease.sessionName||manifest.sessionName||task?.sessionName||null};
+}
+export function retryMissingImage(p,target,{allowUnknownResult=false,confirmOwnedTabClosed=false,ownedTabId=null}={}){
   verifyApproval(p);
   if(active.has(p.id)||jobStore.hasLiveWork(p.id))throw new Error('这篇仍在制作或等待执行，请稍候。');
   const state=imageRetryState(p),failure=state?.failure;
@@ -1129,6 +1263,7 @@ export function retryMissingImage(p,target,{allowUnknownResult=false}={}){
   const canonicalTarget=canonicalPanelKey(target),stateTarget=canonicalPanelKey(state?.target);
   if(!state||stateTarget!==canonicalTarget||(state.certainty==='unknown_result'&&!allowUnknownResult))throw new Error('当前没有可安全重试的这张图片。');
   const retryTarget=canonicalTarget||target;
+  assertRetryOwnedTabClosureAcknowledgment(p,retryTarget,{confirmOwnedTabClosed,ownedTabId});
   const sampleIndex=sampleIndexFromKey(retryTarget),panelKey=panelKeyFromImageKey(retryTarget),panelRevision=panelKey?latestImageRevision(p,panelKey):null;
   if(sampleIndex===null&&!panelKey)throw new Error('无法识别需要重试的图片。');
   if(p.pending){
@@ -1175,7 +1310,7 @@ export function reviewImage(p,key){
     const task=beginTask(p,'review',record.key||key,{artifact:record.file,source:'manual_review'});
     record.integrity=integrity;record.qa={pass:null,status:'pending',summary:'原图已保存，正在重新校对。',issues:[],repairPrompt:''};saveProject(p);
     try{
-      const report=await qa(p,file,prompt,imageRefs(p,refs),signal,kind);record.qa=report;
+      const report=await qa(p,file,prompt,imageRefs(p,refs),signal,kind);record.qa=report;if(panel&&!report.pass)requirePanelDecision(p,key,record);
       jsonWrite(file+'.json',record);finishTask(p,task,'completed',{artifact:file,qa:report.pass?'passed':'needs_review'});
       p.status='paused';p.error=null;p.message=report.pass?'原图已重新校对，可以继续下一步。':'原图已重新校对，请查看建议后决定是否修改。';saveProject(p);return record;
     }catch(error){
@@ -1190,28 +1325,103 @@ export function reviewImage(p,key){
   });
 }
 export async function accept(p,checks){
-  if(active.has(p.id)||p.status!=='ready'||p.pages.length!==p.plan.pages.length||p.pages.some(q=>!pageIsCurrent(p,q))||!p.storyQA?.pass||(p.artifacts||[]).find(artifact=>artifact.id==='story:audit')?.valid!==true)throw new Error('请先完成全篇制作和校对。');
-  if(!Array.isArray(checks)||!CHECKS.every(c=>checks.includes(c)))throw new Error('请先完成成稿验收。');
-  const projectRoot=projectDir(p.id),finalDir=path.join(versionDir(p),'成品');fs.mkdirSync(finalDir,{recursive:true});
-  const finalFiles=[];
-  for(const q of p.pages){
-    if(q.projectVersion!==undefined&&Number(q.projectVersion)!==Number(p.version))throw new Error(`第 ${q.number} 页来自旧作品版本，拒绝打包。`);
-    const source=inside(projectRoot,q.file),sourceIntegrity=await verifyImage(source),pageArtifact=(p.artifacts||[]).find(artifact=>artifact.id===`page:${q.number}`&&artifact.file===q.file);
-    const expectedIntegrity=q.integrity||pageArtifact?.integrity;
-    if(!integrityMatches(expectedIntegrity,sourceIntegrity))throw new Error(integrityMismatchMessage(`第 ${q.number} 页源文件`));
-    const expectedSources=q.sourceIntegrity||pageArtifact?.sourceIntegrity;
-    if(Array.isArray(expectedSources))for(const expected of expectedSources){
-      const current=p.panels?.[expected.key];
-      if(!current?.file||expected.file&&expected.file!==current.file)throw new Error(integrityMismatchMessage(`第 ${q.number} 页第 ${expected.key?.split('-')[1]||'?'} 格来源`));
-      const actual=await verifyImage(inside(projectRoot,current.file));
-      if(!integrityMatches(expected,actual))throw new Error(integrityMismatchMessage(`第 ${q.number} 页第 ${expected.key?.split('-')[1]||'?'} 格来源`));
-    }
-    const file=path.join(finalDir,`${String(q.number).padStart(2,'0')}.png`),temp=`${file}.${crypto.randomUUID()}.tmp`;
-    try{fs.copyFileSync(source,temp);const copied=await verifyImage(temp);if(!integrityMatches(sourceIntegrity,copied))throw new Error(integrityMismatchMessage(`第 ${q.number} 页成品副本`));fs.renameSync(temp,file);q.finalIntegrity=copied;q.finalFile=path.relative(projectRoot,file);finalFiles.push(file);}catch(error){try{if(fs.existsSync(temp))fs.unlinkSync(temp);}catch{}throw error;}
+  if(active.has(p.id)||jobStore.hasLiveWork(p.id)){
+    const error=new Error('这篇仍在制作或等待其他操作，请稍候。');error.code='PROJECT_BUSY';error.statusCode=409;throw error;
   }
-  const dir=runDir(p,'作品打包');const output=path.join(versionDir(p),'温蒂漫画成品.zip');
-  const manifestFile=path.join(versionDir(p),'已确认分镜.md');jsonWrite(path.join(dir,'zip.json'),{output,files:[...finalFiles,manifestFile]});
-  const bundle=JSON.parse(await pythonRun(['zip',path.join(dir,'zip.json')])),actualBundle={bytes:fs.statSync(output).size,sha256:checksum(output)},expectedEntries=[...finalFiles,manifestFile].map(file=>path.basename(file)),actualEntries=Array.isArray(bundle.entries)?bundle.entries:[];
-  if(String(bundle.output)!==output||Number(bundle.bytes)!==actualBundle.bytes||String(bundle.sha256)!==actualBundle.sha256||actualEntries.length!==expectedEntries.length||actualEntries.some((entry,index)=>entry?.name!==expectedEntries[index]||!Number.isFinite(Number(entry.bytes))||!String(entry.sha256||'').match(/^[a-f0-9]{64}$/i)))throw new Error('成品包完整性校验失败，拒绝完成验收。');
-  p.accepted=true;p.acceptance={at:new Date().toISOString(),checks};p.bundle=path.relative(projectRoot,output);p.bundleIntegrity={bytes:actualBundle.bytes,sha256:actualBundle.sha256,entries:actualEntries,projectVersion:p.version,compositionVersion:COMPOSITION_VERSION};recordArtifact(p,'export:bundle','export',p.bundle,['story:audit'],{integrity:p.bundleIntegrity,projectVersion:p.version,compositionVersion:COMPOSITION_VERSION});p.status='complete';activity(p,'成品已保存到本地，可以下载整套图片。');saveProject(p);return p;
+  const snapshot=structuredClone(p),expectedRevision=Number(snapshot.revision),sourceFingerprint=acceptanceSourceFingerprint(snapshot),controller=new AbortController();
+  active.set(p.id,controller);
+  const projectRoot=projectDir(snapshot.id),versionRoot=versionDir(snapshot),finalDir=path.join(versionRoot,'成品'),output=path.join(versionRoot,'温蒂漫画成品.zip');
+  const token=crypto.randomUUID(),staging=path.join(versionRoot,`.accept-stage-${token}`),stagedFinalDir=path.join(staging,'成品'),stagedOutput=path.join(staging,'温蒂漫画成品.zip');
+  const manifestFile=path.join(versionRoot,'已确认分镜.md'),manifestSha=fs.existsSync(manifestFile)?checksum(manifestFile):null;
+  const backupRoot=path.join(projectRoot,'.制作记录',`accept-rollback-${token}`),backupFinal=path.join(backupRoot,'成品'),backupBundle=path.join(backupRoot,'温蒂漫画成品.zip');
+  let movedOldFinal=false,movedOldBundle=false,installedFinal=false,installedBundle=false,committed=false;
+  const assertNotPaused=()=>{if(controller.signal.aborted){const error=new Error('成品验收已暂停；原图保持不变。');error.code='ACCEPT_PAUSED';throw error;}};
+  const restorePublishedFiles=()=>{
+    if(installedBundle&&fs.existsSync(output))fs.unlinkSync(output);
+    if(installedFinal&&fs.existsSync(finalDir))fs.rmSync(finalDir,{recursive:true,force:true});
+    if(movedOldFinal&&fs.existsSync(backupFinal)){fs.mkdirSync(path.dirname(finalDir),{recursive:true});fs.renameSync(backupFinal,finalDir);}
+    if(movedOldBundle&&fs.existsSync(backupBundle)){fs.mkdirSync(path.dirname(output),{recursive:true});fs.renameSync(backupBundle,output);}
+  };
+  try{
+    if(snapshot.status!=='ready'||snapshot.pages.length!==snapshot.plan.pages.length||snapshot.pages.some(q=>!pageIsCurrent(snapshot,q))||!snapshot.storyQA?.pass||(snapshot.artifacts||[]).find(artifact=>artifact.id==='story:audit')?.valid!==true)throw new Error('请先完成全篇制作和校对。');
+    if(!Array.isArray(checks)||!CHECKS.every(c=>checks.includes(c)))throw new Error('请先完成成稿验收。');
+    if(!Number.isInteger(expectedRevision)||expectedRevision<0)throw new Error('缺少可用于提交验收的作品版本。');
+    fs.mkdirSync(stagedFinalDir,{recursive:true});
+    const stagedFiles=[],expectedEntries=[];
+    for(const q of snapshot.pages){
+      assertNotPaused();
+      if(q.projectVersion!==undefined&&Number(q.projectVersion)!==Number(snapshot.version))throw new Error(`第 ${q.number} 页来自旧作品版本，拒绝打包。`);
+      const source=inside(projectRoot,q.file),sourceIntegrity=await verifyImage(source),pageArtifact=(snapshot.artifacts||[]).find(artifact=>artifact.id===`page:${q.number}`&&artifact.file===q.file);
+      const expectedIntegrity=q.integrity||pageArtifact?.integrity;
+      if(!integrityMatches(expectedIntegrity,sourceIntegrity))throw new Error(integrityMismatchMessage(`第 ${q.number} 页源文件`));
+      const expectedSources=q.sourceIntegrity||pageArtifact?.sourceIntegrity;
+      if(Array.isArray(expectedSources))for(const expected of expectedSources){
+        const current=snapshot.panels?.[expected.key];
+        if(!current?.file||expected.file&&expected.file!==current.file)throw new Error(integrityMismatchMessage(`第 ${q.number} 页第 ${expected.key?.split('-')[1]||'?'} 格来源`));
+        const actual=await verifyImage(inside(projectRoot,current.file));
+        if(!integrityMatches(expected,actual))throw new Error(integrityMismatchMessage(`第 ${q.number} 页第 ${expected.key?.split('-')[1]||'?'} 格来源`));
+      }
+      const name=`${String(q.number).padStart(2,'0')}.png`,stagedFile=path.join(stagedFinalDir,name);
+      fs.copyFileSync(source,stagedFile);
+      const copied=await verifyImage(stagedFile);
+      if(!integrityMatches(sourceIntegrity,copied))throw new Error(integrityMismatchMessage(`第 ${q.number} 页成品副本`));
+      q.finalIntegrity=copied;q.finalFile=path.relative(projectRoot,path.join(finalDir,name));
+      stagedFiles.push(stagedFile);expectedEntries.push({name,bytes:copied.sizeBytes,sha256:copied.sha256});
+    }
+    assertNotPaused();
+    if(!manifestSha||checksum(manifestFile)!==manifestSha)throw new Error('已确认分镜在成品验收期间发生变化，拒绝打包。');
+    const stagedManifest=path.join(staging,'已确认分镜.md');fs.copyFileSync(manifestFile,stagedManifest);
+    expectedEntries.push({name:path.basename(manifestFile),bytes:fs.statSync(stagedManifest).size,sha256:checksum(stagedManifest)});
+    const dir=runDir(snapshot,'作品打包');jsonWrite(path.join(dir,'zip.json'),{output:stagedOutput,files:[...stagedFiles,stagedManifest]});
+    const bundle=JSON.parse(await pythonRun(['zip',path.join(dir,'zip.json')]));
+    const actualBundle={bytes:fs.statSync(stagedOutput).size,sha256:checksum(stagedOutput)},actualEntries=Array.isArray(bundle.entries)?bundle.entries:[];
+    if(String(bundle.output)!==stagedOutput||Number(bundle.bytes)!==actualBundle.bytes||String(bundle.sha256)!==actualBundle.sha256||actualEntries.length!==expectedEntries.length||actualEntries.some((entry,index)=>entry?.name!==expectedEntries[index]?.name||Number(entry?.bytes)!==expectedEntries[index]?.bytes||String(entry?.sha256||'').toLowerCase()!==expectedEntries[index]?.sha256))throw new Error('成品包完整性校验失败，拒绝完成验收。');
+
+    assertNotPaused();
+    const latest=readProject(snapshot.id);
+    if(Number(latest.revision)!==expectedRevision||Number(latest.version)!==Number(snapshot.version)||acceptanceSourceFingerprint(latest)!==sourceFingerprint){
+      const error=new Error(`作品已更新（当前版本 ${latest.revision}），本次验收未发布；请刷新后重试。`);error.code='REVISION_CONFLICT';error.statusCode=409;error.currentRevision=Number(latest.revision);error.expectedRevision=expectedRevision;throw error;
+    }
+    if(checksum(manifestFile)!==manifestSha)throw new Error('已确认分镜在成品发布前发生变化，拒绝打包。');
+    for(const q of snapshot.pages){
+      const source=inside(projectRoot,q.file),actual=await verifyImage(source),expected=q.integrity||(snapshot.artifacts||[]).find(artifact=>artifact.id===`page:${q.number}`&&artifact.file===q.file)?.integrity;
+      if(!integrityMatches(expected,actual))throw new Error(integrityMismatchMessage(`第 ${q.number} 页来源在发布前`));
+      const sourceEntries=q.sourceIntegrity||(snapshot.artifacts||[]).find(artifact=>artifact.id===`page:${q.number}`&&artifact.file===q.file)?.sourceIntegrity;
+      for(const entry of Array.isArray(sourceEntries)?sourceEntries:[]){
+        const panel=snapshot.panels?.[entry.key],panelFile=panel?.file&&inside(projectRoot,panel.file),panelActual=panelFile?await verifyImage(panelFile):null;
+        if(!panelActual||entry.file&&entry.file!==panel.file||!integrityMatches(entry,panelActual))throw new Error(integrityMismatchMessage(`第 ${q.number} 页分镜来源在发布前`));
+      }
+    }
+    assertNotPaused();
+
+    if(fs.existsSync(finalDir)||fs.existsSync(output))fs.mkdirSync(backupRoot,{recursive:true});
+    if(fs.existsSync(finalDir)){fs.renameSync(finalDir,backupFinal);movedOldFinal=true;}
+    if(fs.existsSync(output)){fs.renameSync(output,backupBundle);movedOldBundle=true;}
+    fs.renameSync(stagedFinalDir,finalDir);installedFinal=true;
+    fs.renameSync(stagedOutput,output);installedBundle=true;
+    const committedProject=structuredClone(snapshot),bundleRelative=path.relative(projectRoot,output);
+    committedProject.accepted=true;committedProject.acceptance={at:new Date().toISOString(),checks};committedProject.bundle=bundleRelative;
+    committedProject.bundleIntegrity={bytes:actualBundle.bytes,sha256:actualBundle.sha256,entries:actualEntries,projectVersion:committedProject.version,compositionVersion:COMPOSITION_VERSION};
+    recordArtifact(committedProject,'export:bundle','export',bundleRelative,['story:audit'],{integrity:committedProject.bundleIntegrity,projectVersion:committedProject.version,compositionVersion:COMPOSITION_VERSION});
+    committedProject.status='complete';committedProject.message='成品已保存到本地，可以下载整套图片。';
+    committedProject.progress={...committedProject.progress,phase:'complete',completedAt:new Date().toISOString()};
+    saveProject(committedProject,{expectedRevision});
+    Object.assign(p,committedProject);committed=true;return p;
+  }catch(error){
+    if(!committed){try{restorePublishedFiles();}catch(rollbackError){error.rollbackError=String(rollbackError.message||rollbackError).slice(0,500);}}
+    throw error;
+  }finally{
+    try{if(fs.existsSync(staging))fs.rmSync(staging,{recursive:true,force:true});}catch{}
+    if(active.get(p.id)===controller)active.delete(p.id);
+  }
+}
+
+function acceptanceSourceFingerprint(project){
+  return digest({
+    version:project.version,approvedHash:project.approved?.hash||null,planHash:project.plan?digest(project.plan):null,planPages:(project.plan?.pages||[]).map(page=>({number:page.number,panelCount:page.panels?.length||0})),
+    pages:(project.pages||[]).map(page=>({number:page.number,file:page.file,projectVersion:page.projectVersion,compositionVersion:page.compositionVersion,integrity:page.integrity,sourceIntegrity:page.sourceIntegrity,dependsOn:page.dependsOn,qa:page.qa?.pass})),
+    panels:Object.fromEntries(Object.entries(project.panels||{}).map(([key,panel])=>[key,{file:panel?.file,integrity:panel?.integrity,at:panel?.at}])),
+    artifacts:(project.artifacts||[]).filter(artifact=>artifact.kind==='page'||artifact.kind==='image'||artifact.id==='story:audit').map(artifact=>({id:artifact.id,file:artifact.file,valid:artifact.valid,integrity:artifact.integrity,sourceIntegrity:artifact.sourceIntegrity,compositionVersion:artifact.compositionVersion,projectVersion:artifact.projectVersion})),
+    storyQA:project.storyQA?.pass===true,
+  });
 }
