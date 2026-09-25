@@ -41,5 +41,6 @@ next-env.d.ts
 # Local stories and runtime records
 作品/
 .runtime/
+/.素材候选/.提案/
 __pycache__/
 *.tsbuildinfo
