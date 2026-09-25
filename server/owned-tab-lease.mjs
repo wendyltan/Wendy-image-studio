@@ -185,16 +185,33 @@ function latestReadinessEvidence(dir) {
     && readiness?.marker === BROWSER_READINESS_MARKER
     ? readiness
     : null;
-  return {evidence, sourceChecks: readiness?.sourceChecks || null};
+  return {evidence, sourceChecks: readiness?.sourceChecks || null,itemId:latest.itemId};
 }
 
 function assertBrowserReadinessEvidence(dir, lease) {
   const latest = latestReadinessEvidence(dir);
   const evidence = latest?.evidence;
   const checks = evidence?.checks;
-  const requiredChecks = ['targetUrlMatches', 'profileLoaded', 'chatModeActive', 'composerEnabled', 'attachmentEntryEnabled', 'imageCreationAvailable'];
+  const requiredChecks = ['targetUrlMatches', 'profileLoaded', 'chatModeEnabled', 'chatModeSelected', 'chatModeActive', 'composerEnabled', 'attachmentEntryEnabled', 'imageCreationAvailable'];
   const sourceChecks = latest?.sourceChecks;
-  const isValid = sourceChecks?.gateMarkerPresent === true
+  let expected=null,actual=null;
+  try{expected=JSON.parse(fs.readFileSync(path.join(dir,'browser-bootstrap-expected.json'),'utf8'));actual=JSON.parse(fs.readFileSync(path.join(dir,'browser-bootstrap-script.json'),'utf8'));}catch{}
+  const digest=value=>crypto.createHash('sha256').update(value).digest('hex');
+  const scriptValid=expected?.runId===lease?.runId
+    && actual?.runId===lease?.runId
+    && typeof expected?.code==='string'
+    && typeof actual?.code==='string'
+    && expected.code===actual.code
+    && expected.sha256===digest(expected.code)
+    && actual.sha256===digest(actual.code)
+    && actual.expectedSha256===expected.sha256
+    && actual.matchesExpected===true
+    && actual.itemId===latest?.itemId
+    && sourceChecks?.scriptMatchesExpected===true
+    && sourceChecks?.scriptSha256===actual.sha256
+    && sourceChecks?.expectedScriptSha256===expected.sha256;
+  const isValid = scriptValid
+    && sourceChecks?.gateMarkerPresent === true
     && sourceChecks?.gotoCount === 1
     && sourceChecks?.createTabCount === 0
     && Number.isInteger(sourceChecks?.checkCount) && sourceChecks.checkCount >= 0 && sourceChecks.checkCount <= 1
@@ -219,6 +236,7 @@ function assertBrowserReadinessEvidence(dir, lease) {
     && normalizeChatUrl(evidence?.currentUrl) === normalizeChatUrl(evidence?.expectedUrl)
     && evidence?.imageCreationPath === 'chat-composer'
     && checks?.loginRequired === false
+    && typeof checks?.explicitChatMode === 'boolean'
     && requiredChecks.every(check => checks?.[check] === true);
   if (!isValid) {
     const error = new Error('owned tab 不能进入 uploading：当前 run 最近一次 CUA 调用缺少匹配的、通过校验的 WENDI_BROWSER_READINESS_V1 证据。');
@@ -234,7 +252,7 @@ function assertBrowserReadinessEvidence(dir, lease) {
     expectedUrl: normalizeChatUrl(evidence.expectedUrl),
     ready: true,
     imageCreationPath: evidence.imageCreationPath,
-    checks: Object.fromEntries(requiredChecks.map(check => [check, true]).concat([['loginRequired', false]])),
+    checks: Object.fromEntries(requiredChecks.map(check => [check, true]).concat([['loginRequired', false],['explicitChatMode',checks.explicitChatMode]])),
   };
 }
 

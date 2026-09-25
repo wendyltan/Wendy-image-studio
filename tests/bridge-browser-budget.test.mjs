@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {dispatchChatGptWebJob} from '../server/chatgpt-web-provider.mjs';
 import {BROWSER_CLEANUP_MARKER,BROWSER_TOOL_BUSINESS_CALL_BUDGET,BROWSER_TOOL_CLEANUP_CALL_BUDGET,BROWSER_TOOL_STAGE_BUDGETS,browserToolStage,readBrowserToolBudget,runCodex} from '../server/bridge.mjs';
+import {chatGptWebImagePrompt} from '../server/web-executor-instructions.mjs';
 
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'wendi-browser-budget-'));
 
@@ -30,8 +32,16 @@ const emitCompleted=item=>console.log(JSON.stringify({type:'item.completed',item
 const emitIntentHelper=index=>{const item={id:'item_'+index,type:'command_execution',command:'node run-manifest.mjs submission-intent --manifest-file fixture/web-generation.json',aggregated_output:'{"ok":true,"submissionIntent":true}'};console.log(JSON.stringify({type:'item.started',item}));console.log(JSON.stringify({type:'item.completed',item}));};
 const emitFalseIntentHelper=index=>{const item={id:'item_'+index,type:'command_execution',command:'node run-manifest.mjs failed --submission-intent false',aggregated_output:'{"ok":true,"stage":"failed","submissionIntent":false}'};console.log(JSON.stringify({type:'item.started',item}));console.log(JSON.stringify({type:'item.completed',item}));};
 const calls=mode==='initialization-budget'?['init','create','navigation','entry','upload','upload','intent-helper','submit','download','download']:mode==='repeated-initialization'?['init','init','create','navigation','entry']:mode==='four-business-close'?['bootstrap','bootstrap','bootstrap','upload','close']:mode==='implicit-cleanup'?['bootstrap','bootstrap','bootstrap','upload','implicit-close']:mode==='implicit-close-abuse'?['bootstrap','bootstrap','bootstrap','upload','abuse']:mode==='marked-close-abuse'?['bootstrap','bootstrap','bootstrap','upload','abuse']:mode==='close-abuse'?['bootstrap','bootstrap','bootstrap','abuse','business']:mode==='lifecycle-classification'?['diagnostic-ax','entry-diagnostic','upload','submit','download','close']:mode==='single-select-upload'?['duplicate-action']:mode==='duplicate-upload'?['upload','duplicate-action']:mode==='duplicate-create'?['duplicate-action']:mode==='pre-intent'?['bootstrap','bootstrap','bootstrap','upload','upload','upload']:mode==='post-intent'||mode==='post-intent-delayed'?['bootstrap','bootstrap','bootstrap','intent-helper','submit','submit']:mode==='intent-and-send'?['bootstrap','bootstrap','bootstrap','upload','intent-helper','submit']:mode==='false-intent-helper'?['bootstrap','bootstrap','bootstrap','false-intent-helper']:['business','business','business','business','business'];
+if(mode==='readiness-syntax-error-cleanup'){
+  const item={id:'bootstrap-parse-error',type:'mcp_tool_call',server:'cua_repl',tool:'js',arguments:{code:'// WENDI_BROWSER_READINESS_GATE_V1\\nconst broken=(;'},result:{content:[{type:'text',text:"[6:197-6:198]: Expected ')'"}]}};
+  console.log(JSON.stringify({type:'item.started',item}));
+  console.log(JSON.stringify({type:'item.completed',item}));
+  const cleanup={id:'cleanup-after-parse-error',type:'mcp_tool_call',server:'cua_repl',tool:'js',arguments:{code:'await tab.close()'},result:{content:[{type:'text',text:'closed'}]}};
+  console.log(JSON.stringify({type:'item.completed',item:cleanup}));
+  process.exit(0);
+}
 if(mode.startsWith('readiness-marker-oversized')){
-  const evidence={marker:'WENDI_BROWSER_READY_V1',schemaVersion:1,ready:true,runId,ownedTabId:'tab-fixture',currentUrl:'https://chatgpt.com/',expectedUrl:'https://chatgpt.com/',imageCreationPath:'chat-composer',checks:{targetUrlMatches:true,loginRequired:false,profileLoaded:true,chatModeActive:true,composerEnabled:true,attachmentEntryEnabled:true,imageCreationAvailable:true}};
+  const evidence={marker:'WENDI_BROWSER_READY_V1',schemaVersion:1,ready:true,runId,ownedTabId:'tab-fixture',currentUrl:'https://chatgpt.com/',expectedUrl:'https://chatgpt.com/',imageCreationPath:'chat-composer',checks:{targetUrlMatches:true,loginRequired:false,profileLoaded:true,explicitChatMode:true,chatModeEnabled:true,chatModeSelected:true,chatModeActive:true,composerEnabled:true,attachmentEntryEnabled:true,imageCreationAvailable:true}};
   const code='/* '+'X'.repeat(950)+' */ // WENDI_BROWSER_READINESS_GATE_V1\\n globalThis.__wendiOwnedTab; globalThis.__wendiOwnedTabId; await tab.goto("https://chatgpt.com/"); const currentUrl=await tab.url(); await chatMode.check(); const ax=await tab.getAXState({emit:false});';
   const item={id:'readiness',type:'mcp_tool_call',server:'cua_repl',tool:'js',arguments:{timeout_ms:30000,code},result:{content:[{type:'text',text:'WENDI_BROWSER_READY_V1:'+JSON.stringify(evidence)}],_meta:{browser_use:{largeDiagnostic:'D'.repeat(12000),screenshot:{pageUrl:'https://chatgpt.com/',tabId:'tab-fixture',url:'data:image/png;base64,'+'A'.repeat(12000)}}}}};
   console.log(JSON.stringify({type:'item.completed',item}));
@@ -58,11 +68,29 @@ for(let i=0;i<codes.length;i++){
   await new Promise(resolve=>setTimeout(resolve,150));
   console.log(JSON.stringify({type:'item.completed',item}));
 }
+
 fs.writeFileSync(after,'1');
 process.exit(0);
 `;
   fs.writeFileSync(bin,source,{mode:0o755});
   return {dir,codexBin:bin,after};
+}
+
+function readinessContractFixture({drift=false,failed=false,cleanup=false}={}){
+  const dir=fs.mkdtempSync(path.join(root,'readiness-contract-')),runId=path.basename(dir),bin=path.join(dir,'fixture-worker.mjs');
+  const prompt=chatGptWebImagePrompt({outputFile:path.join(dir,'out.png'),manifestFile:path.join(dir,'web-generation.json'),prompt:'fixture',runId});
+  const expected=prompt.match(/<bootstrap_cua_example>\n([\s\S]*?)\n<\/bootstrap_cua_example>/)?.[1];
+  assert.ok(expected);
+  const actual=drift?expected.replace('return name.toLocaleLowerCase() === label.toLocaleLowerCase();','return name.toLocaleLowerCase().includes(label.toLocaleLowerCase());'):expected;
+  if(drift)assert.notEqual(actual,expected);
+  const checks={targetUrlMatches:true,loginRequired:false,profileLoaded:true,explicitChatMode:true,chatModeEnabled:true,chatModeSelected:!failed,chatModeActive:!failed,composerEnabled:true,attachmentEntryEnabled:true,imageCreationAvailable:!failed};
+  const readiness={marker:'WENDI_BROWSER_READY_V1',schemaVersion:1,ready:!failed,reason:failed?'ui_not_ready':null,currentUrl:'https://chatgpt.com/',expectedUrl:'https://chatgpt.com/',ownedTabId:'tab-fixture',runId,imageCreationPath:failed?null:'chat-composer',checks};
+  const ax=failed?'WENDI_BROWSER_AX_V1:'+JSON.stringify({schemaVersion:1,controls:[{kind:'sidebar_filter',label:'筛选聊天和工作',observed:true,selected:false,disabled:false},{kind:'chat_mode',label:'聊天',observed:true,selected:true,disabled:false},{kind:'work_mode',label:'工作',observed:true,selected:false,disabled:false},{kind:'composer',label:'PRIVATE_PROMPT',observed:true,disabled:false},{kind:'attachment',label:'附件按钮',observed:true,disabled:false},{kind:'profile',label:'PRIVATE_ACCOUNT',observed:true,disabled:false}]})+'\n':'';
+  const result=ax+'WENDI_BROWSER_READY_V1:'+JSON.stringify(readiness);
+  const source=`#!/usr/bin/env node\nconst item=${JSON.stringify({id:'readiness-contract',type:'mcp_tool_call',server:'cua_repl',tool:'js',arguments:{code:actual},result:{content:[{type:'text',text:result}]}})};console.log(JSON.stringify({type:'item.started',item}));console.log(JSON.stringify({type:'item.completed',item}));${cleanup?`const close=${JSON.stringify({id:'cleanup-after-readiness',type:'mcp_tool_call',server:'cua_repl',tool:'js',arguments:{code:'await tab.close()'},result:{content:[{type:'text',text:'closed'}]}})};console.log(JSON.stringify({type:'item.completed',item:close}));`:''}`;
+  fs.writeFileSync(bin,source,{mode:0o755});
+  fs.writeFileSync(path.join(dir,'owned-tab-lease.json'),JSON.stringify({schemaVersion:1,runId,requestId:'11111111-1111-4111-8111-111111111111',sessionName:'fixture',ownedTabId:'tab-fixture',createdAt:new Date().toISOString(),state:'created',cleanupStatus:'open',cleanupVerifiedAt:null,cleanupError:null,kernelReset:false,updatedAt:new Date().toISOString()}));
+  return {dir,codexBin:bin,prompt,expected,actual};
 }
 
 async function flush(){await new Promise(resolve=>setImmediate(resolve));}
@@ -142,7 +170,7 @@ test('oversized completed CUA output preserves only validated readiness marker e
   assert.equal(event.truncated,true);
   assert.equal(event.item.timeout_ms,30000);
   assert.ok(event.item.resultText.length<=800);
-  assert.deepEqual(event.item.browserReadinessEvidence,{complete:true,source:'cua_completed_result',marker:'WENDI_BROWSER_READY_V1',schemaVersion:1,ready:true,runId:path.basename(run.dir),ownedTabId:'tab-fixture',currentUrl:'https://chatgpt.com/',expectedUrl:'https://chatgpt.com/',imageCreationPath:'chat-composer',checks:{targetUrlMatches:true,loginRequired:false,profileLoaded:true,chatModeActive:true,composerEnabled:true,attachmentEntryEnabled:true,imageCreationAvailable:true},sourceChecks:{gateMarkerPresent:true,gotoCount:1,createTabCount:0,axReadCount:1,urlReadCount:1,getTabCount:0,setFilesCount:0,clickCount:0,pasteCount:0,setValueCount:0,typeTextCount:0,pressKeyCount:0,checkCount:1,ownedHandleReferencePresent:true}});
+  assert.deepEqual(event.item.browserReadinessEvidence,{complete:true,source:'cua_completed_result',marker:'WENDI_BROWSER_READY_V1',schemaVersion:1,ready:true,runId:path.basename(run.dir),ownedTabId:'tab-fixture',currentUrl:'https://chatgpt.com/',expectedUrl:'https://chatgpt.com/',imageCreationPath:'chat-composer',checks:{targetUrlMatches:true,loginRequired:false,profileLoaded:true,explicitChatMode:true,chatModeEnabled:true,chatModeSelected:true,chatModeActive:true,composerEnabled:true,attachmentEntryEnabled:true,imageCreationAvailable:true},sourceChecks:{gateMarkerPresent:true,gotoCount:1,createTabCount:0,axReadCount:1,urlReadCount:1,getTabCount:0,setFilesCount:0,clickCount:0,pasteCount:0,setValueCount:0,typeTextCount:0,pressKeyCount:0,checkCount:1,ownedHandleReferencePresent:true}});
   assert.doesNotMatch(event.item.code,/WENDI_BROWSER_READINESS_GATE_V1/);
   assert.doesNotMatch(JSON.stringify(event),/D{100}|A{100}/);
   assert.equal(fs.statSync(path.join(run.dir,'browser-readiness-latest.json')).mode&0o777,0o600);
@@ -153,6 +181,65 @@ test('later completed CUA call atomically clears an older readiness sidecar',asy
   await runCodex({codexBin:run.codexBin,dir:run.dir,prompt:'fixture',browserMode:'chrome',timeoutMs:5000});
   const latest=JSON.parse(fs.readFileSync(path.join(run.dir,'browser-readiness-latest.json'),'utf8'));
   assert.equal(latest.itemId,'readiness-unready');assert.equal(latest.browserReadinessEvidence,null);
+  assert.equal(latest.lastReadinessDiagnostic.itemId,'readiness');
+  assert.equal(latest.lastReadinessDiagnostic.ready,true);
+});
+
+test('bootstrap parse failure keeps its exact dispatched script and diagnostic after cleanup',async()=>{
+  const run=fixture('readiness-syntax-error-cleanup',{lease:false});
+  await runCodex({codexBin:run.codexBin,dir:run.dir,prompt:'fixture',browserMode:'chrome',timeoutMs:5000});
+  const saved=JSON.parse(fs.readFileSync(path.join(run.dir,'browser-bootstrap-script.json'),'utf8'));
+  assert.equal(saved.code,'// WENDI_BROWSER_READINESS_GATE_V1\nconst broken=(;');
+  assert.equal(saved.itemId,'bootstrap-parse-error');
+  const latest=JSON.parse(fs.readFileSync(path.join(run.dir,'browser-readiness-latest.json'),'utf8'));
+  assert.equal(latest.itemId,'cleanup-after-parse-error');
+  assert.equal(latest.browserReadinessEvidence,null);
+  assert.match(latest.lastReadinessDiagnostic.resultText,/Expected '\)'/);
+  assert.equal(latest.lastReadinessDiagnostic.itemId,'bootstrap-parse-error');
+});
+
+test('the exact dispatched bootstrap script retains its per-run expected hash and readiness evidence',async()=>{
+  const run=readinessContractFixture();
+  await runCodex({codexBin:run.codexBin,dir:run.dir,prompt:run.prompt,image:true,browserMode:'chrome',role:'browser-executor',timeoutMs:5000});
+  const expected=JSON.parse(fs.readFileSync(path.join(run.dir,'browser-bootstrap-expected.json'),'utf8'));
+  const actual=JSON.parse(fs.readFileSync(path.join(run.dir,'browser-bootstrap-script.json'),'utf8'));
+  const latest=JSON.parse(fs.readFileSync(path.join(run.dir,'browser-readiness-latest.json'),'utf8'));
+  assert.equal(expected.code,run.expected);
+  assert.equal(expected.sha256,crypto.createHash('sha256').update(run.expected).digest('hex'));
+  assert.equal(actual.code,run.actual);
+  assert.equal(actual.matchesExpected,true);
+  assert.equal(latest.browserReadinessEvidence?.sourceChecks?.scriptMatchesExpected,true);
+});
+
+test('a syntax-valid broad checkbox rewrite is recorded as drift and has no uploading evidence',async()=>{
+  const run=readinessContractFixture({drift:true});
+  await runCodex({codexBin:run.codexBin,dir:run.dir,prompt:run.prompt,image:true,browserMode:'chrome',role:'browser-executor',timeoutMs:5000});
+  const actual=JSON.parse(fs.readFileSync(path.join(run.dir,'browser-bootstrap-script.json'),'utf8'));
+  const latest=JSON.parse(fs.readFileSync(path.join(run.dir,'browser-readiness-latest.json'),'utf8'));
+  assert.equal(actual.code,run.actual);
+  assert.equal(actual.matchesExpected,false);
+  assert.equal(latest.browserReadinessEvidence,null);
+  assert.equal(latest.lastReadinessDiagnostic.scriptMatchesExpected,false);
+});
+
+test('readiness failure keeps sanitized controls and hashes after a cleanup call',async()=>{
+  const run=readinessContractFixture({failed:true,cleanup:true});
+  await runCodex({codexBin:run.codexBin,dir:run.dir,prompt:run.prompt,image:true,browserMode:'chrome',role:'browser-executor',timeoutMs:5000});
+  const latest=JSON.parse(fs.readFileSync(path.join(run.dir,'browser-readiness-latest.json'),'utf8'));
+  assert.equal(latest.itemId,'cleanup-after-readiness');
+  assert.equal(latest.browserReadinessEvidence,null);
+  assert.equal(latest.lastReadinessDiagnostic.itemId,'readiness-contract');
+  assert.equal(latest.lastReadinessDiagnostic.scriptMatchesExpected,true);
+  assert.equal(latest.lastReadinessDiagnostic.runId,path.basename(run.dir));
+  assert.equal(latest.lastReadinessDiagnostic.ownedTabId,'tab-fixture');
+  assert.equal(latest.lastReadinessDiagnostic.controls[0].kind,'sidebar_filter');
+  assert.equal(latest.lastReadinessDiagnostic.controls[1].kind,'chat_mode');
+  assert.equal(latest.lastReadinessDiagnostic.controls[1].selected,true);
+  assert.equal(latest.lastReadinessDiagnostic.readinessChecks.chatModeActive,false);
+  assert.doesNotMatch(JSON.stringify(latest.lastReadinessDiagnostic),/PRIVATE_PROMPT|PRIVATE_ACCOUNT/);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(run.dir,'browser-bootstrap-expected.json'),'utf8')).code,run.expected);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(run.dir,'browser-bootstrap-script.json'),'utf8')).code,run.actual);
+  assert.equal(fs.statSync(path.join(run.dir,'browser-readiness-latest.json')).mode&0o777,0o600);
 });
 
 test('required one-time CUA environment initialization does not consume bootstrap slots',async()=>{

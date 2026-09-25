@@ -21,6 +21,25 @@ test('generated upload instructions require full AX snapshots for menu and attac
   assert.match(routeB,/添加照片和文件/);
 });
 
+test('upload route failure emits a bounded snapshot of actual attachment controls',async()=>{
+  const instruction=chatGptWebImagePrompt({outputFile:'/tmp/out.png',manifestFile:'/tmp/run/web-generation.json',prompt:'fixture',referenceFiles:[],runId:'run-fixture'});
+  const fragment=instruction.match(/<upload_entry_diagnostic_cua_fragment>\n([\s\S]*?)\n<\/upload_entry_diagnostic_cua_fragment>/)?.[1];
+  assert.ok(fragment);
+  const syntax=await import('node:child_process').then(({spawnSync})=>spawnSync(process.execPath,['--check','--input-type=module'],{input:fragment,encoding:'utf8'}));
+  assert.equal(syntax.status,0,syntax.stderr);
+  assert.match(fragment,/tab\.getAXState\(\{emit:false,disableDiffing:true\}\)/);
+  assert.match(fragment,/WENDI_UPLOAD_ENTRY_V1:/);
+  assert.match(fragment,/\.slice\(0,6\)/);
+  assert.match(instruction,/B 也失败[\s\S]*upload_entry_diagnostic_cua_fragment/);
+  const {runInNewContext}=await import('node:vm');
+  let output='';
+  const ax='1 button 打开个人资料菜单\n2 button 添加文件等内容\n3 menu item 添加照片和文件\n4 button 发送';
+  await runInNewContext(`(async()=>{${fragment}})()`,{tab:{getAXState:async options=>{assert.equal(options.disableDiffing,true);return ax;}},nodeRepl:{write:value=>{output=value;}}});
+  const evidence=JSON.parse(output.slice('WENDI_UPLOAD_ENTRY_V1:'.length));
+  assert.deepEqual(Array.from(evidence.controls),['2 button 添加文件等内容','3 menu item 添加照片和文件']);
+  assert.equal(evidence.matchingControlCount,2);
+});
+
 test('structured upload evidence accepts a complete ordered attachment gate',()=>{
   const result=validateUploadEvidence(complete,{expectedCount:2,expectedNames:names,requireComplete:true});
   assert.equal(result.ok,true);

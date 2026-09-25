@@ -28,7 +28,7 @@ function appendReadinessEvent(run, {overrides = {}, sourceChecks = {}, eventType
     ownedTabId: 'tab-fixture', runId: run.runId,
     currentUrl: 'https://chatgpt.com/', expectedUrl: 'https://chatgpt.com/',
     imageCreationPath: 'chat-composer',
-    checks: {targetUrlMatches: true, loginRequired: false, profileLoaded: true, chatModeActive: true, composerEnabled: true, attachmentEntryEnabled: true, imageCreationAvailable: true},
+    checks: {targetUrlMatches: true, loginRequired: false, profileLoaded: true, explicitChatMode: true, chatModeEnabled: true, chatModeSelected: true, chatModeActive: true, composerEnabled: true, attachmentEntryEnabled: true, imageCreationAvailable: true},
     ...overrides,
   };
   const event = {
@@ -39,7 +39,7 @@ function appendReadinessEvent(run, {overrides = {}, sourceChecks = {}, eventType
       ...(compactSummary ? {code: `${source.slice(0,800)}…[truncated]`} : {arguments: {code: source}}),
       ...(!omitEvidence ? {browserReadinessEvidence: {
         complete: true, source: 'cua_completed_result',
-        sourceChecks: {gateMarkerPresent: true, gotoCount: 1, createTabCount: 0, checkCount: 0, axReadCount: 1, urlReadCount: 1, getTabCount: 0, setFilesCount: 0, clickCount: 0, pasteCount: 0, setValueCount: 0, typeTextCount: 0, pressKeyCount: 0, ownedHandleReferencePresent: true, ...sourceChecks},
+        sourceChecks: {gateMarkerPresent: true, gotoCount: 1, createTabCount: 0, checkCount: 0, axReadCount: 1, urlReadCount: 1, getTabCount: 0, setFilesCount: 0, clickCount: 0, pasteCount: 0, setValueCount: 0, typeTextCount: 0, pressKeyCount: 0, ownedHandleReferencePresent: true, scriptMatchesExpected:true,scriptSha256:crypto.createHash('sha256').update(source).digest('hex'),expectedScriptSha256:crypto.createHash('sha256').update(source).digest('hex'), ...sourceChecks},
         ...evidence,
       }} : {}),
     },
@@ -51,6 +51,9 @@ function appendReadinessEvent(run, {overrides = {}, sourceChecks = {}, eventType
       itemId: 'item-readiness', server: 'cua_repl', tool: 'js',
       browserReadinessEvidence: omitEvidence ? null : event.item.browserReadinessEvidence,
     }));
+    const expectedSha256=crypto.createHash('sha256').update(source).digest('hex');
+    fs.writeFileSync(path.join(run.dir,'browser-bootstrap-expected.json'),JSON.stringify({schemaVersion:1,runId:run.runId,sha256:expectedSha256,code:source}));
+    fs.writeFileSync(path.join(run.dir,'browser-bootstrap-script.json'),JSON.stringify({schemaVersion:1,runId:run.runId,itemId:'item-readiness',sha256:expectedSha256,expectedSha256,matchesExpected:true,code:source}));
   }
 }
 
@@ -154,6 +157,44 @@ test('uploading requires fresh complete readiness from this run own CUA bootstra
   assert.equal(uploading.browserReadiness.ready, true);
   assert.equal(uploading.browserReadiness.runId, run.runId);
   assert.equal(uploading.browserReadiness.ownedTabId, 'tab-fixture');
+});
+
+test('a retained readiness diagnostic never authorizes uploading after cleanup', () => {
+  const run = fixture();
+  ensureOwnedTabLease(run);
+  reserveOwnedTabCreate(run);
+  markOwnedTabStage({...run, state: 'created', ownedTabId: 'tab-fixture'});
+  appendReadinessEvent(run);
+  const file=path.join(run.dir,'browser-readiness-latest.json');
+  const latest=JSON.parse(fs.readFileSync(file,'utf8'));
+  fs.writeFileSync(file,JSON.stringify({...latest,itemId:'item-cleanup',browserReadinessEvidence:null,lastReadinessDiagnostic:{itemId:'item-readiness',ready:true}}));
+  assert.throws(() => markOwnedTabStage({...run, state: 'uploading'}), error => error.code === 'OWNED_TAB_READINESS_REQUIRED');
+});
+
+test('a syntactically valid broadened chat checkbox script cannot authorize uploading', () => {
+  const run=fixture();ensureOwnedTabLease(run);reserveOwnedTabCreate(run);
+  markOwnedTabStage({...run,state:'created',ownedTabId:'tab-fixture'});
+  appendReadinessEvent(run);
+  const file=path.join(run.dir,'browser-bootstrap-script.json');
+  const actual=JSON.parse(fs.readFileSync(file,'utf8'));
+  actual.code=actual.code.replace('await tab.goto','const broadChatMode=/\\bcheckbox\\b[^\\n]*(?:聊天|Chat)/; await tab.goto');
+  actual.sha256=crypto.createHash('sha256').update(actual.code).digest('hex');
+  actual.matchesExpected=false;
+  fs.writeFileSync(file,JSON.stringify(actual));
+  assert.throws(()=>markOwnedTabStage({...run,state:'uploading'}),error=>error.code==='OWNED_TAB_READINESS_REQUIRED');
+});
+
+test('ready true missing any required readiness contract field cannot authorize uploading', () => {
+  for(const key of ['targetUrlMatches','loginRequired','profileLoaded','explicitChatMode','chatModeEnabled','chatModeSelected','chatModeActive','composerEnabled','attachmentEntryEnabled','imageCreationAvailable']){
+    const run=fixture();ensureOwnedTabLease(run);reserveOwnedTabCreate(run);
+    markOwnedTabStage({...run,state:'created',ownedTabId:'tab-fixture'});
+    appendReadinessEvent(run);
+    const file=path.join(run.dir,'browser-readiness-latest.json');
+    const latest=JSON.parse(fs.readFileSync(file,'utf8'));
+    delete latest.browserReadinessEvidence.checks[key];
+    fs.writeFileSync(file,JSON.stringify(latest));
+    assert.throws(()=>markOwnedTabStage({...run,state:'uploading'}),error=>error.code==='OWNED_TAB_READINESS_REQUIRED',key);
+  }
 });
 
 test('created and verified close both require the reserved real handle', () => {

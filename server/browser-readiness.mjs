@@ -63,6 +63,32 @@ export function evaluateBrowserReadiness({currentUrl, expectedUrl, ax, ownedTabI
 
 export const BROWSER_READINESS_EVALUATOR_SOURCE = `(${evaluateBrowserReadiness.toString()})`;
 
+/** Keep only control identity and state. Never persist AX text or account names. */
+export function summarizeBrowserReadinessControls(ax) {
+  const controls = new Map();
+  for (const line of String(ax || '').split(/\r?\n/)) {
+    let kind = null;
+    if (/\bcheckbox\b/i.test(line)) {
+      const tail = line.slice(line.search(/\bcheckbox\b/i) + 'checkbox'.length)
+        .trim()
+        .replace(/^\s*(?:\([^)]*\)|\[(?:checked|unchecked)\])\s*/i, '')
+        .replace(/^Description:\s*/i, '')
+        .split(/\s*(?:,\s*)?(?:Value:|ID:|Secondary Actions:)/i, 1)[0]
+        .trim().replace(/^['"]|['"]$/g, '').toLocaleLowerCase();
+      if (/^(?:筛选聊天和工作|filter chats and work)$/.test(tail)) kind = 'sidebar_filter';
+      else if (tail === '聊天' || tail === 'chat') kind = 'chat_mode';
+      else if (tail === '工作' || tail === 'work') kind = 'work_mode';
+    } else if (/(?:\bpop up button\b|\bbutton\b)/i.test(line) && /(?:个人资料.{0,12}菜单|profile.{0,12}menu|account.{0,12}menu)/i.test(line)) kind = 'profile';
+    else if (/(?:\btext entry area\b|\btextbox\b)/i.test(line) && /(?:给 ChatGPT 发消息|与 ChatGPT 聊天|chat with chatgpt|message)/i.test(line)) kind = 'composer';
+    else if (/\bbutton\b/i.test(line) && /(?:添加文件等|添加照片和文件|上传照片|上传文件|add files|upload files|attach files)/i.test(line)) kind = 'attachment';
+    if (!kind || controls.has(kind)) continue;
+    controls.set(kind, {kind, label: {sidebar_filter:'筛选聊天和工作',chat_mode:'聊天',work_mode:'工作',composer:'输入框',attachment:'附件按钮',profile:'账号菜单'}[kind], observed:true, disabled:/\(disabled\b/i.test(line), ...(/(?:sidebar_filter|chat_mode|work_mode)/.test(kind) ? {selected:/(?:Value:\s*1|\[checked\]|\(checked\))/i.test(line)} : {})});
+  }
+  return {schemaVersion:1,controls:['sidebar_filter','chat_mode','work_mode','composer','attachment','profile'].map(kind=>controls.get(kind)||{kind,label:{sidebar_filter:'筛选聊天和工作',chat_mode:'聊天',work_mode:'工作',composer:'输入框',attachment:'附件按钮',profile:'账号菜单'}[kind],observed:false,disabled:null,...(/(?:sidebar_filter|chat_mode|work_mode)/.test(kind)?{selected:null}:{})})};
+}
+
+export const BROWSER_READINESS_CONTROLS_SOURCE = `(${summarizeBrowserReadinessControls.toString()})`;
+
 /** Poll only fresh page-state reads; callers inject the supported wait API. */
 export async function waitForBrowserReadiness({
   read,

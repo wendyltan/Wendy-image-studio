@@ -147,3 +147,48 @@ test('generated cleanup CUA example parses as a top-level module and closes once
   const syntax=spawnSync(process.execPath,['--check','--input-type=module'],{input:example,encoding:'utf8'});
   assert.equal(syntax.status,0,syntax.stderr);
 });
+
+test('generated bootstrap CUA is a complete syntax-checked copy of the frozen evaluator',()=>{
+  const instruction=chatGptWebImagePrompt({outputFile:'/tmp/out.png',manifestFile:'/tmp/run/web-generation.json',prompt:'fixture',referenceFiles:[],requestId:'11111111-1111-4111-8111-111111111111',runId:'run-fixture'});
+  const example=instruction.match(/<bootstrap_cua_example>\n([\s\S]*?)\n<\/bootstrap_cua_example>/)?.[1];
+  assert.ok(example,'a complete bootstrap CUA script must be provided');
+  assert.ok(example.includes(BROWSER_READINESS_EVALUATOR_SOURCE),'the evaluator must be copied exactly');
+  assert.ok(example.includes(BROWSER_READINESS_WAITER_SOURCE),'the waiter must be copied exactly');
+  const syntax=spawnSync(process.execPath,['--check','--input-type=module'],{input:example,encoding:'utf8'});
+  assert.equal(syntax.status,0,syntax.stderr);
+  assert.equal((example.match(/\.goto\s*\(/g)||[]).length,1);
+  assert.doesNotMatch(example,/\.setFiles\s*\(|\.click\s*\(|cua\.createBrowserTab|cua\.getTab/);
+  assert.match(example,/runId="run-fixture"/);
+});
+
+test('complete bootstrap CUA reads the current AX tree and emits this run readiness only',async()=>{
+  const instruction=chatGptWebImagePrompt({outputFile:'/tmp/out.png',manifestFile:'/tmp/run/web-generation.json',prompt:'fixture',referenceFiles:[],runId:'run-fixture'});
+  const example=instruction.match(/<bootstrap_cua_example>\n([\s\S]*?)\n<\/bootstrap_cua_example>/)?.[1];
+  let gotoCount=0,axReads=0,output='';
+  const tab={id:'tab-current',goto:async url=>{assert.equal(url,'https://chatgpt.com/');gotoCount+=1;},url:async()=>home+'/',getAXState:async options=>{assert.equal(options.disableDiffing,true);axReads+=1;return observedReadyAx;},playwright:{waitForTimeout:async()=>{throw new Error('ready page should not wait');}}};
+  await runInNewContext(`(async()=>{${example}})()`,{globalThis:{__wendiOwnedTab:tab,__wendiOwnedTabId:'tab-current'},nodeRepl:{write:value=>{output=value;}},URL});
+  assert.equal(gotoCount,1);
+  assert.equal(axReads,1);
+  const readiness=JSON.parse(output.slice('WENDI_BROWSER_READY_V1:'.length));
+  assert.equal(readiness.ready,true);
+  assert.equal(readiness.runId,'run-fixture');
+  assert.equal(readiness.ownedTabId,'tab-current');
+});
+
+test('failed bootstrap emits only selected and disabled states for relevant AX controls',async()=>{
+  const instruction=chatGptWebImagePrompt({outputFile:'/tmp/out.png',manifestFile:'/tmp/run/web-generation.json',prompt:'fixture',referenceFiles:[],runId:'run-fixture'});
+  const example=instruction.match(/<bootstrap_cua_example>\n([\s\S]*?)\n<\/bootstrap_cua_example>/)?.[1];
+  const ax=`36 checkbox Description: 筛选聊天和工作, Value: 0\n199 checkbox 聊天, Value: 1\n200 checkbox 工作, Value: 0\n192 pop up button Description: Wu Wendi，打开个人资料菜单\n214 button (disabled) Description: 添加文件等内容\n215 text entry area (settable) Description: 给 ChatGPT 发消息, Value: 私密提示词`;
+  let time=0;const outputs=[];
+  const tab={id:'tab-current',goto:async()=>{},url:async()=>home+'/',getAXState:async()=>{time=60001;return ax;},playwright:{waitForTimeout:async()=>{}}};
+  await runInNewContext(`(async()=>{${example}})()`,{globalThis:{__wendiOwnedTab:tab,__wendiOwnedTabId:'tab-current'},nodeRepl:{write:value=>{outputs.push(value);}},URL,Date:{now:()=>time}});
+  const controlsLine=outputs.find(line=>line.startsWith('WENDI_BROWSER_AX_V1:'));
+  assert.ok(controlsLine);
+  const controls=JSON.parse(controlsLine.slice('WENDI_BROWSER_AX_V1:'.length)).controls;
+  assert.equal(controls.find(item=>item.kind==='sidebar_filter')?.selected,false);
+  assert.equal(controls.find(item=>item.kind==='chat_mode')?.selected,true);
+  assert.equal(controls.find(item=>item.kind==='composer')?.disabled,false);
+  assert.equal(controls.find(item=>item.kind==='attachment')?.disabled,true);
+  assert.equal(controls.find(item=>item.kind==='profile')?.disabled,false);
+  assert.doesNotMatch(controlsLine,/Wu Wendi|私密提示词/);
+});

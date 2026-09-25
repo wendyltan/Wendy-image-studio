@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {spawn, execFileSync} from 'node:child_process';
 import readline from 'node:readline';
+import vm from 'node:vm';
 import {APP} from './workflow.mjs';
 import {finalizeOwnedTabLease,readOwnedTabLease,syncOwnedTabLeaseToManifest} from './owned-tab-lease.mjs';
 
@@ -106,20 +107,45 @@ function compactEvent(value){
   return output;
 }
 
-const READINESS_CHECK_KEYS=['targetUrlMatches','loginRequired','profileLoaded','chatModeActive','composerEnabled','attachmentEntryEnabled','imageCreationAvailable'];
+const READINESS_CHECK_KEYS=['targetUrlMatches','loginRequired','profileLoaded','explicitChatMode','chatModeEnabled','chatModeSelected','chatModeActive','composerEnabled','attachmentEntryEnabled','imageCreationAvailable'];
+const sha256=value=>crypto.createHash('sha256').update(value).digest('hex');
+function browserResultLines(item){
+  const texts=[];
+  if(typeof item?.resultText==='string')texts.push(item.resultText);
+  for(const block of item?.result?.content||[])if(block?.type==='text'&&typeof block.text==='string')texts.push(block.text);
+  return texts.flatMap(value=>value.split(/\r?\n/));
+}
+function markerValue(lines,marker,maxBytes){
+  const matches=lines.filter(line=>line.includes(`${marker}:`));
+  if(matches.length!==1)return null;
+  const line=matches[0].trim();
+  if(!line.startsWith(`${marker}:`))return null;
+  const json=line.slice(marker.length+1);
+  if(!json.startsWith('{')||Buffer.byteLength(json,'utf8')>maxBytes)return null;
+  try{return JSON.parse(json);}catch{return null;}
+}
+function readBrowserReadinessResult(item){
+  const value=markerValue(browserResultLines(item),'WENDI_BROWSER_READY_V1',1800);
+  if(value?.marker!=='WENDI_BROWSER_READY_V1'||value?.schemaVersion!==1||typeof value?.ready!=='boolean'||typeof value?.runId!=='string'||!value.runId||value.runId.length>200||typeof value?.ownedTabId!=='string'||!value.ownedTabId||value.ownedTabId.length>200)return null;
+  return value;
+}
+function readBrowserControlSummary(item){
+  const value=markerValue(browserResultLines(item),'WENDI_BROWSER_AX_V1',1800);
+  if(value?.schemaVersion!==1||!Array.isArray(value.controls)||value.controls.length!==6)return null;
+  const kinds=['sidebar_filter','chat_mode','work_mode','composer','attachment','profile'];
+  const controls=[];
+  for(let index=0;index<kinds.length;index++){
+    const control=value.controls[index];
+    if(control?.kind!==kinds[index]||typeof control.observed!=='boolean'||!(typeof control.disabled==='boolean'||control.disabled===null))return null;
+    if(index<3&&!(typeof control.selected==='boolean'||control.selected===null))return null;
+    controls.push({kind:kinds[index],observed:control.observed,disabled:control.disabled,...(index<3?{selected:control.selected}:{})});
+  }
+  return controls;
+}
 function extractBrowserReadinessEvidence(event){
   const item=event?.item;
   if(event?.type!=='item.completed'||item?.type!=='mcp_tool_call'||item.server!=='cua_repl'||item.tool!=='js')return null;
-  const texts=[];
-  if(typeof item.resultText==='string')texts.push(item.resultText);
-  for(const block of item.result?.content||[])if(block?.type==='text'&&typeof block.text==='string')texts.push(block.text);
-  const lines=texts.flatMap(text=>text.split(/\r?\n/));
-  const markerLines=lines.filter(line=>line.includes('WENDI_BROWSER_READY_V1'));
-  if(markerLines.length!==1)return null;
-  const markerLine=markerLines[0].trim(),match=markerLine.match(/^WENDI_BROWSER_READY_V1:(\{[^\n]*\})$/);
-  if(!match||Buffer.byteLength(match[1],'utf8')>1800)return null;
-  let value;
-  try{value=JSON.parse(match[1]);}catch{return null;}
+  const value=readBrowserReadinessResult(item);
   const safeUrl=input=>{
     if(typeof input!=='string'||input.length>500)return null;
     try{const url=new URL(input);return url.protocol==='https:'&&url.hostname==='chatgpt.com'&&!url.username&&!url.password?url.href:null;}catch{return null;}
@@ -159,20 +185,78 @@ function boundedEvent(value){
   return {type:summary.type||'event',truncated:true,originalBytes:summary.originalBytes};
 }
 
-function persistLatestBrowserReadiness(dir,event){
+function expectedBootstrapFromPrompt(prompt,runId){
+  const control=String(prompt||'').split('\n<remote_prompt>\n',1)[0];
+  const matches=[...control.matchAll(/<bootstrap_cua_example>\s*\n([\s\S]*?)\n<\/bootstrap_cua_example>/g)];
+  if(matches.length!==1)throw new Error('本次浏览器执行提示缺少唯一的冻结 bootstrap 脚本。');
+  const code=matches[0][1];
+  new vm.Script(`(async()=>{\n${code}\n})()`,{filename:'browser-bootstrap-expected.js'});
+  if(!code.includes(`const runId=${JSON.stringify(runId)};`)||!code.includes('globalThis.__wendiOwnedTab')||!code.includes('WENDI_BROWSER_READINESS_GATE_V1')||(code.match(/\.goto\s*\(/g)||[]).length!==1)throw new Error('本次冻结 bootstrap 脚本身份或导航不合法。');
+  return {schemaVersion:1,runId,sha256:sha256(code),code};
+}
+function readExpectedBootstrap(dir,runId){
+  try{const value=JSON.parse(fs.readFileSync(path.join(dir,'browser-bootstrap-expected.json'),'utf8'));return value?.runId===runId&&typeof value.code==='string'&&value.sha256===sha256(value.code)?value:null;}catch{return null;}
+}
+function readActualBootstrap(dir,runId){
+  try{const value=JSON.parse(fs.readFileSync(path.join(dir,'browser-bootstrap-script.json'),'utf8'));return value?.runId===runId&&typeof value.code==='string'&&value.sha256===sha256(value.code)?value:null;}catch{return null;}
+}
+function persistBrowserBootstrapScript(dir,event,runId){
+  const item=event?.item;
+  const code=item?.arguments?.code;
+  if(event?.type!=='item.started'||item?.type!=='mcp_tool_call'||item.server!=='cua_repl'||item.tool!=='js'||typeof code!=='string')return true;
+  const expected=readExpectedBootstrap(dir,runId);
+  if(expected){
+    if(readActualBootstrap(dir,runId))return true;
+    if(readOwnedTabLease(dir)?.state!=='created'&&!code.includes('WENDI_BROWSER_READINESS_GATE_V1'))return true;
+  }else if(!code.includes('WENDI_BROWSER_READINESS_GATE_V1'))return true;
+  const file=path.join(path.resolve(String(dir||'')),'browser-bootstrap-script.json');
+  const temp=`${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  try{
+    fs.writeFileSync(temp,JSON.stringify({schemaVersion:1,source:'cua_item_started',runId,itemId:String(item.id||event.item_id||''),sha256:sha256(code),...(expected?{expectedSha256:expected.sha256,matchesExpected:code===expected.code}:{}),code}),{mode:0o600,flag:'wx'});
+    fs.renameSync(temp,file);fs.chmodSync(file,0o600);
+    return true;
+  }catch{
+    try{fs.unlinkSync(temp);}catch{}
+    return false;
+  }
+}
+
+function persistLatestBrowserReadiness(dir,event,runId){
   const item=event?.item;
   if(event?.type!=='item.completed'||item?.type!=='mcp_tool_call'||item.server!=='cua_repl'||item.tool!=='js')return true;
   const file=path.join(path.resolve(String(dir||'')),'browser-readiness-latest.json');
   const temp=`${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-  const record={schemaVersion:1,source:'bridge_cua_completed_item',eventType:'item.completed',itemId:String(item.id||event.item_id||''),server:'cua_repl',tool:'js',browserReadinessEvidence:extractBrowserReadinessEvidence(event)};
+  const expected=readExpectedBootstrap(dir,runId),actual=readActualBootstrap(dir,runId);
+  const itemId=String(item.id||event.item_id||'');
+  const code=typeof item.arguments?.code==='string'?item.arguments.code:'';
+  const matchesExpected=Boolean(expected&&actual&&actual.itemId===itemId&&actual.code===expected.code&&code===expected.code);
+  let evidence=extractBrowserReadinessEvidence(event);
+  if(expected){
+    if(!matchesExpected)evidence=null;
+    else if(evidence)evidence.sourceChecks={...evidence.sourceChecks,scriptSha256:actual.sha256,expectedScriptSha256:expected.sha256,scriptMatchesExpected:true};
+  }
+  let previousDiagnostic=null;
+  try{const previous=JSON.parse(fs.readFileSync(file,'utf8'));if(previous.runId===runId)previousDiagnostic=previous.lastReadinessDiagnostic||null;}catch{}
+  const text=typeof item.resultText==='string'?item.resultText:(item.result?.content||[]).filter(block=>block?.type==='text'&&typeof block.text==='string').map(block=>block.text).join(' ');
+  const isBootstrap=expected?actual?.itemId===itemId:code.includes('WENDI_BROWSER_READINESS_GATE_V1');
+  const result=readBrowserReadinessResult(item);
+  const diagnostic=isBootstrap?{
+    itemId,runId,ownedTabId:result?.ownedTabId||readOwnedTabLease(dir)?.ownedTabId||null,
+    ready:evidence?.ready===true,codeSha256:sha256(code),
+    ...(expected?{expectedSha256:expected.sha256,scriptMatchesExpected:matchesExpected}:{resultText:redactRuntimeText(text,800)}),
+    readinessChecks:result?.checks&&typeof result.checks==='object'?Object.fromEntries(READINESS_CHECK_KEYS.filter(key=>typeof result.checks[key]==='boolean').map(key=>[key,result.checks[key]])):null,
+    controls:expected&&matchesExpected&&result?.ready===false?readBrowserControlSummary(item):null,
+  }:previousDiagnostic;
+  const record={schemaVersion:1,source:'bridge_cua_completed_item',runId,eventType:'item.completed',itemId:String(item.id||event.item_id||''),server:'cua_repl',tool:'js',browserReadinessEvidence:evidence,lastReadinessDiagnostic:diagnostic};
   try{
     fs.writeFileSync(temp,JSON.stringify(record),{mode:0o600,flag:'wx'});
     fs.renameSync(temp,file);
     fs.chmodSync(file,0o600);
     return true;
   }catch{
+    // A failed replacement must not destroy the last durable readiness
+    // diagnostic: cleanup may be the event that triggers this write.
     try{fs.unlinkSync(temp);}catch{}
-    try{fs.unlinkSync(file);}catch{}
     return false;
   }
 }
@@ -552,8 +636,17 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
   const resultPath=path.join(dir,'response.txt');
   const runId=String(runIdOverride||path.basename(path.resolve(dir))),leaseRoot=path.resolve(leaseDir||dir),startedAt=new Date().toISOString();
   const readinessLatestFile=path.join(leaseRoot,'browser-readiness-latest.json');
-  if(browserMode==='chrome'){
+  const bootstrapScriptFile=path.join(leaseRoot,'browser-bootstrap-script.json');
+  const expectedBootstrapFile=path.join(leaseRoot,'browser-bootstrap-expected.json');
+  if(browserMode==='chrome'&&role!=='browser-cleanup'){
     try{fs.unlinkSync(readinessLatestFile);}catch(err){if(err?.code!=='ENOENT')throw Object.assign(new Error('无法清除旧浏览器 readiness 证据，已阻止执行。'),{code:'BROWSER_READINESS_EVIDENCE_PERSIST_FAILED',cause:err});}
+    try{fs.unlinkSync(bootstrapScriptFile);}catch(err){if(err?.code!=='ENOENT')throw Object.assign(new Error('无法清除旧浏览器 bootstrap 脚本，已阻止执行。'),{code:'BROWSER_READINESS_EVIDENCE_PERSIST_FAILED',cause:err});}
+  }
+  if(browserMode==='chrome'&&role==='browser-executor'){
+    const expected=expectedBootstrapFromPrompt(prompt,runId);
+    const temp=`${expectedBootstrapFile}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+    try{fs.writeFileSync(temp,JSON.stringify(expected),{mode:0o600,flag:'wx'});fs.renameSync(temp,expectedBootstrapFile);fs.chmodSync(expectedBootstrapFile,0o600);}
+    catch(err){try{fs.unlinkSync(temp);}catch{}throw Object.assign(new Error('无法保存本次冻结 bootstrap 脚本，已阻止执行。'),{code:'BROWSER_READINESS_EVIDENCE_PERSIST_FAILED',cause:err});}
   }
   const executionFile=path.join(dir,'execution.json');
   const execution={schemaVersion:1,role,model:model||null,reasoningEffort,browserMode:browserMode||null,image:Boolean(image),runId,startedAt};
@@ -699,7 +792,7 @@ export function runCodex({prompt,dir,schema,images=[],signal,onEvent=()=>{},imag
             } else registerBrowserToolCall(callKey,browserCall.kind,e,browserCall.stage,{deferTermination:browserCall.phase==='started'});
           }
           const compact=boundedEvent(e);
-          if(browserMode==='chrome'&&!persistLatestBrowserReadiness(leaseRoot,e)){error='BROWSER_READINESS_EVIDENCE_PERSIST_FAILED';stop();}
+          if(browserMode==='chrome'&&(!persistBrowserBootstrapScript(leaseRoot,e,runId)||!persistLatestBrowserReadiness(leaseRoot,e,runId))){error='BROWSER_READINESS_EVIDENCE_PERSIST_FAILED';stop();}
           capturedEvents.push(compact);
           const candidate=runtimeCandidate(e);if(candidate)persistRuntimeError(candidate);
           if(e.type==='item.completed'&&e.item?.type==='agent_message')last=e.item.text;

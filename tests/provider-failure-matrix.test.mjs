@@ -136,7 +136,9 @@ test('executor instructions carry explicit stage flags and only remote_prompt is
   assert.equal(instruction.split(browserCommands.submissionIntent).length-1,1);
   assert.match(instruction,/owned-tab 状态 closing 必须先由独立 command_execution[\s\S]*最后一次且仅一次 cleanup CUA 调用[\s\S]*WENDI_OWNED_TAB_CLEANUP_V1/);
   assert.match(instruction,/--run-id[\s\S]*--owned-tab-id/);
-  assert.doesNotMatch(instruction,/--state closing[\s\S]*await tab\.goto/);
+  const cleanupScript=instruction.match(/<cleanup_cua_example>\n([\s\S]*?)\n<\/cleanup_cua_example>/)?.[1];
+  assert.ok(cleanupScript);
+  assert.doesNotMatch(cleanupScript,/\.goto\s*\(/);
   assert.match(instruction,/user-message baseline[\s\S]*globalThis\.__wendiUserBaseline/i);
   assert.match(instruction,/有界轮询，最长 45 秒、每 2 秒一次/);
   assert.match(instruction,/click exactly once/i);
@@ -210,7 +212,10 @@ test('existing conversation is the sole initial navigation target and readiness 
   assert.match(instruction,/第二个业务 CUA 调用[\s\S]*timeout_ms\s*[:=]\s*180000[\s\S]*外层 180 秒绝对上限/);
   assert.match(instruction,/导航耗时没有单独可控的 timeout[\s\S]*约 90 秒仅为导航\/页面加载的预算预留[\s\S]*内部 readiness gate 从 goto 返回后最多等待 60000 毫秒[\s\S]*另约 30 秒预留用于工具传输和返回/);
   assert.match(instruction,/导航耗尽外层时限[\s\S]*orphan\/cleanup_pending[\s\S]*不能保证能写入 typed graceful failure[\s\S]*保留未知\/未确认状态，禁止重发/);
-  assert.match(instruction,/WENDI_BROWSER_READINESS_GATE_V1[\s\S]*只调用一次 goto[\s\S]*timeoutMs:60000[\s\S]*WENDI_BROWSER_READY_V1/);
+  const bootstrap=instruction.match(/<bootstrap_cua_example>\n([\s\S]*?)\n<\/bootstrap_cua_example>/)?.[1];
+  assert.ok(bootstrap);
+  assert.match(instruction,/只调用一次 goto/);
+  assert.match(bootstrap,/WENDI_BROWSER_READINESS_GATE_V1[\s\S]*timeoutMs:60000[\s\S]*WENDI_BROWSER_READY_V1/);
   assert.match(instruction,/bootstrap.*最多 3 次/);
 });
 
@@ -221,14 +226,17 @@ test('bounded page-landing, attachment-fallback, upload-pending, and download-ca
     conversationUrl:'https://chatgpt.com/c/replay-target',
     referenceFiles:['/tmp/a.png','/tmp/b.png'],
   });
-  const navigationStart=instruction.indexOf('WENDI_BROWSER_READINESS_GATE_V1'),navigationEnd=instruction.indexOf('紧接着以独立 command_execution',navigationStart);
+  const navigationStart=instruction.indexOf('2. 父流程已经在启动执行器前'),navigationEnd=instruction.indexOf('紧接着以独立 command_execution',navigationStart);
   const navigation=instruction.slice(navigationStart,navigationEnd>navigationStart?navigationEnd:undefined);
-  assert.match(navigation,/WENDI_BROWSER_READINESS_GATE_V1/);
   assert.match(navigation,/只调用一次 goto/);
-  assert.match(navigation,/在最多 60000 毫秒内/);
-  assert.match(navigation,/WENDI_BROWSER_READY_V1/);
+  assert.match(navigation,/本次 item\.completed 的 WENDI_BROWSER_READY_V1/);
   assert.match(navigation,/缺少或未通过 readiness 证据时拒绝 uploading/);
   assert.match(navigation,/禁止先打开 chatgpt\.com 首页/);
+  const bootstrap=instruction.match(/<bootstrap_cua_example>\n([\s\S]*?)\n<\/bootstrap_cua_example>/)?.[1];
+  assert.ok(bootstrap);
+  assert.match(bootstrap,/WENDI_BROWSER_READINESS_GATE_V1/);
+  assert.match(bootstrap,/timeoutMs:60000/);
+  assert.equal((bootstrap.match(/\.goto\s*\(/g)||[]).length,1);
 
   const attachments=instruction.slice(instruction.indexOf('附件入口只有两条'),instruction.indexOf('只在 https://chatgpt.com/'));
   assert.match(attachments,/A 没有 chooser 是允许的、可恢复的分支/);
